@@ -82,7 +82,7 @@ curl -fsS https://r.feidu.fit/api/config
    ssh -p <sshPort> '<deviceId>@r.feidu.fit' 'sha256sum /tmp/artifact.bin'
    ```
 
-   Windows Go 客户端的 SCP 原始字节通道当前只在 `go/v0.2.118-feidu.1` 上完成公网实测。交接响应不包含客户端版本，因此默认使用 SFTP。只有从独立可信来源取得精确版本且它等于 `go/v0.2.118-feidu.1` 时才使用 SCP；不能根据相似版本号推断已包含修复。网页 `run.ps1` 和 `run.sh` 会优先下载这个修复版 Windows amd64 客户端，并校验 SHA-256 `049a369042f5a371b921fa3e99cb6a0406349b3e716463a380d1dc9310a69e2e`。
+   Windows Go 客户端的 SCP 原始字节通道当前只在 `go/v0.2.118-feidu.2` 上完成真实链路实测。交接响应不包含客户端版本，因此默认使用 SFTP。只有从独立可信来源取得精确版本且它等于 `go/v0.2.118-feidu.2` 时才使用 SCP；不能根据相似版本号推断已包含修复。网页 `run.ps1` 和 `run.sh` 会优先下载这个修复版 Windows amd64 客户端，并校验 SHA-256 `5bd964ac75331262ac01e21b79ee3af7322b8e34894d46f281f1a8f0667987bd`。
 
 4. 比较本地和设备端哈希，再执行部署命令。大文件或不稳定网络优先使用 SFTP；RDev Web 文件页支持从已确认的 offset 恢复。
 
@@ -144,7 +144,7 @@ python3 tools/feidu-drive.py resume-upload '<session_id>' ./staging/ota.img
 
 - 每个任务先兑换一次性交接，再调用云盘能力查询和 RDev `/api/config`。
 - 不调用 RDev `/api/clients`；设备 ID只取 `data.credentials.device_id`。
-- 默认使用 SFTP。Windows SCP 只在独立证据确认设备版本精确等于 `go/v0.2.118-feidu.1` 时使用。
+- 默认使用 SFTP。Windows SCP 只在独立证据确认设备版本精确等于 `go/v0.2.118-feidu.2` 时使用。
 - 只使用真实 `content_id`、交接响应的设备 ID和 `/api/config` 返回的 `sshPort`。
 - 下载和上传都采用临时文件、大小校验、哈希校验和原子替换。
 - 传输失败时只重试当前阶段；不要重新创建云盘对象或并发上传同一会话。

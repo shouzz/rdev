@@ -18,7 +18,7 @@ describe('AI Agent artifact bridge', () => {
     expect(repository.artifact_plane.base_url).toBe('https://pan.feidu.fit');
     expect(repository.artifact_plane.token_env).toBe('FEIDU_DRIVE_TOKEN');
     expect(repository.artifact_plane.lifecycle).toEqual(['none', 'hide', 'archive']);
-    expect(repository.rdev.verified_windows_scp.client_version).toBe('go/v0.2.118-feidu.1');
+    expect(repository.rdev.verified_windows_scp.client_version).toBe('go/v0.2.118-feidu.2');
     expect(repository.rdev.verified_windows_scp.fallback_for_other_versions).toBe('sftp');
     expect(repository.artifact_plane.download).toContain('GET /developer/v1/contents/{content_id}/download');
     expect(repository.artifact_plane.upload).toContain('POST /developer/v1/direct-upload-sessions/{session_id}/complete');
@@ -44,7 +44,7 @@ describe('AI Agent artifact bridge', () => {
     expect(repositoryGuide).toContain('`FEIDU_DRIVE_TOKEN`');
     expect(repositoryGuide).toContain('`/api/config`');
     expect(repositoryGuide).toContain('`operation_id`');
-    expect(repositoryGuide).toContain('`go/v0.2.118-feidu.1`');
+    expect(repositoryGuide).toContain('`go/v0.2.118-feidu.2`');
     expect(repositoryGuide).toContain('`data.credentials.device_id`');
     expect(repositoryGuide).not.toContain('curl -fsS https://r.feidu.fit/api/clients');
   });
@@ -77,13 +77,13 @@ describe('AI Agent artifact bridge', () => {
   });
 
   test('Windows launchers prefer the verified SCP-capable client', async () => {
-    const expectedHash = '049a369042f5a371b921fa3e99cb6a0406349b3e716463a380d1dc9310a69e2e';
+    const expectedHash = '5bd964ac75331262ac01e21b79ee3af7322b8e34894d46f281f1a8f0667987bd';
     const powershell = await readFile(resolve(root, 'internal/server/static/run.ps1'), 'utf8');
     const shell = await readFile(resolve(root, 'internal/server/static/run.sh'), 'utf8');
 
     for (const launcher of [powershell, shell]) {
       expect(launcher).toContain('/local-release?asset=');
-      expect(launcher).toContain('feidu-20260903-scp2');
+      expect(launcher).toContain('feidu-20260903-scp3');
       expect(launcher).toContain(expectedHash);
     }
   });

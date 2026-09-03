@@ -28,9 +28,9 @@
     "protected_endpoints_not_required": ["GET /api/clients"],
     "device_operations": ["ssh", "exec", "scp", "sftp", "rsync", "port_forward", "remote_desktop"],
     "verified_windows_scp": {
-      "client_version": "go/v0.2.118-feidu.1",
+      "client_version": "go/v0.2.118-feidu.2",
       "asset": "rdev-client-windows-amd64.exe",
-      "sha256": "049a369042f5a371b921fa3e99cb6a0406349b3e716463a380d1dc9310a69e2e",
+      "sha256": "5bd964ac75331262ac01e21b79ee3af7322b8e34894d46f281f1a8f0667987bd",
       "fallback_for_other_versions": "sftp"
     },
     "file_websocket": {
