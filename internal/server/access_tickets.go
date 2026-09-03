@@ -16,6 +16,8 @@ import (
 
 const (
 	accessTicketPrefix      = "rdvat_"
+	browserTicketProtocol   = "rdev-access-ticket."
+	browserTicketSubject    = "feidu-browser:"
 	accessTicketSecretBytes = 32
 	accessTicketMinLifetime = time.Minute
 	accessTicketMaxLifetime = 8 * time.Hour
@@ -64,6 +66,63 @@ func (s *Server) controlAuthOK(r *http.Request) bool {
 	want := sha256.Sum256([]byte(s.ControlToken))
 	got := sha256.Sum256([]byte(r.Header.Get("X-RDev-Control-Token")))
 	return subtle.ConstantTimeCompare(want[:], got[:]) == 1
+}
+
+func (s *Server) browserSocketAuthOK(r *http.Request) bool {
+	if !s.secureControlEnabled() || r == nil || r.Method != http.MethodGet ||
+		!headerContainsToken(r.Header, "Connection", "upgrade") ||
+		!strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return false
+	}
+	switch r.URL.Path {
+	case "/terminal", "/files", "/desktop":
+	default:
+		return false
+	}
+	for _, value := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, protocol := range strings.Split(value, ",") {
+			protocol = strings.TrimSpace(protocol)
+			if !strings.HasPrefix(protocol, browserTicketProtocol) {
+				continue
+			}
+			value := strings.TrimPrefix(protocol, browserTicketProtocol)
+			if s.browserAccessTicketValid(value, r.URL.Query().Get("device")) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func headerContainsToken(header http.Header, name, want string) bool {
+	for _, value := range header.Values(name) {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) browserAccessTicketValid(value, requestedDeviceID string) bool {
+	if !strings.HasPrefix(value, accessTicketPrefix) {
+		return false
+	}
+	hash := sha256.Sum256([]byte(value))
+	now := s.accessTicketCurrentTime()
+	s.accessTicketMu.Lock()
+	defer s.accessTicketMu.Unlock()
+	for key, ticket := range s.accessTickets {
+		if !ticket.ExpiresAt.After(now) {
+			delete(s.accessTickets, key)
+		}
+	}
+	ticket, ok := s.accessTickets[hash]
+	if !ok || !strings.HasPrefix(ticket.Subject, browserTicketSubject) || !ticket.ExpiresAt.After(now) {
+		return false
+	}
+	return requestedDeviceID == "" || requestedDeviceID == ticket.DeviceID
 }
 
 func (s *Server) requiresDeviceCredential(client *ClientConn) bool {

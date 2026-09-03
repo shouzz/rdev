@@ -49,6 +49,49 @@ func TestControlAuthOpenModeCompatibility(t *testing.T) {
 	}
 }
 
+func TestBrowserSocketAuthAcceptsOnlyScopedFeiduTicket(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.clients["device-a"] = &ClientConn{ID: "device-a", InstanceID: "one", Password: "secret"}
+	browserTicket := issueAccessTicketWithSubject(t, s, "device-a", "feidu-browser:42", 60)
+	agentTicket := issueAccessTicketWithSubject(t, s, "device-a", "feidu-agent:42", 60)
+
+	tests := []struct {
+		name       string
+		path       string
+		method     string
+		upgrade    bool
+		protocol   string
+		wantStatus int
+	}{
+		{name: "terminal", path: "/terminal?device=device-a", method: http.MethodGet, upgrade: true, protocol: browserTicketProtocol + browserTicket, wantStatus: http.StatusOK},
+		{name: "files", path: "/files", method: http.MethodGet, upgrade: true, protocol: "rdev-browser-v1, " + browserTicketProtocol + browserTicket, wantStatus: http.StatusOK},
+		{name: "wrong device", path: "/desktop?device=device-b", method: http.MethodGet, upgrade: true, protocol: browserTicketProtocol + browserTicket, wantStatus: http.StatusUnauthorized},
+		{name: "agent ticket", path: "/terminal?device=device-a", method: http.MethodGet, upgrade: true, protocol: browserTicketProtocol + agentTicket, wantStatus: http.StatusUnauthorized},
+		{name: "control api", path: "/api/clients", method: http.MethodGet, upgrade: true, protocol: browserTicketProtocol + browserTicket, wantStatus: http.StatusUnauthorized},
+		{name: "not websocket", path: "/terminal?device=device-a", method: http.MethodGet, protocol: browserTicketProtocol + browserTicket, wantStatus: http.StatusUnauthorized},
+		{name: "wrong method", path: "/files", method: http.MethodPost, upgrade: true, protocol: browserTicketProtocol + browserTicket, wantStatus: http.StatusUnauthorized},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(test.method, test.path, nil)
+			if test.upgrade {
+				req.Header.Set("Connection", "keep-alive, Upgrade")
+				req.Header.Set("Upgrade", "websocket")
+			}
+			req.Header.Set("Sec-WebSocket-Protocol", test.protocol)
+			response := httptest.NewRecorder()
+			if s.requireAuth(response, req) != (test.wantStatus == http.StatusOK) {
+				t.Fatalf("authorization mismatch, response status = %d", response.Code)
+			}
+			if test.wantStatus != http.StatusOK && response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+		})
+	}
+}
+
 func TestWhitespaceControlTokenDoesNotEnableOpenMode(t *testing.T) {
 	s := NewServer()
 	s.ControlToken = "                                "
@@ -215,10 +258,14 @@ func TestAccessTicketIsAbsentFromOtherAPIResponses(t *testing.T) {
 }
 
 func issueAccessTicket(t *testing.T, s *Server, deviceID string, lifetimeSeconds int64) string {
+	return issueAccessTicketWithSubject(t, s, deviceID, "test operator", lifetimeSeconds)
+}
+
+func issueAccessTicketWithSubject(t *testing.T, s *Server, deviceID, subject string, lifetimeSeconds int64) string {
 	t.Helper()
 	body, err := json.Marshal(accessTicketCreateRequest{
 		DeviceID:        deviceID,
-		Subject:         "test operator",
+		Subject:         subject,
 		ExpiresInSecond: lifetimeSeconds,
 	})
 	if err != nil {

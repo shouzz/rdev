@@ -1409,7 +1409,7 @@ func (s *Server) handleFileResult(msg *protocol.Message) {
 }
 
 func (s *Server) requireAuth(w http.ResponseWriter, r *http.Request) bool {
-	if s.controlAuthOK(r) {
+	if s.controlAuthOK(r) || s.browserSocketAuthOK(r) {
 		return true
 	}
 	w.Header().Set("Cache-Control", "no-store")
