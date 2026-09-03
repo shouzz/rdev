@@ -247,6 +247,10 @@ func (s *Server) HandleAccessTicketsAPI(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "device is not connected", http.StatusNotFound)
 		return
 	}
+	if !s.managedDeviceOwnerMatches(input.DeviceID, input.Subject) {
+		http.Error(w, "device is not owned by subject", http.StatusForbidden)
+		return
+	}
 	ticketValue, ticketID, err := newAccessTicketValue()
 	if err != nil {
 		http.Error(w, "ticket generation failed", http.StatusInternalServerError)

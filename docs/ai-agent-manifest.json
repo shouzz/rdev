@@ -1,5 +1,5 @@
 {
-  "schema": "rdev.ai-agent-manifest.v2",
+  "schema": "rdev.ai-agent-manifest.v3",
   "handoff": {
     "issuer_ui": "https://pan.feidu.fit/rdev",
     "claim_prefix": "fdhc_",
@@ -38,6 +38,15 @@
       "auth_message": {"op": "auth", "deviceId": "<device id>", "password": "<runtime secret>"},
       "binary_frame": "[type:1][task_id_length:1][task_id][offset:uint64_be][payload]",
       "types": {"upload_chunk": "0x20", "upload_ack": "0x21", "download_chunk": "0x22", "transfer_end": "0x23", "cancel": "0x24"}
+    },
+    "managed_enrollment": {
+      "issuer_ui": "https://pan.feidu.fit/rdev",
+      "public_join": "https://r.feidu.fit/join#<runtime rdeve_ code>",
+      "code_prefix": "rdeve_",
+      "modes": ["temporary", "persistent"],
+      "persistent_identity": "OS-protected identity file",
+      "secret_storage": "server bcrypt hash only",
+      "persistent_transport": "wss://r.feidu.fit"
     }
   },
   "artifact_plane": {
@@ -51,9 +60,20 @@
     "rules": ["use content_id only", "never log token", "never persist signed URL", "sequential multipart with max 3 attempts per part", "HTTP 200 or 409 means part accepted"]
   },
   "bridge": {
-    "local_staging_required": true,
-    "cloud_to_device": ["artifact_download", "hash_verify", "rdev_scp_or_sftp_upload", "device_hash_verify"],
-    "device_to_cloud": ["device_hash_verify", "rdev_scp_or_sftp_download", "artifact_upload", "content_id_record"],
+    "automatic_threshold_bytes": 104857600,
+    "automatic_large_file": {
+      "local_staging_required": false,
+      "cloud_to_device": ["browser_multipart_to_aliyundrive", "device_https_download", "size_sha1_verify", "atomic_publish"],
+      "device_to_cloud": ["device_size_sha1_verify", "device_sequential_multipart_to_aliyundrive", "result_content_id_bind", "browser_download_ticket"],
+      "transfer_states": ["queued", "running", "paused", "completed", "failed", "cancelled"],
+      "transfer_token_prefix": "fdtx_",
+      "download_part_suffix": ".rdev-cloud.part"
+    },
+    "manual_agent_workflow": {
+      "local_staging_required": true,
+      "cloud_to_device": ["artifact_download", "hash_verify", "rdev_scp_or_sftp_upload", "device_hash_verify"],
+      "device_to_cloud": ["device_hash_verify", "rdev_scp_or_sftp_download", "artifact_upload", "content_id_record"]
+    },
     "integrity": ["size", "sha256_local", "sha256_remote"],
     "secret_policy": "handoff_claim_and_credentials_runtime_only"
   },

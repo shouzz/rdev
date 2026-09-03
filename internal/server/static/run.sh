@@ -18,6 +18,9 @@ RDEV_SHELL=""
 RDEV_SSH_PORT=""
 RDEV_VERSION=""
 RDEV_CLIENT="go"
+RDEV_ENROLL=0
+RDEV_PERSIST=0
+RDEV_IDENTITY_FILE=""
 RDEV_REPO="icepie/rdev"
 LOCAL_CLIENT_REVISION="feidu-20260903-scp3"
 LOCAL_WINDOWS_AMD64_ASSET="rdev-client-windows-amd64.exe"
@@ -40,6 +43,9 @@ while [ $# -gt 0 ]; do
         --go)          RDEV_CLIENT="go"; shift ;;
         --rs)          RDEV_CLIENT="rs"; shift ;;
         --no-mirror)   MIRRORS=""; shift ;;
+        --enroll)      RDEV_ENROLL=1; shift ;;
+        --persist)     RDEV_ENROLL=1; RDEV_PERSIST=1; shift ;;
+        --identity-file) RDEV_IDENTITY_FILE="$2"; shift 2 ;;
         -h|--help)
             echo "Usage: sh run.sh SERVER_URL [options]"
             echo ""
@@ -57,6 +63,9 @@ while [ $# -gt 0 ]; do
             echo "  --client go|rs       Client flavor: compatible Go or performance Rust"
             echo "  --go, --rs           Shorthand for --client go|rs"
             echo "  --no-mirror          Skip CN mirrors (direct server/GitHub sources remain)"
+            echo "  --enroll             Prompt for a one-time enrollment code"
+            echo "  --persist            Enroll and install a systemd service (Linux)"
+            echo "  --identity-file PATH Protected managed-device identity path"
             echo ""
             echo "Examples:"
             echo "  curl -sL http://SERVER/run.sh | sh -s -- ws://SERVER:8080"
@@ -116,7 +125,7 @@ wait_elevation_key() {
     return 1
 }
 
-if [ "$ANDROID_ENV" != "1" ] && [ "$(id -u 2>/dev/null || echo 1)" != "0" ]; then
+if [ "$RDEV_ENROLL" != "1" ] && [ "$RDEV_PERSIST" != "1" ] && [ "$ANDROID_ENV" != "1" ] && [ "$(id -u 2>/dev/null || echo 1)" != "0" ]; then
     if wait_elevation_key; then
         RDEV_ELEVATE=1
         echo "  Elevation requested; will start client with sudo/doas after download." >&2
@@ -583,13 +592,86 @@ else
     [ -n "$RDEV_PASSWORD" ] && set -- "$@" -p "$RDEV_PASSWORD"
     [ -n "$RDEV_SHELL" ] && set -- "$@" -S "$RDEV_SHELL"
     [ -n "$RDEV_SSH_PORT" ] && set -- "$@" --ssh-port "$RDEV_SSH_PORT"
+    [ -n "$RDEV_IDENTITY_FILE" ] && set -- "$@" --identity-file "$RDEV_IDENTITY_FILE"
 fi
 
 echo "" >&2
 echo "  Starting ${CLIENT_LABEL}..." >&2
-printf '  %s' "$RUN_BIN" >&2
-for arg in "$@"; do printf ' %s' "$arg" >&2; done
-printf '\n\n' >&2
+printf '  Binary: %s\n\n' "$RUN_BIN" >&2
+
+read_enrollment_code() {
+    [ -r /dev/tty ] || { echo "Error: enrollment requires an interactive terminal" >&2; return 1; }
+    printf '%s' "  One-time enrollment code: " >/dev/tty
+    old_stty="$(stty -g </dev/tty 2>/dev/null || true)"
+    [ -n "$old_stty" ] && stty -echo </dev/tty 2>/dev/null || true
+    IFS= read -r ENROLLMENT_CODE </dev/tty
+    [ -n "$old_stty" ] && stty "$old_stty" </dev/tty 2>/dev/null || true
+    printf '\n' >/dev/tty
+    [ -n "$ENROLLMENT_CODE" ] || { echo "Error: enrollment code is empty" >&2; return 1; }
+}
+
+run_as_root() {
+    if [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    elif command -v doas >/dev/null 2>&1; then
+        doas "$@"
+    else
+        echo "Error: persistent installation requires root, sudo, or doas" >&2
+        return 1
+    fi
+}
+
+if [ "$RDEV_PERSIST" = "1" ]; then
+    [ "$RDEV_CLIENT" = "go" ] || { echo "Error: persistent enrollment requires the compatible Go client" >&2; exit 1; }
+    [ "$OS" = "linux" ] || { echo "Error: persistent mode currently requires Linux and systemd" >&2; exit 1; }
+    command -v systemctl >/dev/null 2>&1 || { echo "Error: systemd is required for persistent mode" >&2; exit 1; }
+    read_enrollment_code
+    INSTALL_DIR="/usr/local/lib/rdev"
+    INSTALLED_BIN="$INSTALL_DIR/rdev-client"
+    IDENTITY_PATH="${RDEV_IDENTITY_FILE:-/var/lib/rdev/identity.json}"
+    case "$IDENTITY_PATH" in *[[:space:]]*) echo "Error: persistent identity path must not contain whitespace" >&2; exit 1 ;; esac
+    UNIT_TMP="${TMPDIR:-/tmp}/rdev-client-$$.service"
+    trap 'rm -f "$UNIT_TMP" 2>/dev/null' EXIT HUP INT TERM
+    run_as_root mkdir -p "$INSTALL_DIR" "$(dirname "$IDENTITY_PATH")"
+    run_as_root install -m 0755 "$RUN_BIN" "$INSTALLED_BIN"
+    set -- -s "$RDEV_SERVER"
+    [ -n "$RDEV_ID" ] && set -- "$@" -i "$RDEV_ID"
+    set -- "$@" --enroll-stdin --enroll-only --identity-file "$IDENTITY_PATH"
+    printf '%s\n' "$ENROLLMENT_CODE" | run_as_root "$INSTALLED_BIN" "$@"
+    ENROLLMENT_CODE=""
+    umask 077
+    printf '%s\n' \
+        '[Unit]' \
+        'Description=RDev Remote Debug Client' \
+        'After=network-online.target' \
+        'Wants=network-online.target' \
+        '' \
+        '[Service]' \
+        'Type=simple' \
+        "ExecStart=$INSTALLED_BIN --identity-file $IDENTITY_PATH" \
+        'Restart=always' \
+        'RestartSec=2' \
+        '' \
+        '[Install]' \
+        'WantedBy=multi-user.target' > "$UNIT_TMP"
+    run_as_root install -m 0644 "$UNIT_TMP" /etc/systemd/system/rdev-client.service
+    run_as_root systemctl daemon-reload
+    run_as_root systemctl enable --now rdev-client.service
+    echo "  RDev is installed and will reconnect automatically." >&2
+    exit 0
+fi
+
+if [ "$RDEV_ENROLL" = "1" ]; then
+    [ "$RDEV_CLIENT" = "go" ] || { echo "Error: enrollment requires the compatible Go client" >&2; exit 1; }
+    read_enrollment_code
+    set -- "$@" --enroll-stdin
+    printf '%s\n' "$ENROLLMENT_CODE" | "$RUN_BIN" "$@"
+    status=$?
+    ENROLLMENT_CODE=""
+    exit "$status"
+fi
 
 if [ "$RDEV_ELEVATE" = "1" ]; then
     if command -v sudo >/dev/null 2>&1; then

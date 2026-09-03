@@ -12,7 +12,8 @@ type MessageType string
 
 const (
 	// Control (text frames)
-	MsgRegister   MessageType = "register"    // C->S: register with ID + password
+	MsgRegister      MessageType = "register"       // C->S: register with ID + password
+	MsgRegisterError MessageType = "register_error" // S->C: registration rejected
 	MsgNewSession MessageType = "new_session" // S->C: create a proxied SSH session
 
 	MsgStdinClose MessageType = "stdin_close" // S->C: remote closed stdin (EOF)
@@ -46,6 +47,11 @@ const (
 	MsgFileTransferEnd    MessageType = "file_transfer_end"    // bidir: transfer finished
 	MsgFileTransferError  MessageType = "file_transfer_error"  // bidir: transfer failed
 	MsgFileTransferCancel MessageType = "file_transfer_cancel" // bidir: cancel transfer
+
+	// Cloud artifact transfer control. The server only dispatches an opaque,
+	// short-lived Feidu task; the client transfers bytes directly over HTTPS.
+	MsgCloudTransferStart  MessageType = "cloud_transfer_start"  // S->C: start or resume one cloud-backed transfer
+	MsgCloudTransferResult MessageType = "cloud_transfer_result" // C->S: terminal dispatch result
 
 	// Remote desktop (text frames for control, binary for frames)
 	MsgDesktopStart     MessageType = "desktop_start"     // S->C: start desktop capture
@@ -116,7 +122,8 @@ type Message struct {
 	Modes     map[uint8]uint32 `json:"modes,omitempty"` // SSH terminal modes
 
 	// Auth
-	Password string `json:"password,omitempty"`
+	Password     string `json:"password,omitempty"`
+	DeviceSecret string `json:"deviceSecret,omitempty"`
 
 	// Server info (S->C in MsgRegister response)
 	SSHPort  string `json:"sshPort,omitempty"`  // e.g. "8422"
@@ -151,6 +158,14 @@ type Message struct {
 	Truncated   bool        `json:"truncated,omitempty"`
 	HomePath    string      `json:"homePath,omitempty"`
 	FileEntries []FileEntry `json:"entries,omitempty"`
+
+	// Cloud artifact transfer. TransferToken is only present in the one-time
+	// S->C dispatch and must never be persisted or logged.
+	TransferID    string `json:"transferId,omitempty"`
+	BootstrapURL  string `json:"bootstrapUrl,omitempty"`
+	TransferToken string `json:"transferToken,omitempty"`
+	TransferState string `json:"transferState,omitempty"`
+	BytesDone     int64  `json:"bytesDone,omitempty"`
 
 	// Session management
 	SessionType string        `json:"sessionType,omitempty"` // "shell", "exec", "sftp"

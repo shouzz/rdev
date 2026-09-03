@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>加入远程调试</title>
+  <style>
+    :root { color-scheme: light; --ink:#18201d; --muted:#64706a; --line:#d7ded9; --surface:#f5f7f5; --green:#177245; --cyan:#08798a; --danger:#a32929; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; background:#fff; color:var(--ink); font-family:Inter,"Segoe UI","Microsoft YaHei",sans-serif; letter-spacing:0; }
+    main { width:min(760px,calc(100% - 32px)); margin:0 auto; padding:clamp(36px,8vh,84px) 0 48px; }
+    h1 { margin:0; font-size:clamp(28px,5vw,44px); font-weight:680; letter-spacing:0; }
+    .lead { margin:10px 0 30px; color:var(--muted); font-size:15px; }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 0; border-top:1px solid var(--line); }
+    .label { min-width:110px; font-weight:620; }
+    .value { flex:1; min-width:0; font-family:"Cascadia Code",Consolas,monospace; overflow-wrap:anywhere; }
+    button { min-height:40px; border:1px solid var(--line); border-radius:6px; padding:0 14px; background:#fff; color:var(--ink); font:inherit; cursor:pointer; }
+    button:hover { border-color:#8d9a93; background:var(--surface); }
+    button:focus-visible { outline:3px solid rgba(8,121,138,.22); outline-offset:2px; }
+    .segments { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px; padding:4px; background:var(--surface); border:1px solid var(--line); border-radius:7px; }
+    .segments button { border:0; background:transparent; }
+    .segments button.active { color:#fff; background:var(--green); }
+    .command { margin-top:22px; }
+    pre { min-height:112px; margin:10px 0 12px; padding:16px; border:1px solid var(--line); border-radius:7px; background:#111815; color:#e9f2ed; white-space:pre-wrap; overflow-wrap:anywhere; font:13px/1.65 "Cascadia Code",Consolas,monospace; }
+    .actions { display:flex; gap:10px; flex-wrap:wrap; }
+    .primary { border-color:var(--cyan); background:var(--cyan); color:#fff; }
+    .primary:hover { border-color:#076876; background:#076876; }
+    .status { min-height:22px; margin-top:16px; color:var(--green); font-size:14px; }
+    .invalid { color:var(--danger); }
+    @media (max-width:580px) { main { width:min(100% - 24px,760px); padding-top:28px; } .row { align-items:flex-start; flex-direction:column; } .value { width:100%; } .row button { width:100%; } .segments { width:100%; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>加入远程调试</h1>
+  <p class="lead" id="lead">一次性邀请，设备身份不会显示在命令参数中。</p>
+
+  <div class="row">
+    <div class="label">邀请码</div>
+    <div class="value" id="code">正在读取...</div>
+    <button type="button" id="copyCode">复制邀请码</button>
+  </div>
+
+  <div class="row">
+    <div class="label">系统</div>
+    <div class="segments" role="tablist" aria-label="设备系统">
+      <button type="button" class="active" data-os="windows">Windows</button>
+      <button type="button" data-os="linux">Linux</button>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="label">运行方式</div>
+    <div class="segments" role="tablist" aria-label="运行方式">
+      <button type="button" class="active" data-mode="temporary">本次运行</button>
+      <button type="button" data-mode="persistent">保持在线</button>
+    </div>
+  </div>
+
+  <section class="command">
+    <div class="label">启动命令</div>
+    <pre id="command"></pre>
+    <div class="actions">
+      <button type="button" class="primary" id="copyCommand">复制启动命令</button>
+    </div>
+    <div class="status" id="status" role="status"></div>
+  </section>
+</main>
+<script>
+(() => {
+  const invitation = location.hash.startsWith('#') ? location.hash.slice(1) : '';
+  history.replaceState(null, '', location.pathname);
+  const state = { os: 'windows', mode: 'temporary' };
+  const codeNode = document.getElementById('code');
+  const commandNode = document.getElementById('command');
+  const statusNode = document.getElementById('status');
+  const valid = /^rdeve_[A-Za-z0-9_-]{43}$/.test(invitation);
+  codeNode.textContent = valid ? invitation : '邀请链接无效或已缺少邀请码';
+  if (!valid) {
+    codeNode.classList.add('invalid');
+    document.getElementById('lead').textContent = '请从远程调试控制台重新创建设备邀请。';
+  }
+
+  function render() {
+    const origin = location.origin;
+    if (state.os === 'windows') {
+      const mode = state.mode === 'persistent' ? '-Persist' : '-Enroll';
+      commandNode.textContent = `powershell -NoProfile -Command "iwr -useb '${origin}/run.ps1' | iex; RDev '${origin}' ${mode}"`;
+    } else {
+      const mode = state.mode === 'persistent' ? '--persist' : '--enroll';
+      commandNode.textContent = `curl -fsSL '${origin}/run.sh' | sh -s -- '${origin}' ${mode}`;
+    }
+  }
+
+  document.querySelectorAll('[data-os]').forEach(button => button.addEventListener('click', () => {
+    state.os = button.dataset.os;
+    document.querySelectorAll('[data-os]').forEach(item => item.classList.toggle('active', item === button));
+    render();
+  }));
+  document.querySelectorAll('[data-mode]').forEach(button => button.addEventListener('click', () => {
+    state.mode = button.dataset.mode;
+    document.querySelectorAll('[data-mode]').forEach(item => item.classList.toggle('active', item === button));
+    render();
+  }));
+
+  async function copy(value, message) {
+    if (!value) return;
+    await navigator.clipboard.writeText(value);
+    statusNode.textContent = message;
+    setTimeout(() => { statusNode.textContent = ''; }, 1800);
+  }
+  document.getElementById('copyCode').addEventListener('click', () => copy(valid ? invitation : '', '邀请码已复制'));
+  document.getElementById('copyCommand').addEventListener('click', () => copy(commandNode.textContent, '启动命令已复制'));
+  render();
+})();
+</script>
+</body>
+</html>

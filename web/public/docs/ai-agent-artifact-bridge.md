@@ -7,9 +7,9 @@
 | 平面 | 入口 | 负责内容 | 不负责内容 |
 | --- | --- | --- | --- |
 | Device Plane | `https://r.feidu.fit`，SSH 端口由 `/api/config` 返回 | 在线设备、Shell/Exec、SCP/SFTP、Rsync、端口转发、断线重连、设备侧文件 | 飞度网盘目录 ACL、云端长期存储、阿里云签名地址 |
-| Artifact Plane | `https://pan.feidu.fit` | `content_id` 范围内的目录浏览、搜索、详情、下载、顺序分片上传、幂等恢复、生命周期 | 设备连接、SSH 凭据、RDev 会话 |
+| Artifact Plane | `https://pan.feidu.fit` | `content_id` 范围内的目录浏览、搜索、详情、下载、顺序分片上传、幂等恢复、生命周期、账号绑定云中转状态 | 设备连接、SSH 凭据、RDev 会话 |
 
-两者之间的交换介质是 Agent 本地临时目录。服务端不做“万能代理”，RDev 票据和 `fdpat_` 令牌各自独立到期，也不会把云盘签名 URL 传给设备。
+存在两条互不替代的路径：AI 使用开发者 API 与 SFTP 时，可以通过 Agent 本地临时目录衔接；登录后的 `/rdev` 文件工作台对大于 `104857600` 字节的文件自动创建账号绑定云中转，设备直接下载或上传阿里云签名 HTTPS 地址。RDev 服务端和飞度应用服务端只传控制、短期凭据与进度，不代理大文件字节。
 
 ## 2. 账号绑定的一次性交接
 
@@ -84,7 +84,7 @@ curl -fsS https://r.feidu.fit/api/config
 
    Windows Go 客户端的 SCP 原始字节通道当前只在 `go/v0.2.118-feidu.2` 上完成真实链路实测。交接响应不包含客户端版本，因此默认使用 SFTP。只有从独立可信来源取得精确版本且它等于 `go/v0.2.118-feidu.2` 时才使用 SCP；不能根据相似版本号推断已包含修复。网页 `run.ps1` 和 `run.sh` 会优先下载这个修复版 Windows amd64 客户端，并校验 SHA-256 `5bd964ac75331262ac01e21b79ee3af7322b8e34894d46f281f1a8f0667987bd`。
 
-4. 比较本地和设备端哈希，再执行部署命令。大文件或不稳定网络优先使用 SFTP；RDev Web 文件页支持从已确认的 offset 恢复。
+4. 比较本地和设备端哈希，再执行部署命令。此处是通用 Agent 手工路径；登录网页中大于 `104857600` 字节的文件使用第 8 节的自动云中转。
 
 ## 6. 设备 → 云盘（日志/崩溃包/诊断包）
 
@@ -128,7 +128,18 @@ python3 tools/feidu-drive.py resume-upload '<session_id>' ./staging/ota.img
 
 恢复前必须重新选择同一文件并通过服务端会话校验；不要手工拼接短期分片 URL。`none`、`hide`、`archive` 是唯一允许的生命周期动作；最大时长为 30 天，`archive` 只做逻辑归档，不物理删除云盘对象。
 
-## 8. RDev 文件通道的精确消息（浏览器/自研 Agent）
+## 8. 登录工作台的大文件自动云中转
+
+`https://pan.feidu.fit/rdev` 的文件组件使用精确阈值 `104857600` 字节：小于等于阈值继续走 RDev WebSocket 二进制文件通道；大于阈值自动走云中转。
+
+- 浏览器上传到设备：浏览器先以顺序 multipart 直传到飞度网盘；取得真实 `result_content_id` 后，飞度向该账号名下的精确在线设备下发 `cloud_to_device` 任务；设备从飞度领取 302，并直接从阿里云下载到 `<目标文件>.rdev-cloud.part`。完成时核对大小和 SHA-1，再原子发布到目标路径。
+- 浏览器从设备下载：飞度下发 `device_to_cloud` 任务；设备核对源文件为普通文件且大小一致，计算 SHA-1，直接顺序 PUT 阿里云分片；飞度完成底层身份核对并写回 `result_content_id` 后，浏览器领取一次性下载票据。
+
+传输状态只允许 `queued`、`running`、`paused`、`completed`、`failed`、`cancelled`。暂停和取消立即使旧 `fdtx_` 设备凭据失效；恢复生成新凭据并重新下发同一个 `transfer_id`。下载断点保留在设备本地 `.rdev-cloud.part`；完整分片在进程重启后先做哈希和原子发布，不发送无效 Range。上传复用同一个 `operation_id` 和 `upload_session_id`，只传服务端仍标记为待传的分片，单片最多三次尝试，只有 HTTP 200 和 409 表示阿里云接受。
+
+`fdtx_` 明文只存在于飞度到 RDev 再到精确设备的一次下发和设备进程内存。飞度 MySQL 只保存完整令牌的 SHA-256；RDev 不保存令牌；设备不能把 `Authorization` 转发给 302 目标，也不能把签名下载或上传 URL 落盘或写日志。
+
+## 9. RDev 小文件通道的精确消息（浏览器/自研 Agent）
 
 浏览器文件页连接 `wss://<rdev-host>/files`，先发送 JSON `{"op":"auth","deviceId":"<id>","password":"<设备密码>"}`。成功后可使用：
 
@@ -140,7 +151,7 @@ python3 tools/feidu-drive.py resume-upload '<session_id>' ./staging/ota.img
 
 文件数据使用二进制帧，不使用 Base64 文本帧。帧头为 `[类型 1 字节][任务 ID 长度 1 字节][任务 ID][偏移 8 字节，大端][负载]`；上传块类型为 `0x20`，上传确认 `0x21`，下载块 `0x22`，传输结束 `0x23`，取消 `0x24`。收到 `upload_ready` 后从服务端给出的 `offset` 继续；收到连接断开时保留任务元数据，重连后重新发送 `upload_start`。这部分协议优先用于浏览器或专用 Agent；命令行自动化优先使用 SSH/SCP/SFTP。
 
-## 9. Agent 安全和可靠性清单
+## 10. Agent 安全和可靠性清单
 
 - 每个任务先兑换一次性交接，再调用云盘能力查询和 RDev `/api/config`。
 - 不调用 RDev `/api/clients`；设备 ID只取 `data.credentials.device_id`。
@@ -149,9 +160,9 @@ python3 tools/feidu-drive.py resume-upload '<session_id>' ./staging/ota.img
 - 下载和上传都采用临时文件、大小校验、哈希校验和原子替换。
 - 传输失败时只重试当前阶段；不要重新创建云盘对象或并发上传同一会话。
 - 任何 URL、日志或错误上报都必须脱敏：claim、RDev 票据、云盘令牌、`Location`、`upload_url` 不得出现。
-- 完成后清理本地临时文件；云盘生命周期按任务设置，不调用物理删除。
+- 手工路径完成后清理本地临时文件；自动大文件路径不得改回经应用服务器或 Agent 本地代理字节。云盘生命周期按任务设置，不调用物理删除。
 
-## 10. 闭环验收
+## 11. 闭环验收
 
 最小验收应覆盖：
 
@@ -162,5 +173,7 @@ python3 tools/feidu-drive.py resume-upload '<session_id>' ./staging/ota.img
 5. 中断一个分片后用同一 `operation_id`/`session_id` 恢复，确认没有重复对象。
 6. RDev 客户端断线后自动重连，旧票据建立的活动连接不能在重连后创建新 Shell、SFTP 或端口转发；重新交接后 SSH、SFTP 各执行一次。
 7. 一小时凭据过期或撤销测试令牌后 API 返回 HTTP `401`，并确认云盘对象没有被物理删除。
+8. 一个大于 `104857600` 字节的文件完成浏览器直传云盘、设备直下、大小和 SHA-1 核对；中断后复用 `.rdev-cloud.part`。
+9. 一个大于 `104857600` 字节的设备文件完成设备直传云盘、浏览器领票下载、大小和 SHA-1 核对；中断后复用原 `upload_session_id`，云端不出现第二个对象。
 
 机器可读的能力清单见 [`ai-agent-manifest.json`](ai-agent-manifest.json)。

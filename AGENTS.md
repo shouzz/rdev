@@ -32,9 +32,12 @@ Do not hard-code a previously observed device, port, upload session, cloud objec
 
 - RDev is the Device Plane: SSH, Exec, SFTP, SCP when its exact client version is verified, Rsync, port forwarding, remote desktop, and device file operations.
 - Feidu is the Artifact Plane: scoped content browsing, downloads, sequential multipart uploads, session recovery, and lifecycle policy.
-- Bridge the planes through a local staging file. Verify size and SHA-256 before and after the RDev hop.
+- The authenticated `/rdev` file workspace routes files larger than exactly `104857600` bytes through an account-owned cloud transfer. The device exchanges those bytes directly with Aliyun Drive signed HTTPS endpoints; the RDev and Feidu application servers carry control and progress only.
+- The manual Agent workflow may still bridge the planes through a local staging file. Verify size and SHA-256 before and after every manual RDev hop.
+- Never substitute the manual staging workflow for the automatic large-file path when validating the `/rdev` product surface.
 - Default to SFTP for handoff-driven file transfer. Use SCP only when the exact connected client version is independently verified as the version named in the manifest.
 - For Feidu uploads, keep one `operation_id`, concurrency 1, and the original `session_id` during recovery. Only HTTP 200 and 409 confirm a part.
+- For account-owned cloud transfers, use only the exact transfer ID returned by Feidu. Pause, resume, and cancel through the transfer API; resume rotates the `fdtx_` device credential. Never persist that credential or any signed part URL.
 
 ## Completion gate
 

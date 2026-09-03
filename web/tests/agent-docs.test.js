@@ -9,7 +9,7 @@ describe('AI Agent artifact bridge', () => {
     const repository = JSON.parse(await readFile(resolve(root, 'docs/ai-agent-manifest.json'), 'utf8'));
     const published = JSON.parse(await readFile(resolve(root, 'web/public/docs/ai-agent-manifest.json'), 'utf8'));
 
-    expect(repository.schema).toBe('rdev.ai-agent-manifest.v2');
+    expect(repository.schema).toBe('rdev.ai-agent-manifest.v3');
     expect(repository.handoff.redeem.url).toBe('https://pan.feidu.fit/agent/v1/handoffs/redeem');
     expect(repository.handoff.credential_fields.device_id).toBe('data.credentials.device_id');
     expect(repository.handoff.credential_fields.rdev_ticket).toBe('data.credentials.rdev_ticket.ticket');
@@ -22,14 +22,18 @@ describe('AI Agent artifact bridge', () => {
     expect(repository.rdev.verified_windows_scp.fallback_for_other_versions).toBe('sftp');
     expect(repository.artifact_plane.download).toContain('GET /developer/v1/contents/{content_id}/download');
     expect(repository.artifact_plane.upload).toContain('POST /developer/v1/direct-upload-sessions/{session_id}/complete');
+    expect(repository.rdev.managed_enrollment.code_prefix).toBe('rdeve_');
+    expect(repository.bridge.automatic_threshold_bytes).toBe(104857600);
+    expect(repository.bridge.automatic_large_file.transfer_states).toEqual(['queued', 'running', 'paused', 'completed', 'failed', 'cancelled']);
+    expect(repository.bridge.automatic_large_file.transfer_token_prefix).toBe('fdtx_');
 
     expect(published.schema).toBe(repository.schema);
-    expect(published.rdev_base_url).toBe(repository.rdev.base_url);
-    expect(published.artifact_base_url).toBe(repository.artifact_plane.base_url);
-    expect(published.artifact_token_env).toBe(repository.artifact_plane.token_env);
+    expect(published.rdev.base_url).toBe(repository.rdev.base_url);
+    expect(published.artifact_plane.base_url).toBe(repository.artifact_plane.base_url);
+    expect(published.artifact_plane.token_env).toBe(repository.artifact_plane.token_env);
     expect(published.handoff.credential_fields).toEqual(repository.handoff.credential_fields);
-    expect(published.rdev_discovery).toEqual(['GET /api/config']);
-    expect(published.verified_windows_scp).toEqual(repository.rdev.verified_windows_scp);
+    expect(published.rdev.discovery).toEqual(['GET /api/config']);
+    expect(published.rdev.verified_windows_scp).toEqual(repository.rdev.verified_windows_scp);
   });
 
   test('published guide and reference CLI match repository content', async () => {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -219,6 +220,7 @@ type Client struct {
 	requestedID     string
 	instanceID      string
 	password        string
+	deviceSecret    string
 	shell           string
 	version         string
 	conn            *gws.Conn
@@ -232,6 +234,7 @@ type Client struct {
 	uploads         map[string]*managedUpload
 	downloads       map[string]chan struct{}
 	desktopSessions map[string]*desktopSession
+	cloudTransfers  map[string]struct{}
 	mu              sync.Mutex
 	done            chan struct{}
 	reconnectReset  chan struct{}
@@ -332,6 +335,7 @@ func NewClient(serverURL, clientID, password, shell string) *Client {
 		uploads:         make(map[string]*managedUpload),
 		downloads:       make(map[string]chan struct{}),
 		desktopSessions: make(map[string]*desktopSession),
+		cloudTransfers:  make(map[string]struct{}),
 		done:            make(chan struct{}, 1),
 		reconnectReset:  make(chan struct{}, 1),
 		reconnectMin:    defaultReconnectMin,
@@ -341,6 +345,11 @@ func NewClient(serverURL, clientID, password, shell string) *Client {
 	}
 	lc.install(c)
 	return c
+}
+
+// SetDeviceSecret configures the credential used only for managed-device registration.
+func (c *Client) SetDeviceSecret(secret string) {
+	c.deviceSecret = secret
 }
 
 // SetReconnectDelays configures the reconnect backoff bounds.
@@ -421,15 +430,7 @@ func (h *wsEventHandler) OnOpen(socket *gws.Conn) {
 	transport := &wsClientTransport{conn: socket}
 	attempt := h.client.activateTransport(transport, socket, h.endpoint)
 	h.opened <- attempt
-	if err := h.client.send(&protocol.Message{
-		Type:                protocol.MsgRegister,
-		ClientID:            h.client.requestedID,
-		InstanceID:          h.client.instanceID,
-		ClientVersion:       h.client.version,
-		Password:            h.client.password,
-		DesktopCapabilities: desktopCapabilities(),
-		LogSupported:        true,
-	}); err != nil {
+	if err := h.client.send(h.client.registrationMessage()); err != nil {
 		attempt.complete(fmt.Errorf("send registration: %w", err))
 		_ = transport.Close("registration send failed")
 		return
@@ -835,15 +836,7 @@ func (c *Client) connectStream(kind, endpoint string) error {
 	}
 	transport := &streamClientTransport{conn: conn}
 	attempt := c.activateTransport(transport, nil, endpoint)
-	if err := c.send(&protocol.Message{
-		Type:                protocol.MsgRegister,
-		ClientID:            c.requestedID,
-		InstanceID:          c.instanceID,
-		ClientVersion:       c.version,
-		Password:            c.password,
-		DesktopCapabilities: desktopCapabilities(),
-		LogSupported:        true,
-	}); err != nil {
+	if err := c.send(c.registrationMessage()); err != nil {
 		attempt.complete(fmt.Errorf("send registration: %w", err))
 		_ = conn.Close()
 		return fmt.Errorf("send registration: %w", err)
@@ -970,6 +963,23 @@ func (c *Client) closeCurrentTransport(transport clientTransport, conn net.Conn)
 
 func (c *Client) handleMessage(msg *protocol.Message) {
 	switch msg.Type {
+	case protocol.MsgRegisterError:
+		c.mu.Lock()
+		attempt := c.registration
+		transport := c.transport
+		c.registration = nil
+		c.registered = false
+		c.mu.Unlock()
+		registrationErr := errors.New("registration rejected")
+		if strings.TrimSpace(msg.Error) != "" {
+			registrationErr = fmt.Errorf("registration rejected: %s", strings.TrimSpace(msg.Error))
+		}
+		if attempt != nil {
+			attempt.complete(registrationErr)
+		}
+		if transport != nil {
+			_ = transport.Close("registration rejected")
+		}
 	case protocol.MsgRegister:
 		c.mu.Lock()
 		attempt := c.registration
@@ -1028,6 +1038,8 @@ func (c *Client) handleMessage(msg *protocol.Message) {
 		go c.handleManagedDownloadStart(msg)
 	case protocol.MsgFileTransferCancel:
 		c.handleManagedTransferCancel(msg.TaskID)
+	case protocol.MsgCloudTransferStart:
+		c.handleCloudTransferStart(msg)
 	case protocol.MsgDesktopStart:
 		go c.handleDesktopStart(msg)
 	case protocol.MsgDesktopInput:
@@ -1036,6 +1048,14 @@ func (c *Client) handleMessage(msg *protocol.Message) {
 		c.handleDesktopClipboard(msg)
 	case protocol.MsgDesktopClose:
 		c.handleDesktopClose(msg.SessionID)
+	}
+}
+
+func (c *Client) registrationMessage() *protocol.Message {
+	return &protocol.Message{
+		Type: protocol.MsgRegister, ClientID: c.requestedID, InstanceID: c.instanceID,
+		ClientVersion: c.version, Password: c.password, DeviceSecret: c.deviceSecret,
+		DesktopCapabilities: desktopCapabilities(), LogSupported: true,
 	}
 }
 

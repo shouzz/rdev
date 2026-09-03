@@ -146,6 +146,23 @@ func TestWhitespaceControlTokenDoesNotEnableOpenMode(t *testing.T) {
 	}
 }
 
+func TestManagedDeviceAccessTicketRequiresExactOwnerSubject(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.managedDevices["managed-device"] = managedDevice{
+		ID: "managed-device", OwnerSubject: "feidu-user:42", SecretHash: "$2a$10$abcdefghijklmnopqrstuv012345678901234567890123456789012",
+	}
+	s.clients["managed-device"] = &ClientConn{ID: "managed-device", InstanceID: "online"}
+	body := []byte(`{"deviceId":"managed-device","subject":"feidu-user:7","expiresInSeconds":600}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/control/access-tickets", bytes.NewReader(body))
+	request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	response := httptest.NewRecorder()
+	s.HandleAccessTicketsAPI(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", response.Code)
+	}
+}
+
 func TestAccessTicketDeviceBindingAndExpiry(t *testing.T) {
 	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 	s := NewServer()

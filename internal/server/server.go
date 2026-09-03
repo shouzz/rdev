@@ -77,6 +77,8 @@ type ClientConn struct {
 	Transport    DeviceTransport
 	ConnectedAt  time.Time
 	Password     string
+	Managed      bool
+	OwnerSubject string
 	Sessions     map[string]*ProxySession
 	Forwards     map[string]*ProxyForward
 	Desktop      *protocol.DesktopCapabilities
@@ -532,32 +534,38 @@ func (f *ReverseForward) Result() (uint32, string) {
 
 // Server manages WebSocket clients and SSH proxy
 type Server struct {
-	clients           map[string]*ClientConn
-	mu                sync.RWMutex
-	sessions          map[string]*ProxySession
-	sessMu            sync.RWMutex
-	forwards          map[string]*ProxyForward
-	fwdMu             sync.RWMutex
-	revForwards       map[string]*ReverseForward
-	revMu             sync.RWMutex
-	fileResults       map[string]chan *protocol.Message
-	fileRequests      map[string]*fileSocket
-	fileTasks         map[string]*fileTaskRoute
-	fileMu            sync.RWMutex
-	desktops          map[string]*desktopRoute
-	desktopMu         sync.RWMutex
-	vncMu             sync.RWMutex
-	vncSettings       map[string]protocol.Message
-	vncStreams        map[string]*vncDesktopStream
-	gpuDesktopMu      sync.RWMutex
-	gpuDesktopTunnels map[string]*gpuDesktopTunnel
-	accessTicketMu    sync.Mutex
-	accessTickets     map[[32]byte]accessTicket
-	accessTicketNow   func() time.Time
-	releaseLatestMu   sync.Mutex
-	releaseLatestTag  string
-	releaseLatestAt   time.Time
-	upgrader          *gws.Upgrader
+	clients                map[string]*ClientConn
+	mu                     sync.RWMutex
+	sessions               map[string]*ProxySession
+	sessMu                 sync.RWMutex
+	forwards               map[string]*ProxyForward
+	fwdMu                  sync.RWMutex
+	revForwards            map[string]*ReverseForward
+	revMu                  sync.RWMutex
+	fileResults            map[string]chan *protocol.Message
+	fileRequests           map[string]*fileSocket
+	fileTasks              map[string]*fileTaskRoute
+	fileMu                 sync.RWMutex
+	desktops               map[string]*desktopRoute
+	desktopMu              sync.RWMutex
+	vncMu                  sync.RWMutex
+	vncSettings            map[string]protocol.Message
+	vncStreams             map[string]*vncDesktopStream
+	gpuDesktopMu           sync.RWMutex
+	gpuDesktopTunnels      map[string]*gpuDesktopTunnel
+	accessTicketMu         sync.Mutex
+	accessTickets          map[[32]byte]accessTicket
+	accessTicketNow        func() time.Time
+	enrollmentMu           sync.Mutex
+	enrollments            map[[32]byte]enrollmentInvite
+	managedDevices         map[string]managedDevice
+	enrollmentRegistryPath string
+	enrollmentPublicURL    string
+	enrollmentNow          func() time.Time
+	releaseLatestMu        sync.Mutex
+	releaseLatestTag       string
+	releaseLatestAt        time.Time
+	upgrader               *gws.Upgrader
 
 	// Public config (set by main) for API/UI
 	SSHPort          string // e.g. "2222"
@@ -590,6 +598,9 @@ func NewServer() *Server {
 		gpuDesktopTunnels: make(map[string]*gpuDesktopTunnel),
 		accessTickets:     make(map[[32]byte]accessTicket),
 		accessTicketNow:   time.Now,
+		enrollments:       make(map[[32]byte]enrollmentInvite),
+		managedDevices:    make(map[string]managedDevice),
+		enrollmentNow:     time.Now,
 		MaxSessions:       256,
 		MaxForwards:       1024,
 		BatchConcurrency:  runtime.GOMAXPROCS(0) * 8,
@@ -742,6 +753,12 @@ func (h *wsHandler) handleRegister(socket *gws.Conn, msg *protocol.Message) {
 		socket.WriteClose(1000, nil)
 		return
 	}
+	allowed, managed := h.srv.authorizeManagedRegistration(clientID, msg.DeviceSecret)
+	if managed && !allowed {
+		_ = socket.WriteMessage(gws.OpcodeText, []byte(`{"type":"register_error","error":"managed device credential rejected"}`))
+		_ = socket.WriteClose(1008, []byte("managed device credential rejected"))
+		return
+	}
 	instanceID := strings.TrimSpace(msg.InstanceID)
 	client := &ClientConn{
 		ID:           clientID,
@@ -752,6 +769,8 @@ func (h *wsHandler) handleRegister(socket *gws.Conn, msg *protocol.Message) {
 		Transport:    &wsDeviceTransport{conn: socket},
 		ConnectedAt:  time.Now(),
 		Password:     msg.Password,
+		Managed:      managed,
+		OwnerSubject: h.srv.managedDeviceOwner(clientID),
 		Desktop:      cloneDesktopCapabilities(msg.DesktopCapabilities),
 		LogSupported: msg.LogSupported,
 		Sessions:     make(map[string]*ProxySession),
@@ -858,6 +877,12 @@ func (s *Server) registerClient(client *ClientConn) (*ClientConn, string, bool) 
 		requestedID = strings.TrimSpace(client.ID)
 	}
 	client.RequestedID = requestedID
+	if client.Managed {
+		old := s.clients[requestedID]
+		client.ID = requestedID
+		s.clients[requestedID] = client
+		return old, requestedID, false
+	}
 
 	if client.InstanceID != "" {
 		for id, old := range s.clients {
@@ -1067,6 +1092,13 @@ func (s *Server) registerStreamClient(transport DeviceTransport, msg *protocol.M
 		_ = transport.Close("missing client id")
 		return "", false
 	}
+	allowed, managed := s.authorizeManagedRegistration(clientID, msg.DeviceSecret)
+	if managed && !allowed {
+		data, _ := protocol.Encode(&protocol.Message{Type: protocol.MsgRegisterError, Error: "managed device credential rejected"})
+		_ = transport.WriteJSON(data)
+		_ = transport.Close("managed device credential rejected")
+		return "", false
+	}
 	instanceID := strings.TrimSpace(msg.InstanceID)
 	client := &ClientConn{
 		ID:           clientID,
@@ -1076,6 +1108,8 @@ func (s *Server) registerStreamClient(transport DeviceTransport, msg *protocol.M
 		Transport:    transport,
 		ConnectedAt:  time.Now(),
 		Password:     msg.Password,
+		Managed:      managed,
+		OwnerSubject: s.managedDeviceOwner(clientID),
 		Desktop:      cloneDesktopCapabilities(msg.DesktopCapabilities),
 		LogSupported: msg.LogSupported,
 		Sessions:     make(map[string]*ProxySession),
@@ -1437,6 +1471,7 @@ func (s *Server) HandleAPI(w http.ResponseWriter, r *http.Request) {
 		Desktop      *protocol.DesktopCapabilities `json:"desktop,omitempty"`
 		GPUDesktop   bool                          `json:"gpuDesktop,omitempty"`
 		LogSupported bool                          `json:"logSupported,omitempty"`
+		OwnerSubject string                        `json:"ownerSubject,omitempty"`
 	}
 
 	clients := make([]clientInfo, 0, len(s.clients))
@@ -1457,6 +1492,7 @@ func (s *Server) HandleAPI(w http.ResponseWriter, r *http.Request) {
 			Desktop:      publicDesktopCapabilities(c.Desktop),
 			GPUDesktop:   s.clientGPUDesktopAvailable(c),
 			LogSupported: c.LogSupported,
+			OwnerSubject: c.OwnerSubject,
 		})
 	}
 
@@ -1815,6 +1851,7 @@ func (s *Server) HandleTerminalAPI(w http.ResponseWriter, r *http.Request) {
 		Desktop      *protocol.DesktopCapabilities `json:"desktop,omitempty"`
 		GPUDesktop   bool                          `json:"gpuDesktop,omitempty"`
 		LogSupported bool                          `json:"logSupported,omitempty"`
+		OwnerSubject string                        `json:"ownerSubject,omitempty"`
 	}
 
 	devices := make([]deviceInfo, 0, len(s.clients))
@@ -1828,6 +1865,7 @@ func (s *Server) HandleTerminalAPI(w http.ResponseWriter, r *http.Request) {
 			Desktop:      publicDesktopCapabilities(c.Desktop),
 			GPUDesktop:   s.clientGPUDesktopAvailable(c),
 			LogSupported: c.LogSupported,
+			OwnerSubject: c.OwnerSubject,
 		})
 	}
 

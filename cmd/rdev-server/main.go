@@ -28,6 +28,7 @@ func main() {
 		advertiseKCPPort           = ""
 		advertiseSSHPort           = ""
 		dataDir                    = ""
+		publicURL                  = ""
 		maxSessions                = 0
 		maxForwards                = 0
 		batchConcurrency           = 0
@@ -79,6 +80,11 @@ func main() {
 		case "--data", "-d":
 			if i+1 < len(os.Args) {
 				dataDir = os.Args[i+1]
+				i++
+			}
+		case "--public-url":
+			if i+1 < len(os.Args) {
+				publicURL = os.Args[i+1]
 				i++
 			}
 		case "--max-sessions":
@@ -149,6 +155,7 @@ Options:
   --advertise-kcp-port PORT  Public KCP port shown to clients (defaults to listen port)
   --advertise-ssh-port PORT  Public SSH port shown to clients (defaults to listen port)
   --data, -d  Data directory for host key & authorized_keys (default ~/.rdev)
+  --public-url HTTPS public origin used by device enrollment links
   --max-sessions     Max concurrent sessions per device (default 256)
   --max-forwards     Max concurrent TCP forwards per device (default 1024)
   --batch-concurrency Max concurrent batch operations (default GOMAXPROCS*8)
@@ -178,6 +185,9 @@ Examples:
 
 	if env := os.Getenv("RDEV_AUTO_UPDATE"); env != "" {
 		autoUpdate = parseBoolDefault(env, autoUpdate)
+	}
+	if env := os.Getenv("RDEV_PUBLIC_URL"); env != "" {
+		publicURL = env
 	}
 	if env := os.Getenv("RDEV_TCP_ADDR"); env != "" {
 		tcpAddr = env
@@ -249,6 +259,9 @@ Examples:
 	}
 
 	srv := server.NewServer()
+	if err := srv.ConfigureEnrollmentStore(filepath.Join(dataDir, "managed_devices.json"), publicURL); err != nil {
+		log.Fatalf("device enrollment init error: %v", err)
+	}
 	srv.ReleaseVersion = version
 	srv.LocalReleaseDir = localReleaseDir
 	if controlTokenPath := os.Getenv("RDEV_CONTROL_TOKEN_FILE"); controlTokenPath != "" {
@@ -312,6 +325,12 @@ Examples:
 	mux.HandleFunc("/api/client-logs/", srv.HandleClientLogsAPI)
 	mux.HandleFunc("/api/client-logs", srv.HandleClientLogsAPI)
 	mux.HandleFunc("/api/control/access-tickets", srv.HandleAccessTicketsAPI)
+	mux.HandleFunc("/api/control/enrollments", srv.HandleEnrollmentCreateAPI)
+	mux.HandleFunc("/api/control/enrollments/", srv.HandleEnrollmentLifecycleAPI)
+	mux.HandleFunc("/api/control/devices/", srv.HandleManagedDeviceLifecycleAPI)
+	mux.HandleFunc("/api/control/cloud-transfers", srv.HandleCloudTransferDispatchAPI)
+	mux.HandleFunc("/api/enrollments/redeem", srv.HandleEnrollmentRedeemAPI)
+	mux.HandleFunc("/join", srv.StaticPageHandler("join.html"))
 	mux.HandleFunc("/api/upload", srv.HandleFileUpload)
 	mux.HandleFunc("/download-release", srv.HandleReleaseDownload)
 	mux.HandleFunc("/download-release-proxy", srv.HandleReleaseDownloadProxy)

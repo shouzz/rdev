@@ -181,6 +181,22 @@ func TestRegisterClientDuplicateIDGetsSuffix(t *testing.T) {
 	}
 }
 
+func TestRegisterManagedClientKeepsExactDeviceIDAcrossProcessRestart(t *testing.T) {
+	s := NewServer()
+	first := &ClientConn{ID: "device", RequestedID: "device", InstanceID: "process-one", Managed: true}
+	second := &ClientConn{ID: "device", RequestedID: "device", InstanceID: "process-two", Managed: true}
+	if old, assigned, duplicate := s.registerClient(first); old != nil || assigned != "device" || duplicate {
+		t.Fatalf("first managed registration = (%#v, %q, %v)", old, assigned, duplicate)
+	}
+	old, assigned, duplicate := s.registerClient(second)
+	if old != first || assigned != "device" || duplicate {
+		t.Fatalf("managed reconnect = (%#v, %q, %v), want first device false", old, assigned, duplicate)
+	}
+	if s.clients["device"] != second {
+		t.Fatal("managed reconnect did not replace the previous process")
+	}
+}
+
 func TestClientGPUDesktopAvailableFromCapabilities(t *testing.T) {
 	s := NewServer()
 	for _, backend := range []string{"rdev-desktop", "gpu-desktop-tunnel", "pipewire"} {

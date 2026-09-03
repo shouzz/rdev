@@ -338,6 +338,12 @@ function global:RDev {
 
     .PARAMETER Mirror
     Download mirror: auto|none|host (default: auto)
+
+    .PARAMETER Enroll
+    Prompt for a one-time enrollment code without putting it in command history
+
+    .PARAMETER Persist
+    Enroll and install a current-user startup entry
     #>
     [CmdletBinding()]
     param(
@@ -351,7 +357,10 @@ function global:RDev {
         [string]$Version = '',
         [ValidateSet('go','rs')]
         [string]$Client = 'go',
-        [string]$Mirror = 'auto'
+        [string]$Mirror = 'auto',
+        [switch]$Enroll,
+        [switch]$Persist,
+        [string]$IdentityFile = ''
     )
 
     if ($Server -is [Array]) { $Server = ($Server -join ',') }
@@ -360,7 +369,7 @@ function global:RDev {
     if (-not $Server) { Write-Error "Server is required"; return }
 
     $Elevate = $false
-    if (-not (Test-RDevAdministrator)) {
+    if (-not $Enroll -and -not $Persist -and -not (Test-RDevAdministrator)) {
         if (Wait-RDevElevationKey) {
             $Elevate = $true
             Write-Host "  Elevation requested; will start rdev-client with UAC after download." -ForegroundColor Cyan
@@ -544,13 +553,54 @@ function global:RDev {
     if ($Password)  { $A += @("-p", $Password) }
     if ($Shell)     { if ($Client -eq 'rs') { $A += @("--shell", $Shell) } else { $A += @("-S", $Shell) } }
     if ($SshPort -and $Client -ne 'rs')   { $A += @("--ssh-port", $SshPort) }
+    if ($IdentityFile -and $Client -eq 'go') { $A += @('--identity-file', $IdentityFile) }
 
     if ($WinPTYDir) { $env:RDEV_WINPTY_DIR = $WinPTYDir }
 
     Write-Host ""
     Write-Host "  Starting $ClientName..." -ForegroundColor Cyan
-    Write-Host "  $RunPath $($A -join ' ')" -ForegroundColor Gray
+    Write-Host "  Binary: $RunPath" -ForegroundColor Gray
     Write-Host ""
+
+    if ($Persist) {
+        if ($Client -ne 'go') { Write-Error 'Persistent enrollment requires the compatible Go client.'; return }
+        $InstallDir = Join-Path $env:LOCALAPPDATA 'RDev'
+        $InstalledPath = Join-Path $InstallDir 'rdev-client.exe'
+        if (-not $IdentityFile) { $IdentityFile = Join-Path $InstallDir 'identity.bin' }
+        if (Test-Path -LiteralPath $IdentityFile) {
+            Write-Error "A managed-device identity already exists at $IdentityFile."
+            return
+        }
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        Copy-Item -LiteralPath $RunPath -Destination $InstalledPath -Force
+        $EnrollmentCode = Read-Host '  One-time enrollment code'
+        $EnrollArgs = @('-s', $Server)
+        if ($Id) { $EnrollArgs += @('-i', $Id) }
+        $EnrollArgs += @('--enroll-stdin', '--enroll-only', '--identity-file', $IdentityFile)
+        $EnrollmentCode | & $InstalledPath @EnrollArgs
+        $EnrollExitCode = $LASTEXITCODE
+        $EnrollmentCode = $null
+        if ($EnrollExitCode -ne 0) {
+            Write-Error "Enrollment failed with exit code $EnrollExitCode."
+            return
+        }
+        $StartupDir = [Environment]::GetFolderPath('Startup')
+        $StartupPath = Join-Path $StartupDir 'RDev.cmd'
+        $StartupCommand = '@start "" /min "' + $InstalledPath + '" --identity-file "' + $IdentityFile + '"' + "`r`n"
+        [IO.File]::WriteAllText($StartupPath, $StartupCommand, (New-Object Text.UTF8Encoding($false)))
+        Start-Process -FilePath $InstalledPath -ArgumentList @('--identity-file', ('"' + $IdentityFile + '"')) -WindowStyle Hidden | Out-Null
+        Write-Host "  RDev is installed for the current user and will reconnect after sign-in." -ForegroundColor Green
+        return
+    }
+
+    if ($Enroll) {
+        if ($Client -ne 'go') { Write-Error 'Enrollment requires the compatible Go client.'; return }
+        $EnrollmentCode = Read-Host '  One-time enrollment code'
+        $A += '--enroll-stdin'
+        $EnrollmentCode | & $RunPath @A
+        $EnrollmentCode = $null
+        return
+    }
 
     if ($Elevate) {
         try {
