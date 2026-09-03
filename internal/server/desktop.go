@@ -624,6 +624,7 @@ func (s *Server) HandleDesktopWS(w http.ResponseWriter, r *http.Request) {
 	upgrader := gws.NewUpgrader(&desktopWSHandler{srv: s}, &gws.ServerOption{
 		ReadMaxPayloadSize: 1024 * 1024,
 		ParallelGolimit:    runtime.GOMAXPROCS(0),
+		SubProtocols:       []string{browserSocketProtocol},
 		Authorize: func(r *http.Request, session gws.SessionStorage) bool {
 			session.Store("deviceID", deviceID)
 			session.Store("desktopRequest", request)

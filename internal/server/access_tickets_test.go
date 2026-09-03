@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lxzan/gws"
 )
 
 func TestControlAuthUsesOnlyControlTokenHeader(t *testing.T) {
@@ -87,6 +89,48 @@ func TestBrowserSocketAuthAcceptsOnlyScopedFeiduTicket(t *testing.T) {
 			}
 			if test.wantStatus != http.StatusOK && response.Code != test.wantStatus {
 				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+		})
+	}
+}
+
+func TestBrowserWebSocketHandlersNegotiateProtocol(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		handler func(*Server, http.ResponseWriter, *http.Request)
+	}{
+		{name: "terminal", path: "/terminal?device=device", handler: func(s *Server, w http.ResponseWriter, r *http.Request) { s.HandleTerminalWS(w, r) }},
+		{name: "files", path: "/files", handler: func(s *Server, w http.ResponseWriter, r *http.Request) { s.HandleFilesWS(w, r) }},
+		{name: "desktop", path: "/desktop?device=device", handler: func(s *Server, w http.ResponseWriter, r *http.Request) { s.HandleDesktopWS(w, r) }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := NewServer()
+			s.ControlToken = "control-secret"
+			s.clients["device"] = &ClientConn{ID: "device", InstanceID: "one"}
+			ticket := issueAccessTicketWithSubject(t, s, "device", "feidu-browser:42", 60)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				test.handler(s, w, r)
+			}))
+			t.Cleanup(server.Close)
+
+			header := make(http.Header)
+			header.Set("Sec-WebSocket-Protocol", browserSocketProtocol+", "+browserTicketProtocol+ticket)
+			socket, response, err := gws.NewClient(&gws.BuiltinEventHandler{}, &gws.ClientOption{
+				Addr:          "ws" + strings.TrimPrefix(server.URL, "http") + test.path,
+				RequestHeader: header,
+			})
+			if err != nil {
+				t.Fatalf("connect: %v", err)
+			}
+			t.Cleanup(func() { _ = socket.WriteClose(1000, nil) })
+			if got := response.Header.Get("Sec-WebSocket-Protocol"); got != browserSocketProtocol {
+				t.Fatalf("response protocol = %q, want %q", got, browserSocketProtocol)
+			}
+			if got := socket.SubProtocol(); got != browserSocketProtocol {
+				t.Fatalf("socket protocol = %q, want %q", got, browserSocketProtocol)
 			}
 		})
 	}

@@ -16,6 +16,7 @@ import (
 
 const (
 	accessTicketPrefix      = "rdvat_"
+	browserSocketProtocol   = "rdev-browser-v1"
 	browserTicketProtocol   = "rdev-access-ticket."
 	browserTicketSubject    = "feidu-browser:"
 	accessTicketSecretBytes = 32

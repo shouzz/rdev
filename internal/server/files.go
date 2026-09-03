@@ -449,6 +449,7 @@ func (s *Server) HandleFilesWS(w http.ResponseWriter, r *http.Request) {
 	upgrader := gws.NewUpgrader(&filesWSHandler{srv: s}, &gws.ServerOption{
 		ReadMaxPayloadSize: 16 * 1024 * 1024,
 		ParallelGolimit:    1,
+		SubProtocols:       []string{browserSocketProtocol},
 		PermessageDeflate:  gws.PermessageDeflate{Enabled: false},
 	})
 	socket, err := upgrader.Upgrade(w, r)
