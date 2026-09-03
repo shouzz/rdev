@@ -340,7 +340,7 @@ function global:RDev {
     Download mirror: auto|none|host (default: auto)
 
     .PARAMETER Enroll
-    Prompt for a one-time enrollment code without putting it in command history
+    Enroll with a one-time code. Uses RDEV_ENROLLMENT_CODE when set, otherwise prompts.
 
     .PARAMETER Persist
     Enroll and install a current-user startup entry
@@ -362,6 +362,11 @@ function global:RDev {
         [switch]$Persist,
         [string]$IdentityFile = ''
     )
+
+    # Join links provide the code through a process-local environment variable,
+    # keeping it out of the client process argument list. Consume it once.
+    $EnrollmentCode = $env:RDEV_ENROLLMENT_CODE
+    $env:RDEV_ENROLLMENT_CODE = $null
 
     if ($Server -is [Array]) { $Server = ($Server -join ',') }
     $Server = [string]$Server
@@ -573,7 +578,7 @@ function global:RDev {
         }
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
         Copy-Item -LiteralPath $RunPath -Destination $InstalledPath -Force
-        $EnrollmentCode = Read-Host '  One-time enrollment code'
+        if (-not $EnrollmentCode) { $EnrollmentCode = Read-Host '  One-time enrollment code' }
         $EnrollArgs = @('-s', $Server)
         if ($Id) { $EnrollArgs += @('-i', $Id) }
         $EnrollArgs += @('--enroll-stdin', '--enroll-only', '--identity-file', $IdentityFile)
@@ -595,7 +600,7 @@ function global:RDev {
 
     if ($Enroll) {
         if ($Client -ne 'go') { Write-Error 'Enrollment requires the compatible Go client.'; return }
-        $EnrollmentCode = Read-Host '  One-time enrollment code'
+        if (-not $EnrollmentCode) { $EnrollmentCode = Read-Host '  One-time enrollment code' }
         $A += '--enroll-stdin'
         $EnrollmentCode | & $RunPath @A
         $EnrollmentCode = $null

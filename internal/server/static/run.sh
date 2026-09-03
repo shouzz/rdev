@@ -21,6 +21,7 @@ RDEV_CLIENT="go"
 RDEV_ENROLL=0
 RDEV_PERSIST=0
 RDEV_IDENTITY_FILE=""
+RDEV_ENROLLMENT_CODE="${RDEV_ENROLLMENT_CODE:-}"
 RDEV_REPO="icepie/rdev"
 LOCAL_CLIENT_REVISION="feidu-20260903-scp3"
 LOCAL_WINDOWS_AMD64_ASSET="rdev-client-windows-amd64.exe"
@@ -600,6 +601,11 @@ echo "  Starting ${CLIENT_LABEL}..." >&2
 printf '  Binary: %s\n\n' "$RUN_BIN" >&2
 
 read_enrollment_code() {
+    if [ -n "$RDEV_ENROLLMENT_CODE" ]; then
+        ENROLLMENT_CODE="$RDEV_ENROLLMENT_CODE"
+        RDEV_ENROLLMENT_CODE=""
+        return 0
+    fi
     [ -r /dev/tty ] || { echo "Error: enrollment requires an interactive terminal" >&2; return 1; }
     printf '%s' "  One-time enrollment code: " >/dev/tty
     old_stty="$(stty -g </dev/tty 2>/dev/null || true)"

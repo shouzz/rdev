@@ -34,7 +34,7 @@
 <body>
 <main>
   <h1>加入远程调试</h1>
-  <p class="lead" id="lead">一次性邀请，设备身份不会显示在命令参数中。</p>
+  <p class="lead" id="lead">选择系统和运行方式，复制后即可启用，不需要再次输入邀请码。</p>
 
   <div class="row">
     <div class="label">邀请码</div>
@@ -83,13 +83,17 @@
   }
 
   function render() {
+    if (!valid) {
+      commandNode.textContent = '';
+      return;
+    }
     const origin = location.origin;
     if (state.os === 'windows') {
       const mode = state.mode === 'persistent' ? '-Persist' : '-Enroll';
-      commandNode.textContent = `powershell -NoProfile -Command "iwr -useb '${origin}/run.ps1' | iex; RDev '${origin}' ${mode}"`;
+      commandNode.textContent = `$env:RDEV_ENROLLMENT_CODE='${invitation}'; iwr -useb '${origin}/run.ps1' | iex; RDev '${origin}' ${mode}`;
     } else {
       const mode = state.mode === 'persistent' ? '--persist' : '--enroll';
-      commandNode.textContent = `curl -fsSL '${origin}/run.sh' | sh -s -- '${origin}' ${mode}`;
+      commandNode.textContent = `curl -fsSL '${origin}/run.sh' | RDEV_ENROLLMENT_CODE='${invitation}' sh -s -- '${origin}' ${mode}`;
     }
   }
 
