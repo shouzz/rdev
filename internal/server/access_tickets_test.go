@@ -152,6 +152,38 @@ func TestAccessTicketCreationRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
+func TestAccessTicketResponseUsesOneExactSecondPrecision(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 987654321, time.UTC)
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.accessTicketNow = func() time.Time { return now }
+	s.clients["device"] = &ClientConn{ID: "device", InstanceID: "one"}
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/control/access-tickets",
+		strings.NewReader("{\"deviceId\":\"device\",\"subject\":\"feidu-browser:42\",\"expiresInSeconds\":600}"),
+	)
+	req.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	response := httptest.NewRecorder()
+
+	s.HandleAccessTicketsAPI(response, req)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	var access accessTicketCreateResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &access); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	wantExpiresAt := now.Add(10 * time.Minute).UTC().Truncate(time.Second)
+	if access.ExpiresAt != wantExpiresAt.Format(time.RFC3339) {
+		t.Fatalf("expiresAt = %q, want %q", access.ExpiresAt, wantExpiresAt.Format(time.RFC3339))
+	}
+	if access.ExpiresAtMs != wantExpiresAt.UnixMilli() {
+		t.Fatalf("expiresAtMs = %d, want %d", access.ExpiresAtMs, wantExpiresAt.UnixMilli())
+	}
+}
+
 func TestSecureModeDeviceCredentialRules(t *testing.T) {
 	s := NewServer()
 	s.ControlToken = "control-secret"

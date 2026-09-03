@@ -251,7 +251,7 @@ func (s *Server) HandleAccessTicketsAPI(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "ticket generation failed", http.StatusInternalServerError)
 		return
 	}
-	expiresAt := s.accessTicketCurrentTime().Add(lifetime).UTC()
+	expiresAt := s.accessTicketCurrentTime().Add(lifetime).UTC().Truncate(time.Second)
 	hash := sha256.Sum256([]byte(ticketValue))
 	s.accessTicketMu.Lock()
 	if s.accessTickets == nil {
