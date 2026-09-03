@@ -32,6 +32,29 @@ type SSHServer struct {
 	fwdHandler *ForwardedTCPHandler // for -R port forwarding
 }
 
+type sshContextKey struct{}
+
+var sshDeviceAuthorizationKey sshContextKey
+
+func bindSSHDeviceAuthorization(ctx ssh.Context, client *ClientConn) {
+	ctx.SetValue(sshDeviceAuthorizationKey, deviceAuthorizationFor(client))
+}
+
+func (s *Server) authorizedSSHClient(ctx ssh.Context) (*ClientConn, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	authorization, ok := ctx.Value(sshDeviceAuthorizationKey).(deviceAuthorization)
+	if !ok {
+		return nil, false
+	}
+	client, ok := s.GetClient(ctx.User())
+	if !ok || !authorization.validFor(client) {
+		return nil, false
+	}
+	return client, true
+}
+
 // NewSSHServer creates a new SSH server
 func NewSSHServer(srv *Server, addr, hostKeyPath, authorizedKeysPath string) (*SSHServer, error) {
 	s := &SSHServer{srv: srv}
@@ -72,15 +95,19 @@ func NewSSHServer(srv *Server, addr, hostKeyPath, authorizedKeysPath string) (*S
 		// Allow all port forwarding by default
 		LocalPortForwardingCallback: func(ctx ssh.Context, destAddr string, destPort uint32) bool {
 			clientID := ctx.User()
-			_, ok := srv.GetClient(clientID)
+			_, ok := srv.authorizedSSHClient(ctx)
 			if !ok {
-				log.Printf("ssh fwd -L: client %s not connected, denied", clientID)
+				log.Printf("ssh fwd -L: client %s authorization is no longer valid, denied", clientID)
 				return false
 			}
 			log.Printf("ssh fwd -L: %s -> %s:%d allowed", clientID, destAddr, destPort)
 			return true
 		},
 		ReversePortForwardingCallback: func(ctx ssh.Context, bindAddr string, bindPort uint32) bool {
+			if _, ok := srv.authorizedSSHClient(ctx); !ok {
+				log.Printf("ssh fwd -R: client %s authorization is no longer valid, denied", ctx.User())
+				return false
+			}
 			log.Printf("ssh fwd -R: %s bind %s:%d allowed", ctx.User(), bindAddr, bindPort)
 			return true
 		},
@@ -156,18 +183,23 @@ func (s *SSHServer) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	clientID := ctx.User()
 	client, ok := s.srv.GetClient(clientID)
 	if !ok {
-		return true // let auth pass, session handler will show error and close
+		return !s.srv.secureControlEnabled()
+	}
+	if s.srv.secureControlEnabled() {
+		return false
 	}
 	s.authKeysMu.RLock()
 	defer s.authKeysMu.RUnlock()
 	for _, authKey := range s.authKeys {
 		if ssh.KeysEqual(key, authKey) {
+			bindSSHDeviceAuthorization(ctx, client)
 			log.Printf("ssh auth: %s authenticated via public key", clientID)
 			return true
 		}
 	}
-	// No authorized_keys match: allow if client has no password (open mode)
-	if client.Password == "" {
+	// Legacy open mode is available only when the protected control plane is disabled.
+	if client.Password == "" && !s.srv.secureControlEnabled() {
+		bindSSHDeviceAuthorization(ctx, client)
 		log.Printf("ssh auth: %s accepted (no auth required)", clientID)
 		return true
 	}
@@ -178,15 +210,11 @@ func (s *SSHServer) handlePassword(ctx ssh.Context, pass string) bool {
 	clientID := ctx.User()
 	client, ok := s.srv.GetClient(clientID)
 	if !ok {
-		return true // let auth pass, session handler will show error and close
+		return !s.srv.secureControlEnabled()
 	}
-	// Open mode: no password set, any password works
-	if client.Password == "" {
-		log.Printf("ssh auth: %s accepted (no auth required)", clientID)
-		return true
-	}
-	if client.Password == pass {
-		log.Printf("ssh auth: %s authenticated via password", clientID)
+	if s.srv.authorizeDeviceCredential(client, pass) {
+		bindSSHDeviceAuthorization(ctx, client)
+		log.Printf("ssh auth: %s authenticated", clientID)
 		return true
 	}
 	return false
@@ -196,10 +224,11 @@ func (s *SSHServer) handleKeyboardInteractive(ctx ssh.Context, challenger gossh.
 	clientID := ctx.User()
 	client, ok := s.srv.GetClient(clientID)
 	if !ok {
-		return true // let auth pass, session handler will show error and close
+		return !s.srv.secureControlEnabled()
 	}
-	// Open mode: no challenge, auto-accept
-	if client.Password == "" {
+	// Legacy open mode is available only when the protected control plane is disabled.
+	if client.Password == "" && !s.srv.secureControlEnabled() {
+		bindSSHDeviceAuthorization(ctx, client)
 		log.Printf("ssh auth: %s accepted via keyboard-interactive (no auth required)", clientID)
 		return true
 	}
@@ -208,7 +237,8 @@ func (s *SSHServer) handleKeyboardInteractive(ctx ssh.Context, challenger gossh.
 	if err != nil || len(answers) == 0 {
 		return false
 	}
-	if answers[0] == client.Password {
+	if s.srv.authorizeDeviceCredential(client, answers[0]) {
+		bindSSHDeviceAuthorization(ctx, client)
 		log.Printf("ssh auth: %s authenticated via keyboard-interactive", clientID)
 		return true
 	}
@@ -231,9 +261,9 @@ func (s *SSHServer) handleSession(sess ssh.Session) {
 		}
 	}()
 	clientID := sess.User()
-	client, ok := s.srv.GetClient(clientID)
+	client, ok := s.srv.authorizedSSHClient(sess.Context())
 	if !ok {
-		fmt.Fprintf(sess, "rdev: client '%s' is not connected\n", clientID)
+		fmt.Fprintf(sess, "rdev: authorization for client '%s' is no longer valid\n", clientID)
 		sess.Exit(1)
 		return
 	}
@@ -361,9 +391,9 @@ func (s *SSHServer) handleSession(sess ssh.Session) {
 
 func (s *SSHServer) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx ssh.Context) {
 	clientID := ctx.User()
-	client, ok := s.srv.GetClient(clientID)
+	client, ok := s.srv.authorizedSSHClient(ctx)
 	if !ok {
-		newChan.Reject(gossh.ConnectionFailed, "client not connected")
+		newChan.Reject(gossh.Prohibited, "device authorization is no longer valid")
 		return
 	}
 

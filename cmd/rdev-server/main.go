@@ -24,8 +24,10 @@ func main() {
 		tcpAddr                    = ":8081"
 		kcpAddr                    = ":8082"
 		sshAddr                    = ":2222"
+		advertiseTCPPort           = ""
+		advertiseKCPPort           = ""
+		advertiseSSHPort           = ""
 		dataDir                    = ""
-		adminToken                 = ""
 		maxSessions                = 0
 		maxForwards                = 0
 		batchConcurrency           = 0
@@ -59,14 +61,24 @@ func main() {
 				sshAddr = os.Args[i+1]
 				i++
 			}
+		case "--advertise-tcp-port":
+			if i+1 < len(os.Args) {
+				advertiseTCPPort = os.Args[i+1]
+				i++
+			}
+		case "--advertise-kcp-port":
+			if i+1 < len(os.Args) {
+				advertiseKCPPort = os.Args[i+1]
+				i++
+			}
+		case "--advertise-ssh-port":
+			if i+1 < len(os.Args) {
+				advertiseSSHPort = os.Args[i+1]
+				i++
+			}
 		case "--data", "-d":
 			if i+1 < len(os.Args) {
 				dataDir = os.Args[i+1]
-				i++
-			}
-		case "--admin-token", "-t":
-			if i+1 < len(os.Args) {
-				adminToken = os.Args[i+1]
 				i++
 			}
 		case "--max-sessions":
@@ -133,8 +145,10 @@ Options:
   --tcp       TCP client listen address for control and GPU tunnel (default :8081)
   --kcp       KCP/UDP client listen address for control and GPU tunnel (default :8082)
   --ssh, -s   SSH listen address (default :2222)
+  --advertise-tcp-port PORT  Public TCP port shown to clients (defaults to listen port)
+  --advertise-kcp-port PORT  Public KCP port shown to clients (defaults to listen port)
+  --advertise-ssh-port PORT  Public SSH port shown to clients (defaults to listen port)
   --data, -d  Data directory for host key & authorized_keys (default ~/.rdev)
-  --admin-token, -t  Token for Web UI APIs, terminal, batch, upload (optional)
   --max-sessions     Max concurrent sessions per device (default 256)
   --max-forwards     Max concurrent TCP forwards per device (default 1024)
   --batch-concurrency Max concurrent batch operations (default GOMAXPROCS*8)
@@ -162,9 +176,6 @@ Examples:
 		}
 	}
 
-	if adminToken == "" {
-		adminToken = os.Getenv("RDEV_ADMIN_TOKEN")
-	}
 	if env := os.Getenv("RDEV_AUTO_UPDATE"); env != "" {
 		autoUpdate = parseBoolDefault(env, autoUpdate)
 	}
@@ -173,6 +184,15 @@ Examples:
 	}
 	if env := os.Getenv("RDEV_KCP_ADDR"); env != "" {
 		kcpAddr = env
+	}
+	if env := os.Getenv("RDEV_ADVERTISE_TCP_PORT"); env != "" {
+		advertiseTCPPort = env
+	}
+	if env := os.Getenv("RDEV_ADVERTISE_KCP_PORT"); env != "" {
+		advertiseKCPPort = env
+	}
+	if env := os.Getenv("RDEV_ADVERTISE_SSH_PORT"); env != "" {
+		advertiseSSHPort = env
 	}
 	if env := os.Getenv("RDEV_UPDATE_INTERVAL"); env != "" {
 		if d, err := time.ParseDuration(env); err == nil && d > 0 {
@@ -198,6 +218,8 @@ Examples:
 		dataDir = filepath.Join(home, ".rdev")
 	}
 	os.MkdirAll(dataDir, 0700)
+	localReleaseDir := filepath.Join(dataDir, "releases")
+	os.MkdirAll(localReleaseDir, 0700)
 
 	hostKeyPath := filepath.Join(dataDir, "host_key")
 	authorizedKeysPath := filepath.Join(dataDir, "authorized_keys")
@@ -216,16 +238,32 @@ Examples:
 	tcpPort := portFromAddr(tcpAddr)
 	kcpPort := portFromAddr(kcpAddr)
 	sshPort := portFromAddr(sshAddr)
+	if strings.TrimSpace(advertiseTCPPort) != "" {
+		tcpPort = strings.TrimSpace(advertiseTCPPort)
+	}
+	if strings.TrimSpace(advertiseKCPPort) != "" {
+		kcpPort = strings.TrimSpace(advertiseKCPPort)
+	}
+	if strings.TrimSpace(advertiseSSHPort) != "" {
+		sshPort = strings.TrimSpace(advertiseSSHPort)
+	}
 
 	srv := server.NewServer()
 	srv.ReleaseVersion = version
+	srv.LocalReleaseDir = localReleaseDir
+	if controlTokenPath := os.Getenv("RDEV_CONTROL_TOKEN_FILE"); controlTokenPath != "" {
+		controlToken, err := readControlTokenFile(controlTokenPath)
+		if err != nil {
+			log.Fatalf("load RDev control token: %v", err)
+		}
+		srv.ControlToken = controlToken
+	}
 	srv.ClientLogs = server.NewClientLogManager(clientLogDir, clientLogRetention, clientLogMaxFileSize)
 	srv.ClientLogs.StartCleanup()
 	srv.SSHPort = sshPort
 	srv.HTTPHost = outboundIP + ":" + httpPort
 	srv.TCPPort = tcpPort
 	srv.KCPPort = kcpPort
-	srv.AdminToken = adminToken
 	if maxSessions > 0 {
 		srv.MaxSessions = maxSessions
 	}
@@ -273,9 +311,11 @@ Examples:
 	mux.HandleFunc("/api/vnc/settings", srv.HandleVNCSettingsAPI)
 	mux.HandleFunc("/api/client-logs/", srv.HandleClientLogsAPI)
 	mux.HandleFunc("/api/client-logs", srv.HandleClientLogsAPI)
+	mux.HandleFunc("/api/control/access-tickets", srv.HandleAccessTicketsAPI)
 	mux.HandleFunc("/api/upload", srv.HandleFileUpload)
 	mux.HandleFunc("/download-release", srv.HandleReleaseDownload)
 	mux.HandleFunc("/download-release-proxy", srv.HandleReleaseDownloadProxy)
+	mux.HandleFunc("/local-release", srv.HandleLocalReleaseDownload)
 	mux.Handle("/", srv.StaticHandler())
 
 	go func() {
@@ -313,9 +353,6 @@ Examples:
 	}
 	fmt.Printf("  ║  SSH:    %s:%s                       ║\n", outboundIP, sshPort)
 	fmt.Printf("  ║  Data:   %-37s║\n", dataDir)
-	if adminToken != "" {
-		fmt.Println("  ║  WebAuth: enabled                              ║")
-	}
 	if vncAddr != "" {
 		fmt.Printf("  ║  VNC:    %-37s║\n", vncAddr)
 	}

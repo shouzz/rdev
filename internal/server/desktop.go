@@ -103,8 +103,8 @@ func (h *desktopWSHandler) OnOpen(socket *gws.Conn) {
 
 	bc := &desktopBrowserConn{srv: h.srv, socket: socket, deviceID: client.ID, client: client, request: desktopRequestFromSession(socket), frameCh: make(chan []byte, 1), done: make(chan struct{})}
 	socket.Session().Store("desktopConn", bc)
-	if client.Password != "" {
-		h.sendJSON(socket, desktopMsg{Op: "auth", Device: client.ID, Message: "device password required"})
+	if h.srv.requiresDeviceCredential(client) {
+		h.sendJSON(socket, desktopMsg{Op: "auth", Device: client.ID, Message: "device credential required"})
 		return
 	}
 	h.start(bc)
@@ -137,15 +137,21 @@ func (h *desktopWSHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 		if bc.authOK {
 			return
 		}
-		if msg.Op == "start" && bc.client.Password != "" {
-			bc.writeJSON(desktopMsg{Op: "auth", Device: bc.deviceID, Message: "device password required"})
+		client, ok := h.srv.GetClient(bc.deviceID)
+		if !ok {
+			bc.writeJSON(desktopMsg{Op: "error", Device: bc.deviceID, Message: "device not connected"})
 			return
 		}
-		if bc.client.Password == "" || passwordFingerprint(msg.Pass) == passwordFingerprint(bc.client.Password) {
+		bc.client = client
+		if msg.Op == "start" && h.srv.requiresDeviceCredential(client) {
+			bc.writeJSON(desktopMsg{Op: "auth", Device: bc.deviceID, Message: "device credential required"})
+			return
+		}
+		if h.srv.authorizeDeviceCredential(client, msg.Pass) {
 			h.start(bc)
 			return
 		}
-		bc.writeJSON(desktopMsg{Op: "auth_fail", Device: bc.deviceID, Message: "wrong password"})
+		bc.writeJSON(desktopMsg{Op: "auth_fail", Device: bc.deviceID, Message: "wrong credential"})
 	case "input":
 		input, ok := bc.prepareInput(msg)
 		if !ok {

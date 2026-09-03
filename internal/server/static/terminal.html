@@ -122,23 +122,13 @@
     document.querySelectorAll('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); });
     window.addEventListener('rdev:langchange', () => { if (typeof renderDevices === 'function') renderDevices(); if (typeof renderList === 'function') renderList(); });
 
-    const adminToken = new URLSearchParams(location.search).get('token') || localStorage.getItem('rdevAdminToken') || '';
-    if (adminToken) localStorage.setItem('rdevAdminToken', adminToken);
-    function authURL(path) { return adminToken ? path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(adminToken) : path; }
-    async function authFetch(path, init) {
-        const r = await fetch(authURL(path), init);
-        if (r.status === 401) {
-            const token = await RDevUI.prompt({ title: t('common.adminTokenRequired'), message: t('common.adminTokenRequired'), type: 'password' });
-            if (token) { localStorage.setItem('rdevAdminToken', token); location.search = 'token=' + encodeURIComponent(token); }
-        }
-        return r;
-    }
+    function authFetch(path, init) { return fetch(path, init); }
     const FitAddon = window.FitAddon;
     const WebLinksAddon = window.WebLinksAddon;
     const WebglAddon = window.AddonWebgl?.WebglAddon;
     const enableTerminalWebgl = localStorage.getItem('rdevTerminal.webgl') === 'true';
 
-    document.querySelectorAll('[data-auth-link]').forEach(a => a.href = authURL(a.getAttribute('href')));
+    document.querySelectorAll('[data-auth-link]').forEach(a => a.href = a.getAttribute('href'));
 
     let tabs = [], activeTabId = null, tabCounter = 0;
     const terminalInputEncoder = new TextEncoder();
@@ -314,7 +304,7 @@
         tab.status = 'connecting'; tab.needAuth = false; tab.term.reset(); renderTabs();
 
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const terminalURL = `${proto}//${location.host}${authURL('/terminal?device=' + encodeURIComponent(tab.deviceId))}`;
+        const terminalURL = `${proto}//${location.host}/terminal?device=${encodeURIComponent(tab.deviceId)}`;
         tab.ws = RDevUI.socket(terminalURL, { worker: false });
         tab.ws.binaryType = 'arraybuffer';
 

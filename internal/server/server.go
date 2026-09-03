@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -549,6 +551,9 @@ type Server struct {
 	vncStreams        map[string]*vncDesktopStream
 	gpuDesktopMu      sync.RWMutex
 	gpuDesktopTunnels map[string]*gpuDesktopTunnel
+	accessTicketMu    sync.Mutex
+	accessTickets     map[[32]byte]accessTicket
+	accessTicketNow   func() time.Time
 	releaseLatestMu   sync.Mutex
 	releaseLatestTag  string
 	releaseLatestAt   time.Time
@@ -559,12 +564,13 @@ type Server struct {
 	HTTPHost         string // e.g. "192.168.1.100:8080"
 	TCPPort          string
 	KCPPort          string
-	AdminToken       string // optional token for web APIs and browser WebSockets
 	VNCAddr          string // optional VNC/RFB listen address
 	MaxSessions      int    // maximum concurrent sessions per device
 	MaxForwards      int    // maximum concurrent forwards per device
 	BatchConcurrency int    // maximum concurrent batch operations
 	ReleaseVersion   string // server release version, injected by main
+	LocalReleaseDir  string // optional directory for verified operator-provided client builds
+	ControlToken     string // backend-only control API credential
 	ClientLogs       *ClientLogManager
 }
 
@@ -582,6 +588,8 @@ func NewServer() *Server {
 		vncSettings:       make(map[string]protocol.Message),
 		vncStreams:        make(map[string]*vncDesktopStream),
 		gpuDesktopTunnels: make(map[string]*gpuDesktopTunnel),
+		accessTickets:     make(map[[32]byte]accessTicket),
+		accessTicketNow:   time.Now,
 		MaxSessions:       256,
 		MaxForwards:       1024,
 		BatchConcurrency:  runtime.GOMAXPROCS(0) * 8,
@@ -804,6 +812,19 @@ func cloneDesktopCapabilities(caps *protocol.DesktopCapabilities) *protocol.Desk
 		clone.Sources = append([]protocol.DesktopSource(nil), caps.Sources...)
 	}
 	return &clone
+}
+
+func publicDesktopCapabilities(caps *protocol.DesktopCapabilities) *protocol.DesktopCapabilities {
+	clone := cloneDesktopCapabilities(caps)
+	if clone == nil {
+		return nil
+	}
+	for i := range clone.Sources {
+		if clone.Sources[i].Kind == "window" {
+			clone.Sources[i].Label = "Window (" + clone.Sources[i].ID + ")"
+		}
+	}
+	return clone
 }
 
 func (s *Server) clientGPUDesktopAvailable(client *ClientConn) bool {
@@ -1387,25 +1408,11 @@ func (s *Server) handleFileResult(msg *protocol.Message) {
 	}
 }
 
-func (s *Server) authOK(r *http.Request) bool {
-	if s.AdminToken == "" {
-		return true
-	}
-	token := r.Header.Get("X-RDev-Token")
-	if token == "" {
-		token = r.URL.Query().Get("token")
-	}
-	if token == "" {
-		auth := r.Header.Get("Authorization")
-		token = strings.TrimPrefix(auth, "Bearer ")
-	}
-	return token == s.AdminToken
-}
-
 func (s *Server) requireAuth(w http.ResponseWriter, r *http.Request) bool {
-	if s.authOK(r) {
+	if s.controlAuthOK(r) {
 		return true
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
 	return false
 }
@@ -1447,7 +1454,7 @@ func (s *Server) HandleAPI(w http.ResponseWriter, r *http.Request) {
 			Sessions:     n,
 			Forwards:     f,
 			HasPassword:  c.Password != "",
-			Desktop:      cloneDesktopCapabilities(c.Desktop),
+			Desktop:      publicDesktopCapabilities(c.Desktop),
 			GPUDesktop:   s.clientGPUDesktopAvailable(c),
 			LogSupported: c.LogSupported,
 		})
@@ -1491,6 +1498,34 @@ func releaseDownloadParams(r *http.Request) (asset, tag string, ok bool) {
 		}
 	}
 	return asset, tag, true
+}
+
+// HandleLocalReleaseDownload serves operator-provided client builds without exposing a directory listing.
+func (s *Server) HandleLocalReleaseDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	asset := strings.TrimSpace(r.URL.Query().Get("asset"))
+	if asset == "" || strings.Contains(asset, "/") || strings.Contains(asset, "\\") || strings.Contains(asset, "..") {
+		http.Error(w, "bad asset", http.StatusBadRequest)
+		return
+	}
+	dir := strings.TrimSpace(s.LocalReleaseDir)
+	if dir == "" {
+		http.NotFound(w, r)
+		return
+	}
+	path := filepath.Join(dir, asset)
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+asset+"\"")
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, path)
 }
 
 func releaseDownloadCandidates(asset, tag string) []string {
@@ -1749,7 +1784,7 @@ func (s *Server) HandleConfigAPI(w http.ResponseWriter, r *http.Request) {
 		"tcpPort":      s.TCPPort,
 		"kcpPort":      s.KCPPort,
 		"vncAddr":      s.VNCAddr,
-		"authRequired": map[bool]string{true: "true", false: "false"}[s.AdminToken != ""],
+		"authRequired": map[bool]string{true: "true", false: "false"}[s.secureControlEnabled()],
 	})
 }
 
@@ -1790,7 +1825,7 @@ func (s *Server) HandleTerminalAPI(w http.ResponseWriter, r *http.Request) {
 			ConnectedAt:  c.ConnectedAt.Format(time.RFC3339),
 			Version:      c.Version,
 			HasPassword:  c.Password != "",
-			Desktop:      cloneDesktopCapabilities(c.Desktop),
+			Desktop:      publicDesktopCapabilities(c.Desktop),
 			GPUDesktop:   s.clientGPUDesktopAvailable(c),
 			LogSupported: c.LogSupported,
 		})

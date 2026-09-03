@@ -82,10 +82,10 @@ type vncDesktopStream struct {
 }
 
 // StartVNCServer exposes connected RDev devices through the RFB/VNC protocol.
-// Device selection uses modern VeNCrypt Plain username/password auth:
-// username=deviceId, password=device password. For devices without a password,
-// password may be empty or equal to the device id; if username is empty,
-// password may be the device id for no-password devices.
+// Device selection uses modern VeNCrypt Plain username/password auth. RDev
+// access tickets are intentionally not accepted by the VNC protocol.
+// username=deviceId, password=device password. When secure control is disabled,
+// a device without a password may use an empty password or its device id.
 func StartVNCServer(srv *Server, addr string) (net.Listener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -256,13 +256,19 @@ func (v *vncConn) readPlainCredentials() (string, string, error) {
 }
 
 func (v *vncConn) authenticate(username, password string) (*ClientConn, string, bool) {
+	if strings.HasPrefix(password, accessTicketPrefix) {
+		return nil, "", false
+	}
 	if username != "" {
 		client := v.lookupClient(username)
 		if client == nil {
 			return nil, "", false
 		}
 		if client.Password != "" {
-			return client, client.ID, constantTimeEqual(passwordFingerprint(password), passwordFingerprint(client.Password))
+			return client, client.ID, constantTimeEqual(password, client.Password)
+		}
+		if v.srv.secureControlEnabled() {
+			return nil, "", false
 		}
 		return client, client.ID, password == "" || password == client.ID
 	}
@@ -270,7 +276,7 @@ func (v *vncConn) authenticate(username, password string) (*ClientConn, string, 
 		return nil, "", false
 	}
 	client := v.lookupClient(password)
-	if client == nil || client.Password != "" {
+	if client == nil || client.Password != "" || v.srv.secureControlEnabled() {
 		return nil, "", false
 	}
 	return client, client.ID, true

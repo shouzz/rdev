@@ -64,6 +64,9 @@
         .progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.2s linear; }
         .task-stats { color: var(--muted); font-size: 0.76rem; margin-top: 0.35rem; }
         .task-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+        .connection-status { color: var(--muted); font-size: 0.78rem; white-space: nowrap; }
+        .connection-status.online { color: var(--green); }
+        .connection-status.offline { color: var(--yellow); }
         .badge { padding: 2px 7px; border-radius: 6px; font-size: 0.72rem; }
         .running { color: var(--accent); background: rgba(34,211,238,0.12); }
         .completed { color: var(--green); background: rgba(74,222,128,0.12); }
@@ -102,6 +105,7 @@
             <button id="up-btn"><span data-icon="folder"></span><span data-i18n="files.up">Up</span></button>
             <button id="refresh-btn"><span data-icon="refresh"></span><span data-i18n="files.refresh">Refresh</span></button>
             <button id="upload-btn" class="primary"><span data-icon="upload"></span><span data-i18n="files.upload">Upload</span></button>
+            <span id="ws-status" class="connection-status" role="status" aria-live="polite"></span>
         </section>
 
         <div class="drop" id="drop-zone"><span data-icon="upload"></span><span data-i18n="files.dropHint">Drop files here or choose files</span></div>
@@ -128,28 +132,19 @@
     document.getElementById('lang-slot').innerHTML = RDevUI.themeButton() + RDevI18n.langSelector();
     RDevI18n.apply();
     document.querySelectorAll('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); });
-    window.addEventListener('rdev:langchange', () => { renderTasks(); loadDevices(); RDevI18n.apply(); });
+    window.addEventListener('rdev:langchange', () => { renderTasks(); loadDevices(); RDevI18n.apply(); setConnectionState(connectionState); });
 
-    const adminToken = new URLSearchParams(location.search).get('token') || localStorage.getItem('rdevAdminToken') || '';
-    if (adminToken) localStorage.setItem('rdevAdminToken', adminToken);
-    function authURL(path) { return adminToken ? path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(adminToken) : path; }
-    async function authFetch(path, init) {
-        const r = await fetch(authURL(path), init);
-        if (r.status === 401) {
-            const token = await RDevUI.prompt({ title: t('common.adminTokenRequired'), message: t('common.adminTokenRequired'), type: 'password' });
-            if (token) { localStorage.setItem('rdevAdminToken', token); location.search = 'token=' + encodeURIComponent(token); }
-        }
-        return r;
-    }
-    document.querySelectorAll('[data-auth-link]').forEach(a => a.href = authURL(a.getAttribute('href')));
+    function authFetch(path, init) { return fetch(path, init); }
+    document.querySelectorAll('[data-auth-link]').forEach(a => a.href = a.getAttribute('href'));
 
     const CHUNK = 512 * 1024;
     const FILE_LIST_LIMIT = 100;
     const DOWNLOAD_STALL_MS = 12000;
     const DOWNLOAD_RETRY_MS = 2500;
+    const UPLOAD_ACK_TIMEOUT_MS = 15000;
     const enc = new TextEncoder();
     const dec = new TextDecoder();
-    let ws, devices = [], currentPath = '', parentPath = '', activeDevice = '', authPending = null, authResult = null, initialDeviceLoaded = false;
+    let ws, devices = [], currentPath = '', parentPath = '', activeDevice = '', authPending = null, authResult = null, initialDeviceLoaded = false, connectionState = 'connecting';
     let reconnectDelay = 1000, reconnectTimer = null;
     let fileEntries = [], listOffset = 0, listTotal = 0, listTruncated = false;
     const sendQueue = [];
@@ -191,9 +186,9 @@
                     <div class="task-stats">${esc(stat)}${task.message ? ' · ' + esc(task.message) : ''}</div>
                 </div>
                 <div class="task-actions">
-                    <button data-act="pause" ${task.status !== 'running' ? 'disabled' : ''}>${icon('pause')}</button>
-                    <button data-act="resume" ${task.status === 'running' || task.status === 'completed' || task.status === 'canceled' ? 'disabled' : ''}>${icon('play')}</button>
-                    <button data-act="cancel" ${task.status === 'completed' || task.status === 'canceled' ? 'disabled' : ''}>${icon('close')}</button>
+                    <button data-act="pause" aria-label="${esc(t('files.pause'))}" title="${esc(t('files.pause'))}" ${task.status !== 'running' ? 'disabled' : ''}>${icon('pause')}</button>
+                    <button data-act="resume" aria-label="${esc(t('files.resume'))}" title="${esc(t('files.resume'))}" ${task.status === 'running' || task.status === 'completed' || task.status === 'canceled' ? 'disabled' : ''}>${icon('play')}</button>
+                    <button data-act="cancel" aria-label="${esc(t('files.cancel'))}" title="${esc(t('files.cancel'))}" ${task.status === 'completed' || task.status === 'canceled' ? 'disabled' : ''}>${icon('close')}</button>
                     <button data-act="clear" ${task.status === 'running' ? 'disabled' : ''}>${t('files.clear')}</button>
                 </div>
             </div>`;
@@ -221,24 +216,52 @@
         clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(connectWS, nextReconnectDelay());
     }
+    function setConnectionState(state) {
+        connectionState = state;
+        const el = document.getElementById('ws-status');
+        if (!el) return;
+        el.className = 'connection-status ' + (state === 'online' ? 'online' : state === 'offline' ? 'offline' : '');
+        el.textContent = t('files.connection' + state[0].toUpperCase() + state.slice(1));
+    }
     function connectWS() {
         clearTimeout(reconnectTimer);
+        setConnectionState('connecting');
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = RDevUI.socket(`${proto}//${location.host}${authURL('/files')}`, { worker: false });
+        ws = RDevUI.socket(`${proto}//${location.host}/files`, { worker: false });
         ws.binaryType = 'arraybuffer';
         ws.onopen = () => {
+            setConnectionState('online');
             resetReconnectBackoff();
             while (sendQueue.length && ws && ws.readyState === WebSocket.OPEN) ws.send(sendQueue.shift());
             tasks.forEach(task => {
                 if (task.dir === 'download' && task.status === 'running' && !task.saved) resumeDownload(task, task.done || 0, t('files.resuming'));
+                if (task.dir === 'upload' && task.connectionPaused && filesByTask.has(task.id)) {
+                    task.connectionPaused = false;
+                    task.status = 'running';
+                    task.message = t('files.resuming');
+                    send({ op: 'upload_start', deviceId: task.device, taskId: task.id, parentPath: task.parentPath, name: task.name, size: task.size });
+                }
             });
+            saveTasks(); renderTasks();
         };
         ws.onmessage = evt => {
             if (evt.data instanceof ArrayBuffer) return onBinary(evt.data);
             if (evt.data instanceof Blob) return evt.data.arrayBuffer().then(onBinary);
             onText(JSON.parse(evt.data));
         };
-        ws.onclose = () => { ws = null; scheduleReconnect(); };
+        ws.onclose = () => {
+            setConnectionState('offline');
+            tasks.forEach(task => {
+                if (task.waitAck) { const reject = task.waitAck; task.waitAck = null; reject(new Error('WebSocket closed')); }
+                if (task.dir === 'upload' && task.status === 'running') {
+                    task.status = 'paused';
+                    task.connectionPaused = true;
+                    task.message = t('files.connectionLost');
+                }
+            });
+            ws = null;
+            saveTasks(); renderTasks(); scheduleReconnect();
+        };
     }
     function send(msg) {
         const payload = JSON.stringify(msg);
@@ -299,6 +322,7 @@
             task.status = 'running';
             task.message = '';
             task.lastProgress = Date.now();
+            task.requestedOffset = Number(msg.offset || 0);
             if ((msg.offset || 0) === 0 && (task.done || 0) === 0) task.blobParts = [];
             saveTasks();
         } else if (msg.op === 'transfer_end' && task) {
@@ -396,15 +420,41 @@
         send({ op: 'upload_start', deviceId: activeDevice, taskId: task.id, parentPath: currentPath, name: file.name, size: file.size, modTime: new Date(file.lastModified).toISOString() });
     }
     async function uploadLoop(task) {
+        if (task.uploadRunning) return;
         const file = filesByTask.get(task.id);
         if (!file) { task.status = 'failed'; task.message = t('files.reselect'); saveTasks(); return; }
-        for (let off = task.done || 0; off < file.size; off = task.done) {
-            if (task.status !== 'running') return;
-            const chunk = await file.slice(off, off + CHUNK).arrayBuffer();
-            ws.send(encodeFrame(0x20, task.id, off, chunk));
-            await new Promise(resolve => task.waitAck = resolve);
+        task.uploadRunning = true;
+        try {
+            for (let off = task.done || 0; off < file.size; off = task.done) {
+                if (task.status !== 'running') return;
+                if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('WebSocket is not connected');
+                const chunk = await file.slice(off, off + CHUNK).arrayBuffer();
+                await new Promise((resolve, reject) => {
+                    let settled = false;
+                    const finish = (err) => {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
+                        if (task.waitAck === finish) task.waitAck = null;
+                        err ? reject(err) : resolve();
+                    };
+                    const timer = setTimeout(() => finish(new Error('upload acknowledgement timed out')), UPLOAD_ACK_TIMEOUT_MS);
+                    task.waitAck = finish;
+                    try { ws.send(encodeFrame(0x20, task.id, off, chunk)); }
+                    catch (err) { finish(err); }
+                });
+            }
+            if (task.status === 'running') send({ op: 'upload_end', taskId: task.id, path: task.path, size: file.size });
+        } catch (err) {
+            if (task.status === 'running') {
+                task.status = 'paused';
+                task.connectionPaused = !ws || ws.readyState !== WebSocket.OPEN;
+                task.message = err && err.message ? err.message : t('common.error');
+                saveTasks(); renderTasks();
+            }
+        } finally {
+            task.uploadRunning = false;
         }
-        send({ op: 'upload_end', taskId: task.id, path: task.path, size: file.size });
     }
     function startDownload(path, name, size) {
         if (!activeDevice) activeDevice = document.getElementById('device-select').value;
@@ -421,10 +471,13 @@
             resumeOffset = 0;
             task.blobParts = [];
         }
+        const now = Date.now();
+        if (task.requestedOffset === resumeOffset && now - (task.lastRequested || 0) < DOWNLOAD_RETRY_MS) return;
         task.done = resumeOffset;
         task.status = 'running';
         task.message = message || '';
-        task.lastRequested = Date.now();
+        task.lastRequested = now;
+        task.requestedOffset = resumeOffset;
         saveTasks();
         send({ op: 'download_start', deviceId: task.device, taskId: task.id, path: task.path, offset: resumeOffset });
     }
@@ -475,7 +528,11 @@
         if (!card || !btn) return;
         const task = tasks.get(card.dataset.task), act = btn.dataset.act;
         if (!task) return;
-        if (act === 'pause') { task.status = 'paused'; send({ op: 'cancel', taskId: task.id, offset: task.done || 0 }); }
+        if (act === 'pause') {
+            task.status = 'paused';
+            if (task.waitAck) { const reject = task.waitAck; task.waitAck = null; reject(new Error('upload paused')); }
+            send({ op: 'cancel', taskId: task.id, offset: task.done || 0 });
+        }
         if (act === 'resume') {
             task.status = 'running'; task.message = '';
             if (task.dir === 'upload') {
@@ -487,7 +544,11 @@
                 resumeDownload(task, task.done || 0, t('files.resuming'));
             }
         }
-        if (act === 'cancel') { task.status = 'canceled'; send({ op: 'cancel', taskId: task.id, offset: task.done || 0 }); }
+        if (act === 'cancel') {
+            task.status = 'canceled';
+            if (task.waitAck) { const reject = task.waitAck; task.waitAck = null; reject(new Error('upload canceled')); }
+            send({ op: 'cancel', taskId: task.id, offset: task.done || 0 });
+        }
         if (act === 'clear') tasks.delete(task.id);
         saveTasks(); renderTasks();
     });

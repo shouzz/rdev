@@ -43,6 +43,32 @@ func TestVNCAuthenticateNoPasswordDeviceFallbacks(t *testing.T) {
 	}
 }
 
+func TestVNCSecureModeRejectsPasswordlessDevice(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.clients["open"] = &ClientConn{ID: "open", InstanceID: "one"}
+	v := &vncConn{srv: s}
+
+	for _, credentials := range [][2]string{{"open", ""}, {"open", "open"}, {"", "open"}} {
+		if _, _, ok := v.authenticate(credentials[0], credentials[1]); ok {
+			t.Fatalf("passwordless device authenticated in secure mode with user=%q", credentials[0])
+		}
+	}
+}
+
+func TestVNCRejectsRDevAccessTicket(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	client := &ClientConn{ID: "pc", InstanceID: "one", Password: "secret"}
+	s.clients[client.ID] = client
+	ticket := issueAccessTicket(t, s, client.ID, 60)
+	v := &vncConn{srv: s}
+
+	if _, _, ok := v.authenticate(client.ID, ticket); ok {
+		t.Fatal("VNC accepted an RDev access ticket")
+	}
+}
+
 func TestVNCHandshakeVeNCryptPlain(t *testing.T) {
 	s := NewServer()
 	s.clients["pc"] = &ClientConn{ID: "pc", Password: "secret"}

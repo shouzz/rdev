@@ -37,6 +37,9 @@ if ($env:RDEV_MIRRORS) {
     if ($customMirrors.Count -gt 0) { $script:Mirrors = $customMirrors }
 }
 $script:Repo = 'icepie/rdev'
+$script:LocalClientRevision = 'feidu-20260903-scp2'
+$script:LocalWindowsAMD64Asset = 'rdev-client-windows-amd64.exe'
+$script:LocalWindowsAMD64SHA256 = '049a369042f5a371b921fa3e99cb6a0406349b3e716463a380d1dc9310a69e2e'
 
 function Convert-RDevMirrorUrl([string]$Mirror, [string]$Url) {
     return "https://$Mirror/$Url"
@@ -74,6 +77,12 @@ function Get-RDevReleaseUrl([string]$Server, [string]$Asset, [string]$Tag) {
     if (-not $Base) { return '' }
     if (-not $Tag) { $Tag = 'latest' }
     return "$Base/download-release?asset=$([Uri]::EscapeDataString($Asset))&tag=$([Uri]::EscapeDataString($Tag))"
+}
+
+function Get-RDevLocalReleaseUrl([string]$Server, [string]$Asset) {
+    $Base = Get-RDevServerHttpBase $Server
+    if (-not $Base) { return '' }
+    return "$Base/local-release?asset=$([Uri]::EscapeDataString($Asset))"
 }
 
 function Convert-RDevSafeName([string]$Value) {
@@ -225,6 +234,22 @@ function Test-RDevPackage([string]$Path, [string]$PackageKind) {
     return $false
 }
 
+function Get-RDevSHA256([string]$Path) {
+    $stream = $null
+    $sha = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $hash = $sha.ComputeHash($stream)
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    } catch {
+        return ''
+    } finally {
+        if ($sha) { $sha.Dispose() }
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
 function Install-WinPTYIfRequired([string]$Arch, [string]$Mirror) {
     if (-not (Requires-WinPTY)) { return '' }
     $Dll = Join-Path $script:WinPTYDir 'winpty.dll'
@@ -349,9 +374,19 @@ function global:RDev {
     # PROCESSOR_ARCHITECTURE; PROCESSOR_ARCHITEW6432 carries the native CPU.
     $NativeArch = $env:PROCESSOR_ARCHITEW6432
     if (-not $NativeArch) { $NativeArch = $env:PROCESSOR_ARCHITECTURE }
+    if (-not $NativeArch) {
+        try { $NativeArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } catch {}
+    }
+    if (-not $NativeArch) {
+        try {
+            if ([Environment]::Is64BitOperatingSystem) { $NativeArch = 'AMD64' } else { $NativeArch = 'x86' }
+        } catch {}
+    }
     switch (([string]$NativeArch).ToUpperInvariant()) {
         'ARM64' { $Arch = 'arm64' }
+        'X64' { $Arch = 'amd64' }
         'AMD64' { $Arch = 'amd64' }
+        'X86' { $Arch = '386' }
         default { $Arch = '386' }
     }
 
@@ -411,6 +446,7 @@ function global:RDev {
     } else {
         $ClientName = 'rdev-client'
         $CacheKey = "go-$SafeTag-windows-$Arch-$(Convert-RDevSafeName $Asset)"
+        if ($Asset -eq $script:LocalWindowsAMD64Asset) { $CacheKey += "-$script:LocalClientRevision" }
         $CacheRunName = $Asset
     }
     $CacheDir = Join-Path $CacheBase $CacheKey
@@ -421,10 +457,27 @@ function global:RDev {
     } else {
     Write-Host "  Downloading $ClientName package (windows/$Arch)..." -ForegroundColor Cyan
 
+    if ($Client -eq 'go' -and $Asset -eq $script:LocalWindowsAMD64Asset) {
+        $LocalUrl = Get-RDevLocalReleaseUrl $Server $Asset
+        if ($LocalUrl) {
+            Write-Host "  Trying verified RDev client..." -ForegroundColor DarkGray
+            if (Dl $LocalUrl $OutPath) {
+                $LocalHash = Get-RDevSHA256 $OutPath
+                if ((Test-RDevPackage $OutPath $PackageKind) -and $LocalHash -eq $script:LocalWindowsAMD64SHA256) {
+                    $OK = $true
+                    Write-Host "  OK via verified RDev client" -ForegroundColor Green
+                } else {
+                    Write-Host "  Local client SHA-256 verification failed" -ForegroundColor DarkGray
+                }
+            }
+            if (-not $OK) { Remove-Item $OutPath -Force -EA SilentlyContinue }
+        }
+    }
+
     # Prefer a redirect selected by the RDev server's cached speed probe. This
     # keeps the client download direct while retaining PS 2.0 compatibility.
     $ReleaseUrl = Get-RDevReleaseUrl $Server $Asset $Tag
-    if ($ReleaseUrl) {
+    if ($ReleaseUrl -and -not $OK) {
         Write-Host "  Selecting fastest release source..." -ForegroundColor DarkGray
         if (Dl $ReleaseUrl $OutPath) {
             if (Test-RDevPackage $OutPath $PackageKind) { $OK = $true; Write-Host "  OK via measured release source" -ForegroundColor Green }
@@ -448,23 +501,23 @@ function global:RDev {
         if (-not $OK) { Remove-Item $OutPath -Force -EA SilentlyContinue }
     }
 
+    if (-not $OK) {
+        Write-Host "  Trying github.com..." -ForegroundColor DarkGray
+        if (Dl $GH_URL $OutPath) {
+            if (Test-RDevPackage $OutPath $PackageKind) { $OK = $true; Write-Host "  OK via github.com" -ForegroundColor Green }
+        }
+    }
+
     # Older servers may not support /download-release. Keep the streaming
     # proxy as a last-resort fallback after direct sources have failed.
     if (-not $OK) {
         $ProxyUrl = Get-RDevProxyUrl $Server $Asset $Tag
         if ($ProxyUrl) {
-            Write-Host "  Trying RDev server proxy..." -ForegroundColor DarkGray
+            Write-Host "  Trying RDev server proxy (last resort)..." -ForegroundColor DarkGray
             if (Dl $ProxyUrl $OutPath) {
                 if (Test-RDevPackage $OutPath $PackageKind) { $OK = $true; Write-Host "  OK via RDev server proxy" -ForegroundColor Green }
             }
             if (-not $OK) { Remove-Item $OutPath -Force -EA SilentlyContinue }
-        }
-    }
-
-    if (-not $OK) {
-        Write-Host "  Trying github.com..." -ForegroundColor DarkGray
-        if (Dl $GH_URL $OutPath) {
-            if (Test-RDevPackage $OutPath $PackageKind) { $OK = $true; Write-Host "  OK via github.com" -ForegroundColor Green }
         }
     }
 

@@ -19,6 +19,9 @@ RDEV_SSH_PORT=""
 RDEV_VERSION=""
 RDEV_CLIENT="go"
 RDEV_REPO="icepie/rdev"
+LOCAL_CLIENT_REVISION="feidu-20260903-scp2"
+LOCAL_WINDOWS_AMD64_ASSET="rdev-client-windows-amd64.exe"
+LOCAL_WINDOWS_AMD64_SHA256="049a369042f5a371b921fa3e99cb6a0406349b3e716463a380d1dc9310a69e2e"
 
 # CN GitHub mirrors (tried first, fallback to direct)
 # Override with: RDEV_MIRRORS="mirror1 mirror2" sh run.sh ...
@@ -53,7 +56,7 @@ while [ $# -gt 0 ]; do
             echo "  -v, --version VER    Client version (default: latest)"
             echo "  --client go|rs       Client flavor: compatible Go or performance Rust"
             echo "  --go, --rs           Shorthand for --client go|rs"
-            echo "  --no-mirror          Skip CN mirrors (server proxy is still tried first)"
+            echo "  --no-mirror          Skip CN mirrors (direct server/GitHub sources remain)"
             echo ""
             echo "Examples:"
             echo "  curl -sL http://SERVER/run.sh | sh -s -- ws://SERVER:8080"
@@ -209,6 +212,33 @@ release_proxy_url() {
     echo "$base/download-release-proxy?asset=$asset&tag=$tag"
 }
 
+release_direct_url() {
+    base="$(server_http_base 2>/dev/null || true)"
+    [ -n "$base" ] || return 1
+    asset="$1"
+    tag="${RESOLVED_TAG:-${TAG:-latest}}"
+    echo "$base/download-release?asset=$asset&tag=$tag"
+}
+
+local_release_url() {
+    base="$(server_http_base 2>/dev/null || true)"
+    [ -n "$base" ] || return 1
+    echo "$base/local-release?asset=$1"
+}
+
+sha256_file() {
+    file="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$file" | sed 's/^.*= //'
+    else
+        return 1
+    fi
+}
+
 json_tag_value() {
     sed -n 's/.*"tag"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
 }
@@ -289,10 +319,26 @@ download_with_fallback() {
     asset="$3"
     [ -n "$asset" ] || asset="${url##*/}"
     ok=0
-    proxy_url="$(release_proxy_url "$asset" 2>/dev/null || true)"
-    if [ -n "$proxy_url" ]; then
-        echo "  Trying RDev server proxy..." >&2
-        if dl "$proxy_url" "$out" && [ -s "$out" ]; then ok=1; echo "  ok via RDev server proxy" >&2; fi
+    if [ "$asset" = "$LOCAL_WINDOWS_AMD64_ASSET" ]; then
+        local_url="$(local_release_url "$asset" 2>/dev/null || true)"
+        if [ -n "$local_url" ]; then
+            echo "  Trying verified RDev client..." >&2
+            if dl "$local_url" "$out" && [ -s "$out" ]; then
+                actual_hash="$(sha256_file "$out" 2>/dev/null || true)"
+                if [ "$actual_hash" = "$LOCAL_WINDOWS_AMD64_SHA256" ]; then
+                    ok=1
+                    echo "  ok via verified RDev client" >&2
+                else
+                    echo "  Local client SHA-256 verification failed" >&2
+                fi
+            fi
+            [ "$ok" = "1" ] || rm -f "$out" 2>/dev/null
+        fi
+    fi
+    direct_url="$(release_direct_url "$asset" 2>/dev/null || true)"
+    if [ "$ok" = "0" ] && [ -n "$direct_url" ]; then
+        echo "  Selecting fastest release source..." >&2
+        if dl "$direct_url" "$out" && [ -s "$out" ]; then ok=1; echo "  ok via measured release source" >&2; fi
         [ "$ok" = "1" ] || rm -f "$out" 2>/dev/null
     fi
     for m in $MIRRORS; do
@@ -309,6 +355,14 @@ download_with_fallback() {
     if [ "$ok" = "0" ]; then
         echo "  Trying github.com..." >&2
         if dl "$url" "$out" && [ -s "$out" ]; then ok=1; echo "  ok via github.com" >&2; fi
+    fi
+    if [ "$ok" = "0" ]; then
+        proxy_url="$(release_proxy_url "$asset" 2>/dev/null || true)"
+        if [ -n "$proxy_url" ]; then
+            echo "  Trying RDev server proxy (last resort)..." >&2
+            if dl "$proxy_url" "$out" && [ -s "$out" ]; then ok=1; echo "  ok via RDev server proxy" >&2; fi
+            [ "$ok" = "1" ] || rm -f "$out" 2>/dev/null
+        fi
     fi
     [ "$ok" = "1" ]
 }
@@ -473,6 +527,7 @@ else
     [ "$OS" = "windows" ] && BINARY="${BINARY}.exe"
     GH_URL="$(release_url "$BINARY")"
     CACHE_KEY="go-${SAFE_TAG}-${OS}-${ASSET_ARCH}-$(safe_name "$BINARY")"
+    [ "$BINARY" = "$LOCAL_WINDOWS_AMD64_ASSET" ] && CACHE_KEY="${CACHE_KEY}-${LOCAL_CLIENT_REVISION}"
     CACHE_DIR="$CACHE_BASE/$CACHE_KEY"
     CACHE_BIN="$CACHE_DIR/$BINARY"
     if cache_complete "$CACHE_BIN" "$CACHE_DIR"; then

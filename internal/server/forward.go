@@ -41,17 +41,17 @@ type remoteForwardChannelData struct {
 }
 
 func (h *ForwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (bool, []byte) {
+	clientID := ctx.User()
+	client, ok := h.srv.authorizedSSHClient(ctx)
+	if !ok {
+		return false, []byte{}
+	}
+
 	h.mu.Lock()
 	if h.forwards == nil {
 		h.forwards = make(map[string]string)
 	}
 	h.mu.Unlock()
-
-	clientID := ctx.User()
-	client, ok := h.srv.GetClient(clientID)
-	if !ok {
-		return false, []byte{}
-	}
 
 	switch req.Type {
 	case "tcpip-forward":

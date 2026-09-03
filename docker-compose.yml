@@ -9,10 +9,11 @@ services:
       # Enable this mapping if you set RDEV_VNC_ADDR=:15900 below.
       # - "${RDEV_VNC_PORT:-15900}:15900"
     environment:
-      RDEV_ADMIN_TOKEN: "${RDEV_ADMIN_TOKEN:-}"
       RDEV_AUTO_UPDATE: "false"
+      RDEV_CONTROL_TOKEN_FILE: "/run/secrets/rdev-control-token"
     volumes:
       - rdev-data:/data
+      - "${RDEV_CONTROL_TOKEN_FILE:?set RDEV_CONTROL_TOKEN_FILE to an absolute 0600 file}:/run/secrets/rdev-control-token:ro"
     command:
       - --http
       - :8080

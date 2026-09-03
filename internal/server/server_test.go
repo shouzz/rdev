@@ -5,6 +5,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +101,43 @@ func TestHandleReleaseDownloadRedirectsCachedChoice(t *testing.T) {
 		t.Fatalf("Location = %q, want %q", got, candidate)
 	}
 }
+
+func TestHandleLocalReleaseDownload(t *testing.T) {
+	dir := t.TempDir()
+	asset := "rdev-client-windows-amd64.exe"
+	payload := []byte("verified-client")
+	if err := os.WriteFile(filepath.Join(dir, asset), payload, 0600); err != nil {
+		t.Fatalf("write local release: %v", err)
+	}
+	srv := NewServer()
+	srv.LocalReleaseDir = dir
+
+	req := httptest.NewRequest(http.MethodGet, "/local-release?asset="+asset, nil)
+	res := httptest.NewRecorder()
+	srv.HandleLocalReleaseDownload(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", res.Code)
+	}
+	if !bytes.Equal(res.Body.Bytes(), payload) {
+		t.Fatalf("body = %q, want %q", res.Body.Bytes(), payload)
+	}
+	if got := res.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+
+	for _, target := range []string{
+		"/local-release?asset=../host_key",
+		"/local-release?asset=sub/client.exe",
+		"/local-release?asset=sub%5Cclient.exe",
+	} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		res := httptest.NewRecorder()
+		srv.HandleLocalReleaseDownload(res, req)
+		if res.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400", target, res.Code)
+		}
+	}
+}
 func TestRegisterClientReplacesSameInstanceReconnect(t *testing.T) {
 	s := NewServer()
 	oldConn := &gws.Conn{}
@@ -169,6 +208,30 @@ func TestClientGPUDesktopAvailableRequiresSupportedCapability(t *testing.T) {
 	}
 	if s.clientGPUDesktopAvailable(client) {
 		t.Fatal("clientGPUDesktopAvailable should ignore unsupported desktop capability")
+	}
+}
+
+func TestPublicDesktopCapabilitiesRedactsWindowTitles(t *testing.T) {
+	caps := &protocol.DesktopCapabilities{
+		Supported: true,
+		Sources: []protocol.DesktopSource{
+			{ID: "screen:all", Label: "All screens", Kind: "screen"},
+			{ID: "window:120252", Label: "terminal --password secret", Kind: "window"},
+		},
+	}
+
+	got := publicDesktopCapabilities(caps)
+	if got == caps {
+		t.Fatal("public desktop capabilities must be cloned")
+	}
+	if got.Sources[0].Label != "All screens" {
+		t.Fatalf("screen label = %q, want All screens", got.Sources[0].Label)
+	}
+	if got.Sources[1].Label != "Window (window:120252)" {
+		t.Fatalf("window label = %q, want redacted window identifier", got.Sources[1].Label)
+	}
+	if caps.Sources[1].Label != "terminal --password secret" {
+		t.Fatalf("source capabilities were mutated: %q", caps.Sources[1].Label)
 	}
 }
 

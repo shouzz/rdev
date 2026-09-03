@@ -2,9 +2,11 @@ package updater
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"strings"
 	"testing"
@@ -113,5 +115,56 @@ func TestProxiedURL(t *testing.T) {
 	}
 	if got := proxiedURL("http://proxy/?url=${url}", target); got != "http://proxy/?url="+target {
 		t.Fatalf("proxy template URL = %q", got)
+	}
+}
+
+func TestDownloadWithProxiesRetriesTransientStatus(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("payload"))
+	}))
+	defer server.Close()
+
+	data, err := downloadWithProxies(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("downloadWithProxies returned error: %v", err)
+	}
+	if string(data) != "payload" {
+		t.Fatalf("download body = %q, want payload", data)
+	}
+	if attempts != 2 {
+		t.Fatalf("request attempts = %d, want 2", attempts)
+	}
+}
+
+func TestReadDownloadBodyRejectsOversizeResponse(t *testing.T) {
+	_, err := readDownloadBody(strings.NewReader(strings.Repeat("x", maxDownloadBytes+1)))
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("readDownloadBody error = %v, want size-limit error", err)
+	}
+}
+
+func TestDownloadWithProxiesDoesNotRetryPermanentStatus(t *testing.T) {
+	attempts := 0
+	ctx, cancel := context.WithCancel(context.Background())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusNotFound)
+		cancel()
+	}))
+	defer server.Close()
+
+	_, err := downloadWithProxies(ctx, server.URL, nil)
+	if err == nil {
+		t.Fatal("downloadWithProxies succeeded for 404")
+	}
+	if attempts != 1 {
+		t.Fatalf("request attempts = %d, want 1", attempts)
 	}
 }

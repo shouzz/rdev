@@ -36,6 +36,7 @@ import (
 const (
 	defaultReconnectMin = 1 * time.Second
 	defaultReconnectMax = 30 * time.Second
+	defaultRegisterWait = 8 * time.Second
 	clientWriteWait     = 10 * time.Second
 	clientReadWait      = 75 * time.Second
 	clientPingPeriod    = 25 * time.Second
@@ -151,6 +152,7 @@ type clientSession struct {
 	ptyProc *ptyutil.Process
 
 	// Non-PTY exec mode
+	stdinMu   sync.Mutex
 	stdinPipe io.WriteCloser
 	cmdWaitFn func() (int, error)
 
@@ -167,14 +169,32 @@ func (s *clientSession) close() {
 		if s.ptyProc != nil {
 			s.ptyProc.Close()
 		}
-		if s.stdinPipe != nil {
-			s.stdinPipe.Close()
-		}
+		s.closeStdin()
 		if s.sftpInput != nil {
 			s.sftpInput.Close()
 		}
 		close(s.done)
 	})
+}
+
+func (s *clientSession) writeStdin(data []byte) bool {
+	s.stdinMu.Lock()
+	defer s.stdinMu.Unlock()
+	if s.stdinPipe == nil {
+		return false
+	}
+	_, _ = s.stdinPipe.Write(data)
+	return true
+}
+
+func (s *clientSession) closeStdin() {
+	s.stdinMu.Lock()
+	defer s.stdinMu.Unlock()
+	if s.stdinPipe == nil {
+		return
+	}
+	_ = s.stdinPipe.Close()
+	s.stdinPipe = nil
 }
 
 type fileStream struct {
@@ -217,6 +237,10 @@ type Client struct {
 	reconnectReset  chan struct{}
 	reconnectMin    time.Duration
 	reconnectMax    time.Duration
+	registerWait    time.Duration
+	registration    *registrationAttempt
+	registered      bool
+	activeEndpoint  string
 
 	// Server info (received on register response)
 	sshPort  string
@@ -232,6 +256,17 @@ type clientTransport interface {
 	WriteBinary([]byte) error
 	WritePing([]byte) error
 	Close(string) error
+}
+
+type registrationAttempt struct {
+	transport clientTransport
+	endpoint  string
+	result    chan error
+	once      sync.Once
+}
+
+func (a *registrationAttempt) complete(err error) {
+	a.once.Do(func() { a.result <- err })
 }
 
 type wsClientTransport struct{ conn *gws.Conn }
@@ -301,6 +336,7 @@ func NewClient(serverURL, clientID, password, shell string) *Client {
 		reconnectReset:  make(chan struct{}, 1),
 		reconnectMin:    defaultReconnectMin,
 		reconnectMax:    defaultReconnectMax,
+		registerWait:    defaultRegisterWait,
 		logCollector:    lc,
 	}
 	lc.install(c)
@@ -375,15 +411,16 @@ func (b *reconnectBackoff) Next() time.Duration {
 // wsEventHandler implements gws.Event for the client
 type wsEventHandler struct {
 	gws.BuiltinEventHandler
-	client *Client
+	client   *Client
+	endpoint string
+	opened   chan *registrationAttempt
 }
 
 func (h *wsEventHandler) OnOpen(socket *gws.Conn) {
 	_ = socket.SetDeadline(time.Now().Add(clientReadWait))
-	h.client.mu.Lock()
-	h.client.conn = socket
-	h.client.transport = &wsClientTransport{conn: socket}
-	h.client.mu.Unlock()
+	transport := &wsClientTransport{conn: socket}
+	attempt := h.client.activateTransport(transport, socket, h.endpoint)
+	h.opened <- attempt
 	if err := h.client.send(&protocol.Message{
 		Type:                protocol.MsgRegister,
 		ClientID:            h.client.requestedID,
@@ -393,12 +430,10 @@ func (h *wsEventHandler) OnOpen(socket *gws.Conn) {
 		DesktopCapabilities: desktopCapabilities(),
 		LogSupported:        true,
 	}); err != nil {
-		log.Printf("register send error: %v", err)
+		attempt.complete(fmt.Errorf("send registration: %w", err))
+		_ = transport.Close("registration send failed")
 		return
 	}
-	log.Printf("connected to %s as '%s'", h.client.serverURL, h.client.requestedID)
-	// OnConnect will be called after receiving the register response
-	// (in handleMessage when MsgRegister response arrives with sshPort)
 }
 
 func (h *wsEventHandler) OnClose(socket *gws.Conn, err error) {
@@ -408,6 +443,8 @@ func (h *wsEventHandler) OnClose(socket *gws.Conn, err error) {
 		h.client.mu.Unlock()
 		return
 	}
+	attempt := h.client.registration
+	wasRegistered := h.client.registered
 	for sid, sess := range h.client.sessions {
 		sess.close()
 		delete(h.client.sessions, sid)
@@ -430,10 +467,18 @@ func (h *wsEventHandler) OnClose(socket *gws.Conn, err error) {
 	}
 	h.client.conn = nil
 	h.client.transport = nil
+	h.client.registration = nil
+	h.client.registered = false
+	h.client.activeEndpoint = ""
 	h.client.mu.Unlock()
-	select {
-	case h.client.done <- struct{}{}:
-	default:
+	if attempt != nil {
+		attempt.complete(fmt.Errorf("connection closed before registration: %v", err))
+	}
+	if wasRegistered {
+		select {
+		case h.client.done <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -699,14 +744,17 @@ func (c *Client) connect() error {
 			lastErr = err
 			continue
 		}
+		log.Printf("trying endpoint %s", normalized)
 		if kind == "ws" {
 			if err := c.connectWebSocket(normalized); err != nil {
+				log.Printf("endpoint %s failed: %v", normalized, err)
 				lastErr = err
 				continue
 			}
 			return nil
 		}
 		if err := c.connectStream(kind, normalized); err != nil {
+			log.Printf("endpoint %s failed: %v", normalized, err)
 			lastErr = err
 			continue
 		}
@@ -723,7 +771,11 @@ func (c *Client) connectWebSocket(serverURL string) error {
 	if err != nil {
 		return err
 	}
-	handler := &wsEventHandler{client: c}
+	handler := &wsEventHandler{
+		client:   c,
+		endpoint: wsURL,
+		opened:   make(chan *registrationAttempt, 1),
+	}
 	socket, _, err := gws.NewClient(handler, &gws.ClientOption{
 		Addr:               wsURL,
 		HandshakeTimeout:   10 * time.Second,
@@ -741,6 +793,17 @@ func (c *Client) connectWebSocket(serverURL string) error {
 	}
 
 	go socket.ReadLoop()
+	var attempt *registrationAttempt
+	select {
+	case attempt = <-handler.opened:
+	case <-time.After(c.registerWait):
+		_ = socket.WriteClose(1001, []byte("open timeout"))
+		return fmt.Errorf("websocket open timeout after %s", c.registerWait)
+	}
+	if err := c.waitForRegistration(attempt); err != nil {
+		_ = socket.WriteClose(1001, []byte("registration failed"))
+		return err
+	}
 	go c.pingLoop(socket)
 	return nil
 }
@@ -771,10 +834,7 @@ func (c *Client) connectStream(kind, endpoint string) error {
 		}
 	}
 	transport := &streamClientTransport{conn: conn}
-	c.mu.Lock()
-	c.transport = transport
-	c.conn = nil
-	c.mu.Unlock()
+	attempt := c.activateTransport(transport, nil, endpoint)
 	if err := c.send(&protocol.Message{
 		Type:                protocol.MsgRegister,
 		ClientID:            c.requestedID,
@@ -784,13 +844,46 @@ func (c *Client) connectStream(kind, endpoint string) error {
 		DesktopCapabilities: desktopCapabilities(),
 		LogSupported:        true,
 	}); err != nil {
-		conn.Close()
+		attempt.complete(fmt.Errorf("send registration: %w", err))
+		_ = conn.Close()
+		return fmt.Errorf("send registration: %w", err)
+	}
+	go c.streamReadLoop(conn, transport)
+	if err := c.waitForRegistration(attempt); err != nil {
+		_ = transport.Close("registration failed")
 		return err
 	}
-	log.Printf("connected to %s as '%s'", endpoint, c.requestedID)
-	go c.streamReadLoop(conn, transport)
 	go c.streamPingLoop(transport)
 	return nil
+}
+
+func (c *Client) activateTransport(transport clientTransport, conn *gws.Conn, endpoint string) *registrationAttempt {
+	attempt := &registrationAttempt{
+		transport: transport,
+		endpoint:  endpoint,
+		result:    make(chan error, 1),
+	}
+	c.mu.Lock()
+	c.transport = transport
+	c.conn = conn
+	c.registration = attempt
+	c.registered = false
+	c.activeEndpoint = endpoint
+	c.mu.Unlock()
+	return attempt
+}
+
+func (c *Client) waitForRegistration(attempt *registrationAttempt) error {
+	timer := time.NewTimer(c.registerWait)
+	defer timer.Stop()
+	select {
+	case err := <-attempt.result:
+		return err
+	case <-timer.C:
+		err := fmt.Errorf("registration timeout after %s", c.registerWait)
+		attempt.complete(err)
+		return err
+	}
 }
 
 func (c *Client) isCurrentTransport(t clientTransport) bool {
@@ -835,6 +928,8 @@ func (c *Client) closeCurrentTransport(transport clientTransport, conn net.Conn)
 		c.mu.Unlock()
 		return
 	}
+	attempt := c.registration
+	wasRegistered := c.registered
 	for sid, sess := range c.sessions {
 		sess.close()
 		delete(c.sessions, sid)
@@ -857,17 +952,31 @@ func (c *Client) closeCurrentTransport(transport clientTransport, conn net.Conn)
 	}
 	c.transport = nil
 	c.conn = nil
+	c.registration = nil
+	c.registered = false
+	c.activeEndpoint = ""
 	c.mu.Unlock()
 	conn.Close()
-	select {
-	case c.done <- struct{}{}:
-	default:
+	if attempt != nil {
+		attempt.complete(fmt.Errorf("connection closed before registration"))
+	}
+	if wasRegistered {
+		select {
+		case c.done <- struct{}{}:
+		default:
+		}
 	}
 }
 
 func (c *Client) handleMessage(msg *protocol.Message) {
 	switch msg.Type {
 	case protocol.MsgRegister:
+		c.mu.Lock()
+		attempt := c.registration
+		if attempt == nil || c.transport != attempt.transport {
+			c.mu.Unlock()
+			return
+		}
 		if msg.ClientID != "" {
 			oldID := c.clientID
 			c.clientID = msg.ClientID
@@ -877,6 +986,12 @@ func (c *Client) handleMessage(msg *protocol.Message) {
 		}
 		c.sshPort = msg.SSHPort
 		c.httpHost = msg.HTTPHost
+		c.registration = nil
+		c.registered = true
+		endpoint := c.activeEndpoint
+		c.mu.Unlock()
+		attempt.complete(nil)
+		log.Printf("registered with %s as '%s'", endpoint, c.clientID)
 		c.reconnectBackoffReset()
 		if c.OnConnect != nil {
 			c.OnConnect(c)
@@ -1225,12 +1340,14 @@ func (c *Client) handleBinData(sessionID string, data []byte) {
 		return
 	}
 
-	switch {
-	case sess.ptyProc != nil:
+	if sess.ptyProc != nil {
 		sess.ptyProc.Write(data)
-	case sess.stdinPipe != nil:
-		sess.stdinPipe.Write(data)
-	case sess.sftpInput != nil:
+		return
+	}
+	if sess.writeStdin(data) {
+		return
+	}
+	if sess.sftpInput != nil {
 		sess.sftpInput.Write(data)
 	}
 }
@@ -1499,7 +1616,12 @@ func (c *Client) startShellExecSession(msg *protocol.Message) (*clientSession, e
 	stdoutW.Close()
 	stderrW.Close()
 
-	sess.stdinPipe = wincompat.EncodeInput(stdinW)
+	rawIO := isSCPExecCommand(msg.Command)
+	if rawIO {
+		sess.stdinPipe = stdinW
+	} else {
+		sess.stdinPipe = wincompat.EncodeInput(stdinW)
+	}
 	sess.cmdWaitFn = func() (int, error) {
 		err := cmd.Wait()
 		if err == nil {
@@ -1518,7 +1640,11 @@ func (c *Client) startShellExecSession(msg *protocol.Message) (*clientSession, e
 		defer ioWg.Done()
 		defer stdoutR.Close()
 		cw := newCoalescingWriter(c, msg.SessionID, protocol.BinData)
-		io.Copy(cw, wincompat.DecodeOutput(stdoutR))
+		reader := io.Reader(stdoutR)
+		if !rawIO {
+			reader = wincompat.DecodeOutput(stdoutR)
+		}
+		io.Copy(cw, reader)
 		cw.flush()
 	}()
 
@@ -1547,6 +1673,19 @@ func (c *Client) startShellExecSession(msg *protocol.Message) (*clientSession, e
 func isGitSmartSSHCommand(command string) bool {
 	_, ok := parseGitSmartSSHCommand(command)
 	return ok
+}
+
+func isSCPExecCommand(command string) bool {
+	fields := strings.Fields(command)
+	if len(fields) < 2 || fields[0] != "scp" {
+		return false
+	}
+	for _, field := range fields[1:] {
+		if field == "-t" || field == "-f" {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) startSFTPSession(sessionID string) (*clientSession, error) {
@@ -1599,10 +1738,7 @@ func (c *Client) handleStdinClose(msg *protocol.Message) {
 	if !ok {
 		return
 	}
-	if sess.stdinPipe != nil {
-		sess.stdinPipe.Close()
-		sess.stdinPipe = nil
-	}
+	sess.closeStdin()
 	if sess.sftpInput != nil {
 		sess.sftpInput.Close()
 	}

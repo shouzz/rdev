@@ -139,8 +139,8 @@ func (h *sessionAttachHandler) OnOpen(socket *gws.Conn) {
 		socket.WriteClose(1000, nil)
 		return
 	}
-	if client.Password != "" {
-		h.sendJSON(socket, sessionAttachMsg{Op: "auth", Message: "Device '" + sess.ClientID + "' requires password"})
+	if h.srv.requiresDeviceCredential(client) {
+		h.sendJSON(socket, sessionAttachMsg{Op: "auth", Message: "Device '" + sess.ClientID + "' requires credential"})
 		return
 	}
 	h.attach(ac)
@@ -220,11 +220,11 @@ func (h *sessionAttachHandler) OnMessage(socket *gws.Conn, message *gws.Message)
 			h.sendError(socket, "device not connected")
 			return
 		}
-		if client.Password == "" || constantTimeEqual(client.Password, msg.Password) {
+		if h.srv.authorizeDeviceCredential(client, msg.Password) {
 			h.attach(ac)
 			return
 		}
-		h.sendJSON(socket, sessionAttachMsg{Op: "auth_fail", Message: "Wrong password"})
+		h.sendJSON(socket, sessionAttachMsg{Op: "auth_fail", Message: "Wrong credential"})
 	case "resize":
 		if !ac.authOK {
 			return

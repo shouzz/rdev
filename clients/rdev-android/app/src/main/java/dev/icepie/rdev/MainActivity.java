@@ -107,7 +107,7 @@ public class MainActivity extends Activity {
         root.addView(subtitle, matchWrap());
 
         LinearLayout config = card("连接配置", "保存后启动在线服务，空密码表示开放模式。", colors);
-        serverField = addInput(config, "服务器", "例如 wss://rdev.singzer.cn（可用 rdev:// 链接填充）", prefs.getString("server", ""), false, colors);
+        serverField = addInput(config, "服务器", "例如 wss://r.feidu.fit（可用 rdev:// 链接填充）", prefs.getString("server", ""), false, colors);
         idField = addInput(config, "设备 ID", "例如 PDA3109", prefs.getString("id", defaultDeviceId()), false, colors);
         passwordField = addInput(config, "访问密码", "留空为无密码", prefs.getString("password", ""), true, colors);
         root.addView(config, sectionParams());

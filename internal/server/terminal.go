@@ -76,14 +76,12 @@ func (h *terminalWSHandler) OnOpen(socket *gws.Conn) {
 		return
 	}
 
-	// If device has a password, require auth before creating session
-	if client.Password != "" {
+	if h.srv.requiresDeviceCredential(client) {
 		h.authed = false
-		h.sendJSON(socket, terminalMsg{Op: "auth", Message: "Device '" + deviceID + "' requires password"})
+		h.sendJSON(socket, terminalMsg{Op: "auth", Message: "Device '" + deviceID + "' requires credential"})
 		return
 	}
 
-	// No password → skip auth, create session immediately
 	h.passOK = true
 	h.createSession(socket, deviceID)
 }
@@ -189,7 +187,6 @@ func (h *terminalWSHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 				return
 			}
 
-			// Validate password
 			deviceIDI, _ := socket.Session().Load("deviceID")
 			deviceID := deviceIDI.(string)
 
@@ -203,12 +200,12 @@ func (h *terminalWSHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 				return
 			}
 
-			if client.Password != "" && client.Password == tmsg.Password {
+			if h.srv.authorizeDeviceCredential(client, tmsg.Password) {
 				h.authed = true
 				h.sendJSON(socket, terminalMsg{Op: "auth_ok"})
 				h.createSession(socket, deviceID)
 			} else {
-				h.sendJSON(socket, terminalMsg{Op: "auth_fail", Message: "Wrong password"})
+				h.sendJSON(socket, terminalMsg{Op: "auth_fail", Message: "Wrong credential"})
 			}
 		}
 		return

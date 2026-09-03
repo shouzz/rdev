@@ -58,7 +58,7 @@ type batchSocket struct {
 	conn       *gws.Conn
 	mu         sync.Mutex
 	authMu     sync.RWMutex
-	authorized map[string]string
+	authorized map[string]deviceAuthorization
 	authFails  map[string]int
 	uploads    map[string]*batchUpload
 }
@@ -69,6 +69,8 @@ type batchUpload struct {
 	mode    int32
 	jobs    map[string]chan uploadChunk
 	ackCh   chan string
+	mu      sync.Mutex
+	closed  bool
 }
 
 type uploadChunk struct {
@@ -100,7 +102,7 @@ func (s *batchSocket) sendUploadAck(uploadID string) {
 func (h *batchWSHandler) OnOpen(socket *gws.Conn) {
 	socket.Session().Store("batchSocket", &batchSocket{
 		conn:       socket,
-		authorized: make(map[string]string),
+		authorized: make(map[string]deviceAuthorization),
 		authFails:  make(map[string]int),
 		uploads:    make(map[string]*batchUpload),
 	})
@@ -158,9 +160,9 @@ func (h *batchWSHandler) handleBatchAuth(socket *batchSocket, msg batchMsg) {
 		socket.WriteText(batchMsg{Op: "auth_fail", DeviceID: msg.DeviceID, Message: "device not connected"})
 		return
 	}
-	if client.Password == "" || constantTimeEqual(client.Password, msg.Password) {
+	if h.srv.authorizeDeviceCredential(client, msg.Password) {
 		socket.authMu.Lock()
-		socket.authorized[msg.DeviceID] = passwordFingerprint(client.Password)
+		socket.authorized[msg.DeviceID] = deviceAuthorizationFor(client)
 		delete(socket.authFails, msg.DeviceID)
 		socket.authMu.Unlock()
 		socket.WriteText(batchMsg{Op: "auth_ok", DeviceID: msg.DeviceID})
@@ -228,6 +230,14 @@ func (h *batchWSHandler) handleBinaryMessage(socket *batchSocket, raw []byte) {
 			socket.WriteText(batchMsg{Op: "error", Message: "upload stream not found"})
 			return
 		}
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		if u.closed {
+			return
+		}
+		if len(h.authorizedDevices(socket, u.devices)) != len(u.devices) {
+			return
+		}
 		for _, ch := range u.jobs {
 			buf := make([]byte, len(payload))
 			copy(buf, payload)
@@ -244,11 +254,26 @@ func (h *batchWSHandler) handleBinaryMessage(socket *batchSocket, raw []byte) {
 	case protocol.BinFileEnd:
 		socket.mu.Lock()
 		u := socket.uploads[id]
-		delete(socket.uploads, id)
 		socket.mu.Unlock()
 		if u == nil {
 			return
 		}
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		if u.closed {
+			return
+		}
+		if len(h.authorizedDevices(socket, u.devices)) != len(u.devices) {
+			return
+		}
+		socket.mu.Lock()
+		if socket.uploads[id] != u {
+			socket.mu.Unlock()
+			return
+		}
+		delete(socket.uploads, id)
+		socket.mu.Unlock()
+		u.closed = true
 		for _, ch := range u.jobs {
 			close(ch)
 		}
@@ -290,6 +315,10 @@ func (h *batchWSHandler) handleBatchExec(socket *batchSocket, bmsg batchMsg) {
 		h.srv.mu.RUnlock()
 		if !ok {
 			socket.WriteText(batchMsg{Op: "error", DeviceID: deviceID, Message: "device not connected"})
+			continue
+		}
+		if !h.isDeviceAuthorized(socket, client) {
+			socket.WriteText(batchMsg{Op: "auth_required", DeviceID: deviceID, Message: "device credential required"})
 			continue
 		}
 
@@ -409,6 +438,10 @@ func (h *batchWSHandler) handleBatchUploadBytes(socket *batchSocket, devices []s
 			socket.WriteText(batchMsg{Op: "error", DeviceID: deviceID, Message: "device not connected"})
 			continue
 		}
+		if !h.isDeviceAuthorized(socket, client) {
+			socket.WriteText(batchMsg{Op: "auth_required", DeviceID: deviceID, Message: "device credential required"})
+			continue
+		}
 
 		wg.Add(1)
 		go func(deviceID string, client *ClientConn) {
@@ -454,6 +487,10 @@ func (h *batchWSHandler) startStreamUpload(socket *batchSocket, uploadID string,
 		h.srv.mu.RUnlock()
 		if !ok {
 			socket.WriteText(batchMsg{Op: "error", DeviceID: deviceID, Message: "device not connected"})
+			continue
+		}
+		if !h.isDeviceAuthorized(socket, client) {
+			socket.WriteText(batchMsg{Op: "auth_required", DeviceID: deviceID, Message: "device credential required"})
 			continue
 		}
 		ch := make(chan uploadChunk, 8)
@@ -533,19 +570,19 @@ func (h *batchWSHandler) authorizedDevices(socket *batchSocket, devices []string
 			allowed = append(allowed, deviceID)
 			continue
 		}
-		socket.WriteText(batchMsg{Op: "auth_required", DeviceID: deviceID, Message: "device password required"})
+		socket.WriteText(batchMsg{Op: "auth_required", DeviceID: deviceID, Message: "device credential required"})
 	}
 	return allowed
 }
 
 func (h *batchWSHandler) isDeviceAuthorized(socket *batchSocket, client *ClientConn) bool {
-	if client.Password == "" {
+	if !h.srv.requiresDeviceCredential(client) {
 		return true
 	}
 	socket.authMu.RLock()
-	fingerprint, ok := socket.authorized[client.ID]
+	authorization, ok := socket.authorized[client.ID]
 	socket.authMu.RUnlock()
-	return ok && constantTimeEqual(fingerprint, passwordFingerprint(client.Password))
+	return ok && authorization.validFor(client)
 }
 
 // HandleFileUpload handles HTTP file upload, returns base64-encoded content
@@ -584,9 +621,12 @@ func (s *Server) HandleFileUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleBatchDevicesAPI returns device metadata for the Batch page.
-// This endpoint is intentionally not protected by the admin token; Batch actions
-// enforce each target device's own password before executing or writing files.
+// The control token protects device discovery; each action also requires the
+// target device credential before executing or writing files.
 func (s *Server) HandleBatchDevicesAPI(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAuth(w, r) {
+		return
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -618,6 +658,9 @@ func (s *Server) HandleBatchDevicesAPI(w http.ResponseWriter, r *http.Request) {
 
 // HandleBatchWS handles browser batch WebSocket connections
 func (s *Server) HandleBatchWS(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAuth(w, r) {
+		return
+	}
 	upgrader := gws.NewUpgrader(&batchWSHandler{srv: s}, &gws.ServerOption{
 		ReadMaxPayloadSize: 100 * 1024 * 1024,
 		ParallelGolimit:    runtime.GOMAXPROCS(0),

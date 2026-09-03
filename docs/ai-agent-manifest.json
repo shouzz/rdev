@@ -1,0 +1,64 @@
+{
+  "schema": "rdev.ai-agent-manifest.v2",
+  "handoff": {
+    "issuer_ui": "https://pan.feidu.fit/rdev",
+    "claim_prefix": "fdhc_",
+    "claim_ttl_seconds": 300,
+    "redeem": {
+      "method": "POST",
+      "url": "https://pan.feidu.fit/agent/v1/handoffs/redeem",
+      "content_type": "application/json",
+      "body": {"claim": "<runtime fdhc_ claim>"},
+      "required_http_status": 200,
+      "required_json_code": 0
+    },
+    "credential_fields": {
+      "device_id": "data.credentials.device_id",
+      "rdev_ticket": "data.credentials.rdev_ticket.ticket",
+      "developer_token": "data.credentials.developer_token.token"
+    },
+    "credential_ttl_seconds": 3600,
+    "single_use": true
+  },
+  "rdev": {
+    "base_url": "https://r.feidu.fit",
+    "discovery": ["GET /api/config"],
+    "device_id_source": "data.credentials.device_id",
+    "password_source": "data.credentials.rdev_ticket.ticket",
+    "protected_endpoints_not_required": ["GET /api/clients"],
+    "device_operations": ["ssh", "exec", "scp", "sftp", "rsync", "port_forward", "remote_desktop"],
+    "verified_windows_scp": {
+      "client_version": "go/v0.2.118-feidu.1",
+      "asset": "rdev-client-windows-amd64.exe",
+      "sha256": "049a369042f5a371b921fa3e99cb6a0406349b3e716463a380d1dc9310a69e2e",
+      "fallback_for_other_versions": "sftp"
+    },
+    "file_websocket": {
+      "url": "wss://r.feidu.fit/files",
+      "auth_message": {"op": "auth", "deviceId": "<device id>", "password": "<runtime secret>"},
+      "binary_frame": "[type:1][task_id_length:1][task_id][offset:uint64_be][payload]",
+      "types": {"upload_chunk": "0x20", "upload_ack": "0x21", "download_chunk": "0x22", "transfer_end": "0x23", "cancel": "0x24"}
+    }
+  },
+  "artifact_plane": {
+    "base_url": "https://pan.feidu.fit",
+    "token_env": "FEIDU_DRIVE_TOKEN",
+    "cli": "python3 tools/feidu-drive.py",
+    "download": ["GET /developer/v1/capabilities", "GET /developer/v1/contents", "GET /developer/v1/contents/{content_id}", "GET /developer/v1/contents/{content_id}/download"],
+    "upload": ["POST /developer/v1/direct-upload-sessions", "GET /developer/v1/direct-upload-sessions/{session_id}", "PUT /developer/v1/direct-upload-sessions/{session_id}/parts/{part_number}", "POST /developer/v1/direct-upload-sessions/{session_id}/parts/refresh", "POST /developer/v1/direct-upload-sessions/{session_id}/rapid-proof", "POST /developer/v1/direct-upload-sessions/{session_id}/complete", "POST /developer/v1/direct-upload-sessions/{session_id}/cancel"],
+    "token_prefix": "fdpat_",
+    "lifecycle": ["none", "hide", "archive"],
+    "rules": ["use content_id only", "never log token", "never persist signed URL", "sequential multipart with max 3 attempts per part", "HTTP 200 or 409 means part accepted"]
+  },
+  "bridge": {
+    "local_staging_required": true,
+    "cloud_to_device": ["artifact_download", "hash_verify", "rdev_scp_or_sftp_upload", "device_hash_verify"],
+    "device_to_cloud": ["device_hash_verify", "rdev_scp_or_sftp_download", "artifact_upload", "content_id_record"],
+    "integrity": ["size", "sha256_local", "sha256_remote"],
+    "secret_policy": "handoff_claim_and_credentials_runtime_only"
+  },
+  "documentation": {
+    "human": "/docs/ai-agent-artifact-bridge.md",
+    "repository": "docs/ai-agent-artifact-bridge.md"
+  }
+}

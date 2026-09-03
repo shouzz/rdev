@@ -11,9 +11,9 @@ async function loadScript(window, name) {
   window.eval(source);
 }
 
-async function setupDom(html = '<!doctype html><html><head></head><body></body></html>') {
+async function setupDom(html = '<!doctype html><html><head></head><body></body></html>', url = 'https://rdev.test/') {
   const dom = new JSDOM(html, {
-    url: 'https://rdev.test/',
+    url,
     runScripts: 'outside-only',
     pretendToBeVisual: true
   });
@@ -81,6 +81,19 @@ describe('RDevI18n', () => {
 });
 
 describe('RDevUI', () => {
+  it('generates WSS as the default client endpoint and keeps public stream ports advanced', async () => {
+    const source = await readFile(resolve(root, 'web/index.html'), 'utf8');
+    const embedded = await readFile(resolve(root, 'internal/server/static/index.html'), 'utf8');
+
+    for (const raw of [source, embedded]) {
+      const html = raw.replace(/\r\n/g, '\n');
+      expect(html).toContain('function serverList() {\n            return WS + H;');
+      expect(html).toContain('function advancedServerList()');
+      expect(html).toContain('`Advanced endpoints: ${advancedServerList() || \'none\'}`');
+      expect(html).not.toContain('return [tcpEndpoint, kcpEndpoint, wsEndpoint]');
+    }
+  });
+
   it('renders SVG icons without emoji fallback text', async () => {
     const dom = await setupDom();
     const html = dom.window.RDevUI.icon('files', 'Files');
@@ -197,6 +210,23 @@ describe('RDevUI', () => {
     const nativeSocket = nativeDom.window.RDevUI.socket('wss://rdev.test/terminal');
     expect(nativeSocket).toBeInstanceOf(FakeWebSocket);
     expect(opened).toEqual(['wss://rdev.test/terminal']);
+  });
+
+  it('keeps WebSocket URLs unchanged when admin authentication is disabled', async () => {
+    const dom = await setupDom();
+    const { RDevUI } = dom.window;
+
+    const opened = [];
+    class FakeWebSocket {
+      constructor(url) { this.url = url; opened.push(url); }
+    }
+    const oldWebSocket = dom.window.WebSocket;
+    dom.window.WebSocket = FakeWebSocket;
+    RDevUI.socket('wss://rdev.test/files?session=one', { worker: false });
+    dom.window.WebSocket = oldWebSocket;
+    expect(opened).toEqual(['wss://rdev.test/files?session=one']);
+    expect(RDevUI.adminToken).toBeUndefined();
+    expect(RDevUI.authHeaders).toBeUndefined();
   });
 });
 

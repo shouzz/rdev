@@ -177,11 +177,8 @@
     document.querySelectorAll('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); });
     window.addEventListener('rdev:langchange', () => { if (typeof renderDevices === 'function') renderDevices(); if (typeof renderList === 'function') renderList(); });
 
-    const adminToken = new URLSearchParams(location.search).get('token') || localStorage.getItem('rdevAdminToken') || '';
-    if (adminToken) localStorage.setItem('rdevAdminToken', adminToken);
-    function authURL(path) { return adminToken ? path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(adminToken) : path; }
-    function authFetch(path, init) { return fetch(authURL(path), init); }
-    document.querySelectorAll('[data-auth-link]').forEach(a => a.href = authURL(a.getAttribute('href')));
+    function authFetch(path, init) { return fetch(path, init); }
+    document.querySelectorAll('[data-auth-link]').forEach(a => a.href = a.getAttribute('href'));
 
     const FitAddon = window.FitAddon;
     const WebLinksAddon = window.WebLinksAddon;
@@ -415,7 +412,7 @@
 
         // Connect WebSocket
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = RDevUI.socket(`${proto}//${location.host}${authURL('/session?session=' + encodeURIComponent(sessionID))}`);
+        ws = RDevUI.socket(`${proto}//${location.host}/session?session=${encodeURIComponent(sessionID)}`);
         ws.binaryType = 'arraybuffer';
 
         ws.onmessage = (evt) => {

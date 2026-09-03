@@ -12,6 +12,26 @@ import (
 	"rdev/internal/protocol"
 )
 
+func TestIsSCPExecCommand(t *testing.T) {
+	tests := []struct {
+		command string
+		want    bool
+	}{
+		{command: "scp -t rdev-scp-sftp-e2e.bin", want: true},
+		{command: "scp -f rdev-scp-sftp-e2e.bin", want: true},
+		{command: "scp -v -t rdev-scp-sftp-e2e.bin", want: true},
+		{command: "scp local.bin remote.bin", want: false},
+		{command: "cmd.exe /c scp -t file.bin", want: false},
+		{command: "", want: false},
+	}
+
+	for _, test := range tests {
+		if got := isSCPExecCommand(test.command); got != test.want {
+			t.Fatalf("isSCPExecCommand(%q) = %v, want %v", test.command, got, test.want)
+		}
+	}
+}
+
 func TestExecSessionKeepsStdinForRsyncServerCommand(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses POSIX shell script")

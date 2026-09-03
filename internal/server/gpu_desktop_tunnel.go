@@ -78,7 +78,7 @@ func (s *Server) HandleGPUDesktopTunnel(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "device is not connected", http.StatusNotFound)
 		return
 	}
-	if client.Password != "" && passwordFingerprint(r.URL.Query().Get("password")) != passwordFingerprint(client.Password) {
+	if client.Password != "" && !constantTimeEqual(r.URL.Query().Get("password"), client.Password) {
 		http.Error(w, "wrong device password", http.StatusUnauthorized)
 		return
 	}
@@ -368,7 +368,7 @@ func (s *Server) handleGPUDesktopStreamTunnel(conn net.Conn, msg *protocol.Messa
 		_ = conn.Close()
 		return
 	}
-	if client.Password != "" && passwordFingerprint(msg.Password) != passwordFingerprint(client.Password) {
+	if client.Password != "" && !constantTimeEqual(msg.Password, client.Password) {
 		_ = conn.Close()
 		return
 	}
@@ -428,8 +428,8 @@ func (s *Server) HandleGPUDesktopProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "device is not connected", http.StatusNotFound)
 		return
 	}
-	if client.Password != "" && passwordFingerprint(r.URL.Query().Get("password")) != passwordFingerprint(client.Password) {
-		http.Error(w, "wrong device password", http.StatusUnauthorized)
+	if !s.authorizeBrowserDeviceRequest(client, r) {
+		http.Error(w, "wrong device credential", http.StatusUnauthorized)
 		return
 	}
 	if gpuDesktopIsServerFrontendPath(r.URL.Path, deviceID) {

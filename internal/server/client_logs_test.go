@@ -55,19 +55,18 @@ func TestClientLogAppendTailAndCleanup(t *testing.T) {
 	}
 }
 
-func TestClientLogsAPIAuthConfigTailDownloadDelete(t *testing.T) {
+func TestClientLogsAPIConfigTailDownloadDelete(t *testing.T) {
 	s := NewServer()
-	s.AdminToken = "tok"
 	s.ClientLogs = NewClientLogManager(t.TempDir(), 7*24*time.Hour, 32*1024*1024)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/client-logs/config", nil)
 	w := httptest.NewRecorder()
 	s.HandleClientLogsAPI(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthorized code=%d", w.Code)
+	if w.Code != http.StatusOK {
+		t.Fatalf("config code=%d body=%s", w.Code, w.Body.String())
 	}
 
-	req = httptest.NewRequest(http.MethodPost, "/api/client-logs/devices/dev1/config?token=tok", strings.NewReader(`{"enabled":true,"level":"debug"}`))
+	req = httptest.NewRequest(http.MethodPost, "/api/client-logs/devices/dev1/config", strings.NewReader(`{"enabled":true,"level":"debug"}`))
 	w = httptest.NewRecorder()
 	s.HandleClientLogsAPI(w, req)
 	if w.Code != http.StatusOK {
@@ -81,19 +80,19 @@ func TestClientLogsAPIAuthConfigTailDownloadDelete(t *testing.T) {
 	if err := s.ClientLogs.appendBatch("dev1", "go/test", []protocol.LogEntry{{Level: "info", Module: "api", Message: "line1"}}); err != nil {
 		t.Fatal(err)
 	}
-	req = httptest.NewRequest(http.MethodGet, "/api/client-logs/devices/dev1/tail?lines=1&token=tok", nil)
+	req = httptest.NewRequest(http.MethodGet, "/api/client-logs/devices/dev1/tail?lines=1", nil)
 	w = httptest.NewRecorder()
 	s.HandleClientLogsAPI(w, req)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "line1") {
 		t.Fatalf("tail code=%d body=%s", w.Code, w.Body.String())
 	}
-	req = httptest.NewRequest(http.MethodGet, "/api/client-logs/devices/dev1/download?date="+time.Now().Format("2006-01-02")+"&token=tok", nil)
+	req = httptest.NewRequest(http.MethodGet, "/api/client-logs/devices/dev1/download?date="+time.Now().Format("2006-01-02"), nil)
 	w = httptest.NewRecorder()
 	s.HandleClientLogsAPI(w, req)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "line1") {
 		t.Fatalf("download code=%d body=%s", w.Code, w.Body.String())
 	}
-	req = httptest.NewRequest(http.MethodDelete, "/api/client-logs/devices/dev1?token=tok", nil)
+	req = httptest.NewRequest(http.MethodDelete, "/api/client-logs/devices/dev1", nil)
 	w = httptest.NewRecorder()
 	s.HandleClientLogsAPI(w, req)
 	if w.Code != http.StatusNoContent {

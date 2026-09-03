@@ -27,6 +27,14 @@ var defaultProxyPrefixes = []string{
 	"https://hub.gitmirror.com/",
 }
 
+var errDownloadTooLarge = errors.New("download response exceeds size limit")
+
+const (
+	downloadAttempts  = 3
+	downloadRetryBase = 200 * time.Millisecond
+	maxDownloadBytes  = 512 << 20
+)
+
 type Config struct {
 	App      string
 	Version  string
@@ -210,39 +218,85 @@ func downloadWithProxies(ctx context.Context, target string, validate func(strin
 	var lastErr error
 	for _, prefix := range proxyPrefixes() {
 		url := proxiedURL(prefix, target)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
+		if _, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil); err != nil {
 			lastErr = err
 			continue
 		}
-		req.Header.Set("User-Agent", "rdev-auto-updater")
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			lastErr = readErr
-			continue
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			lastErr = fmt.Errorf("%s returned %s", url, resp.Status)
-			continue
-		}
-		if validate != nil {
-			if err := validate(url, resp, body); err != nil {
+		for attempt := 0; attempt < downloadAttempts; attempt++ {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
 				lastErr = err
+				break
+			}
+			req.Header.Set("User-Agent", "rdev-auto-updater")
+			resp, err := client.Do(req)
+			if err != nil {
+				lastErr = err
+				if !retryDownloadError(ctx, attempt, true) {
+					break
+				}
 				continue
 			}
+			body, readErr := readDownloadBody(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				lastErr = fmt.Errorf("%s: %w", url, readErr)
+				if !retryDownloadError(ctx, attempt, !errors.Is(readErr, errDownloadTooLarge)) {
+					break
+				}
+				continue
+			}
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				lastErr = fmt.Errorf("%s returned %s", url, resp.Status)
+				if !retryDownloadError(ctx, attempt, retryableStatus(resp.StatusCode)) {
+					break
+				}
+				continue
+			}
+			if validate != nil {
+				if err := validate(url, resp, body); err != nil {
+					lastErr = err
+					break
+				}
+			}
+			return body, nil
 		}
-		return body, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("all update URLs failed")
 	}
 	return nil, lastErr
+}
+
+func readDownloadBody(body io.Reader) ([]byte, error) {
+	limited := io.LimitReader(body, maxDownloadBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxDownloadBytes {
+		return nil, fmt.Errorf("%w: %d bytes", errDownloadTooLarge, maxDownloadBytes)
+	}
+	return data, nil
+}
+
+func retryableStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests || status >= 500
+}
+
+func retryDownloadError(ctx context.Context, attempt int, retryable bool) bool {
+	if !retryable || attempt >= downloadAttempts-1 || ctx.Err() != nil {
+		return false
+	}
+	delay := downloadRetryBase << attempt
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func looksLikeHTML(resp *http.Response, body []byte) bool {

@@ -1,0 +1,17 @@
+{
+  "schema": "rdev.ai-agent-manifest.v2",
+  "human_document": "/docs/ai-agent-artifact-bridge.md",
+  "handoff": {"issuer_ui": "https://pan.feidu.fit/rdev", "claim_prefix": "fdhc_", "claim_ttl_seconds": 300, "redeem_method": "POST", "redeem_url": "https://pan.feidu.fit/agent/v1/handoffs/redeem", "required_http_status": 200, "required_json_code": 0, "credential_fields": {"device_id": "data.credentials.device_id", "rdev_ticket": "data.credentials.rdev_ticket.ticket", "developer_token": "data.credentials.developer_token.token"}, "credential_ttl_seconds": 3600, "single_use": true},
+  "rdev_base_url": "https://r.feidu.fit",
+  "artifact_base_url": "https://pan.feidu.fit",
+  "artifact_token_env": "FEIDU_DRIVE_TOKEN",
+  "rdev_discovery": ["GET /api/config"],
+  "rdev_device_id_source": "data.credentials.device_id",
+  "rdev_password_source": "data.credentials.rdev_ticket.ticket",
+  "verified_windows_scp": {"client_version": "go/v0.2.118-feidu.1", "asset": "rdev-client-windows-amd64.exe", "sha256": "049a369042f5a371b921fa3e99cb6a0406349b3e716463a380d1dc9310a69e2e", "fallback_for_other_versions": "sftp"},
+  "artifact_capabilities": ["GET /developer/v1/capabilities", "GET /developer/v1/contents", "GET /developer/v1/contents/{content_id}", "GET /developer/v1/contents/{content_id}/download", "POST /developer/v1/direct-upload-sessions", "GET /developer/v1/direct-upload-sessions/{session_id}", "PUT /developer/v1/direct-upload-sessions/{session_id}/parts/{part_number}", "POST /developer/v1/direct-upload-sessions/{session_id}/parts/refresh", "POST /developer/v1/direct-upload-sessions/{session_id}/rapid-proof", "POST /developer/v1/direct-upload-sessions/{session_id}/complete", "POST /developer/v1/direct-upload-sessions/{session_id}/cancel"],
+  "rdev_file_channel": {"websocket": "wss://r.feidu.fit/files", "binary_frame": "[type:1][task_id_length:1][task_id][offset:uint64_be][payload]", "types": {"upload_chunk": "0x20", "upload_ack": "0x21", "download_chunk": "0x22", "transfer_end": "0x23", "cancel": "0x24"}},
+  "lifecycle": ["none", "hide", "archive"],
+  "security": ["content_id_only", "runtime_secrets_only", "never_log_tokens_or_signed_urls", "local_staging_and_hash_verification"],
+  "bridge_flows": ["cloud_to_device", "device_to_cloud"]
+}

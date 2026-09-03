@@ -1,11 +1,8 @@
 // @ts-nocheck
 document.getElementById('lang-slot').innerHTML = RDevUI.themeButton() + RDevI18n.langSelector();
     RDevI18n.apply();
-    const adminToken = new URLSearchParams(location.search).get('token') || localStorage.getItem('rdevAdminToken') || '';
-    if (adminToken) localStorage.setItem('rdevAdminToken', adminToken);
-    function authURL(path) { return adminToken ? path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(adminToken) : path; }
-    function authFetch(path, init) { return fetch(authURL(path), init); }
-    document.querySelectorAll('[data-auth-link]').forEach(a => a.href = authURL(a.getAttribute('href')));
+    function authFetch(path, init) { return fetch(path, init); }
+    document.querySelectorAll('[data-auth-link]').forEach(a => a.href = a.getAttribute('href'));
 
     const params = new URLSearchParams(location.search);
     const settings = document.getElementById('settings');
@@ -526,7 +523,7 @@ document.getElementById('lang-slot').innerHTML = RDevUI.themeButton() + RDevI18n
         const params = new URLSearchParams();
         if (passwordInput.value) params.set('password', passwordInput.value);
         const path = `/gpu-desktop/${encodeURIComponent(device)}/ws`;
-        const url = `${proto}//${location.host}${authURL(path + (params.toString() ? '?' + params.toString() : ''))}`;
+        const url = `${proto}//${location.host}${path + (params.toString() ? '?' + params.toString() : '')}`;
         return url;
     }
     function gpuSend(message) {
@@ -766,7 +763,7 @@ document.getElementById('lang-slot').innerHTML = RDevUI.themeButton() + RDevI18n
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
         remoteInput = false;
         resetFrameStats();
-        ws = RDevUI.socket(`${proto}//${location.host}${authURL('/desktop?' + desktopQuery())}`);
+        ws = RDevUI.socket(`${proto}//${location.host}/desktop?${desktopQuery()}`);
         const connID = ++connectionSeq;
         lastCloseMessage = '';
         ws.binaryType = 'arraybuffer';

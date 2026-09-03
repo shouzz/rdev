@@ -8,39 +8,42 @@
     <style>
         :root { color-scheme: dark; }
         :root[data-theme="dark"] {
-            --bg: #0f1117; --card: #1a1d27; --border: #2a2d3a;
-            --text: #e4e4e7; --muted: #71717a; --accent: #22d3ee;
-            --green: #4ade80; --red: #f87171; --yellow: #facc15;
+            --bg: #171717; --card: #222222; --border: #3b3b3b;
+            --text: #f5f5f4; --muted: #a3a3a3; --accent: #2dd4bf;
+            --green: #4ade80; --red: #fb7185; --yellow: #fbbf24;
         }
         :root[data-theme="light"] {
             color-scheme: light;
-            --bg: #f6f8fb; --card: #ffffff; --border: #d8dee9;
-            --text: #1f2937; --muted: #6b7280; --accent: #0891b2;
-            --green: #16a34a; --red: #dc2626; --yellow: #ca8a04;
+            --bg: #f2f6f5; --card: #ffffff; --border: #d6e2df;
+            --text: #1f2933; --muted: #64727a; --accent: #0f766e;
+            --green: #15803d; --red: #be123c; --yellow: #b45309;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
-        .container { max-width: 1440px; margin: 0 auto; padding: 2rem; }
-        header { margin-bottom: 2rem; display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem; }
-        header h1 { font-size: 1.8rem; font-weight: 700; letter-spacing: -0.02em; }
+        .container { max-width: 1320px; margin: 0 auto; padding: 2.25rem; }
+        header { margin-bottom: 1.75rem; padding-bottom: 1.35rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem; }
+        header h1 { font-size: 1.85rem; font-weight: 700; letter-spacing: 0; }
         header h1 span { color: var(--accent); }
-        header p { color: var(--muted); margin-top: 0.5rem; font-size: 0.9rem; }
+        header p { color: var(--muted); margin-top: 0.55rem; font-size: 0.88rem; }
         .header-right { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
         .gh-link { font-size: 0.9rem; color: var(--muted); text-decoration: none; display: flex; align-items: center; gap: 4px; }
         .gh-link:hover { color: var(--accent); }
         .lang-switch { display:inline-flex; align-items:center; gap:6px; color:var(--muted); font-size:0.78rem; }
         .header-btns { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-        .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: 8px; font-size: 0.85rem; font-weight: 500; cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--text); text-decoration: none; transition: all 0.15s; }
+        .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 6px; font-size: 0.85rem; font-weight: 500; cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--text); text-decoration: none; transition: all 0.15s; }
         .btn:hover { border-color: var(--accent); color: var(--accent); }
-        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
-        .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.2rem; }
-        .stat-card .label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
-        .stat-card .value { font-size: 1.8rem; font-weight: 700; margin-top: 0.3rem; }
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.85rem; margin-bottom: 1.5rem; }
+        .stat-card { background: var(--card); border: 1px solid var(--border); border-top: 3px solid var(--accent); border-radius: 8px; padding: 1.15rem 1.2rem; box-shadow: 0 8px 24px rgba(15, 118, 110, 0.06); }
+        .stat-card:nth-child(1) { border-top-color: var(--green); }
+        .stat-card:nth-child(3) { border-top-color: var(--yellow); }
+        .stat-card:nth-child(4) { border-top-color: var(--text); }
+        .stat-card .label { font-size: 0.74rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0; }
+        .stat-card .value { font-size: 1.85rem; font-weight: 700; margin-top: 0.35rem; }
         .stat-card .value.online { color: var(--green); }
         .stat-card .value.accent { color: var(--accent); }
         .stat-card .value.yellow { color: var(--yellow); }
-        table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
-        thead th { text-align: left; padding: 0.8rem 1rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-bottom: 1px solid var(--border); }
+        table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.05); }
+        thead th { text-align: left; padding: 0.8rem 1rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0; color: var(--muted); border-bottom: 1px solid var(--border); }
         tbody td { padding: 0.8rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
         tbody tr:last-child td { border-bottom: none; }
         tbody tr:hover { background: rgba(255,255,255,0.02); }
@@ -61,7 +64,7 @@
         .term-btn:disabled { opacity: 0.45; cursor: not-allowed; filter: grayscale(0.5); }
         .modal-backdrop { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 1rem; background: rgba(0,0,0,0.55); z-index: 50; }
         .modal-backdrop.open { display: flex; }
-        .modal { width: min(100%, 980px); max-height: 86vh; overflow: hidden; display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 18px 60px rgba(0,0,0,0.35); }
+        .modal { width: min(100%, 980px); max-height: 86vh; overflow: hidden; display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 18px 60px rgba(0,0,0,0.35); }
         .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem 1.2rem; border-bottom: 1px solid var(--border); }
         .modal-title { font-weight: 700; color: var(--accent); }
         .modal-body { padding: 1rem 1.2rem; overflow: auto; }
@@ -69,7 +72,7 @@
         .log-toolbar select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; }
         .log-meta { color: var(--muted); font-size: 0.8rem; margin-bottom: 0.6rem; }
         .log-tail { min-height: 360px; max-height: 58vh; overflow: auto; background: #000; color: #d4d4d8; border-radius: 8px; padding: 0.8rem; font: 12px/1.5 'SF Mono','Fira Code',Consolas,monospace; white-space: pre-wrap; word-break: break-word; }
-        .install { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin-top: 2rem; }
+        .install { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.35rem; margin-top: 1.5rem; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.04); }
         .install-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
         .install h3 { font-size: 1rem; color: var(--accent); margin: 0; }
         .client-switch { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
@@ -101,7 +104,7 @@
         .android-downloads .btn { background: rgba(34,211,238,0.08); border-color: rgba(34,211,238,0.3); color: var(--accent); }
         .android-downloads .btn:hover { background: rgba(34,211,238,0.16); }
         .download-note { margin-top: 0.7rem; font-size: 0.8rem; color: var(--muted); }
-        .hint { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin-top: 1.5rem; }
+        .hint { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.35rem; margin-top: 1.25rem; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.04); }
         .hint h3 { font-size: 0.95rem; color: var(--accent); margin-bottom: 0.8rem; }
         .hint code { display: block; background: #000; padding: 0.5rem 1rem; border-radius: 6px; font-family: 'SF Mono','Fira Code',monospace; font-size: 0.8rem; color: var(--muted); margin-top: 0.3rem; overflow-x: auto; }
         code .h1 { color: var(--accent); } code .h2 { color: var(--green); } code .h3 { color: var(--yellow); }
@@ -146,6 +149,7 @@
                     <a href="/batch" data-auth-link class="btn"><span class="icon-inline"><span data-icon="package"></span><span data-i18n="index.navBatch">Batch</span></span></a>
                     <a href="/files" data-auth-link class="btn"><span class="icon-inline"><span data-icon="files"></span><span data-i18n="index.navFiles">Files</span></span></a>
                     <a href="/sessions" data-auth-link class="btn"><span class="icon-inline"><span data-icon="sessions"></span><span data-i18n="index.navSessions">Sessions</span></span></a>
+                    <a href="/docs/ai-agent-artifact-bridge.md" class="btn" target="_blank" rel="noopener"><span class="icon-inline"><span data-icon="files"></span><span data-i18n="index.navAgentDocs">Agent docs</span></span></a>
                 </div>
             </div>
         </header>
@@ -317,18 +321,8 @@
     renderIcons();
     window.addEventListener('rdev:langchange', () => { render(); refresh(); RDevI18n.apply(); renderIcons(); });
 
-    const adminToken = new URLSearchParams(location.search).get('token') || localStorage.getItem('rdevAdminToken') || '';
-    if (adminToken) localStorage.setItem('rdevAdminToken', adminToken);
-    function authURL(path) { return adminToken ? path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(adminToken) : path; }
-    async function authFetch(path, init) {
-        const r = await fetch(authURL(path), init);
-        if (r.status === 401) {
-            const token = await RDevUI.prompt({ title: t('common.adminTokenRequired'), message: t('common.adminTokenRequired'), type: 'password' });
-            if (token) { localStorage.setItem('rdevAdminToken', token); location.search = 'token=' + encodeURIComponent(token); }
-        }
-        return r;
-    }
-        document.querySelectorAll('[data-auth-link]').forEach(a => a.href = authURL(a.getAttribute('href')));
+    function authFetch(path, init) { return fetch(path, init); }
+    document.querySelectorAll('[data-auth-link]').forEach(a => a.href = a.getAttribute('href'));
         const H = location.host;
         const isHTTPS = location.protocol === 'https:';
         const WS = isHTTPS ? 'wss://' : 'ws://';
@@ -348,11 +342,14 @@
         }
 
         function serverList() {
+            return WS + H;
+        }
+
+        function advancedServerList() {
             const host = location.hostname || H.split(':')[0];
-            const wsEndpoint = WS + H;
             const tcpEndpoint = TP ? `tcp://${host}:${TP}` : '';
             const kcpEndpoint = KP ? `kcp://${host}:${KP}` : '';
-            return [tcpEndpoint, kcpEndpoint, wsEndpoint].filter(Boolean).join(',');
+            return [tcpEndpoint, kcpEndpoint].filter(Boolean).join(',');
         }
 
         function render() {
@@ -451,6 +448,7 @@
                 `Auth: ${hasPassword ? t('common.password') : t('common.open')}`,
                 '',
                 `Client endpoints: ${serverList()}`,
+                `Advanced endpoints: ${advancedServerList() || 'none'}`,
                 `Client command: rdev-client -s ${serverList()} -i ${deviceID}` + (hasPassword ? ` -p <password>` : ''),
                 '',
                 `SSH: ssh ${deviceID}@${sshHost} -p ${SP}`,
@@ -545,7 +543,7 @@
         function downloadClientLog() {
             if (!currentLogDevice) return;
             const day = new Date().toISOString().slice(0, 10);
-            location.href = authURL('/api/client-logs/devices/' + encodeURIComponent(currentLogDevice) + '/download?date=' + day);
+            location.href = '/api/client-logs/devices/' + encodeURIComponent(currentLogDevice) + '/download?date=' + day;
         }
         async function deleteClientLogFiles() {
             if (!currentLogDevice) return;

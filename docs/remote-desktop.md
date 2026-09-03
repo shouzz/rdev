@@ -126,7 +126,7 @@ Build tags should keep platform code isolated:
 
 ## Security model
 
-- Require the same device password/admin-token gates as Web Terminal before starting desktop sessions.
+- Require the device password gate as Web Terminal before starting desktop sessions.
 - Default to view-only; require an explicit UI confirmation to enable input control.
 - Show a visible session indicator in the Web UI.
 - Support per-device policy flags: `--desktop`, `--desktop-view-only`, `--desktop-input`.

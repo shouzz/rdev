@@ -44,7 +44,7 @@ type fileSocket struct {
 	srv        *Server
 	mu         sync.Mutex
 	authMu     sync.RWMutex
-	authorized map[string]string
+	authorized map[string]deviceAuthorization
 	authFails  map[string]int
 }
 
@@ -77,7 +77,7 @@ func (h *filesWSHandler) OnOpen(socket *gws.Conn) {
 	socket.Session().Store("fileSocket", &fileSocket{
 		conn:       socket,
 		srv:        h.srv,
-		authorized: make(map[string]string),
+		authorized: make(map[string]deviceAuthorization),
 		authFails:  make(map[string]int),
 	})
 }
@@ -159,9 +159,9 @@ func (h *filesWSHandler) handleAuth(socket *fileSocket, msg fileMsg) {
 		socket.writeText(fileMsg{Op: "auth_fail", DeviceID: msg.DeviceID, Message: "device not connected"})
 		return
 	}
-	if client.Password == "" || constantTimeEqual(client.Password, msg.Password) {
+	if h.srv.authorizeDeviceCredential(client, msg.Password) {
 		socket.authMu.Lock()
-		socket.authorized[msg.DeviceID] = passwordFingerprint(client.Password)
+		socket.authorized[msg.DeviceID] = deviceAuthorizationFor(client)
 		delete(socket.authFails, msg.DeviceID)
 		socket.authMu.Unlock()
 		socket.writeText(fileMsg{Op: "auth_ok", DeviceID: msg.DeviceID})
@@ -178,13 +178,13 @@ func (h *filesWSHandler) handleAuth(socket *fileSocket, msg fileMsg) {
 }
 
 func (h *filesWSHandler) isAuthorized(socket *fileSocket, client *ClientConn) bool {
-	if client.Password == "" {
+	if !h.srv.requiresDeviceCredential(client) {
 		return true
 	}
 	socket.authMu.RLock()
-	fp := socket.authorized[client.ID]
+	authorization, ok := socket.authorized[client.ID]
 	socket.authMu.RUnlock()
-	return fp != "" && fp == passwordFingerprint(client.Password)
+	return ok && authorization.validFor(client)
 }
 
 func (h *filesWSHandler) clientFor(socket *fileSocket, deviceID string) (*ClientConn, bool) {
@@ -194,7 +194,7 @@ func (h *filesWSHandler) clientFor(socket *fileSocket, deviceID string) (*Client
 		return nil, false
 	}
 	if !h.isAuthorized(socket, client) {
-		socket.writeText(fileMsg{Op: "auth_required", DeviceID: deviceID, Message: "device password required"})
+		socket.writeText(fileMsg{Op: "auth_required", DeviceID: deviceID, Message: "device credential required"})
 		return nil, false
 	}
 	return client, true
@@ -283,9 +283,8 @@ func (h *filesWSHandler) forwardTaskControl(socket *fileSocket, msg fileMsg, typ
 		socket.writeText(fileMsg{Op: "error", TaskID: msg.TaskID, Message: "task not found"})
 		return
 	}
-	client, ok := h.srv.GetClient(route.deviceID)
+	client, ok := h.clientFor(socket, route.deviceID)
 	if !ok {
-		socket.writeText(fileMsg{Op: "error", TaskID: msg.TaskID, Message: "device not connected"})
 		return
 	}
 	client.Send(&protocol.Message{Type: typ, TaskID: msg.TaskID, Path: msg.Path, Size: msg.Size, Offset: msg.Offset})
@@ -296,7 +295,7 @@ func (h *filesWSHandler) handleCancel(socket *fileSocket, msg fileMsg) {
 	if route == nil || route.socket != socket {
 		return
 	}
-	if client, ok := h.srv.GetClient(route.deviceID); ok {
+	if client, ok := h.clientFor(socket, route.deviceID); ok {
 		client.Send(&protocol.Message{Type: protocol.MsgFileTransferCancel, TaskID: msg.TaskID})
 		client.SendBinaryOffset(protocol.BinFileTransferCancel, msg.TaskID, msg.Offset, nil)
 	}
@@ -315,9 +314,8 @@ func (h *filesWSHandler) handleBinary(socket *fileSocket, raw []byte) {
 		socket.writeText(fileMsg{Op: "error", TaskID: taskID, Message: "task not found"})
 		return
 	}
-	client, ok := h.srv.GetClient(route.deviceID)
+	client, ok := h.clientFor(socket, route.deviceID)
 	if !ok {
-		socket.writeText(fileMsg{Op: "error", TaskID: taskID, Message: "device not connected"})
 		return
 	}
 	switch typ {
