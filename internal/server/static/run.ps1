@@ -39,7 +39,7 @@ if ($env:RDEV_MIRRORS) {
 $script:Repo = 'icepie/rdev'
 $script:LocalClientRevision = 'feidu-20260903-scp3'
 $script:LocalWindowsAMD64Asset = 'rdev-client-windows-amd64.exe'
-$script:LocalWindowsAMD64SHA256 = '5bd964ac75331262ac01e21b79ee3af7322b8e34894d46f281f1a8f0667987bd'
+$script:LocalWindowsAMD64SHA256 = 'd85e262d4b39b065ba0f7cef5bd4f79fba435cd5956080c6f3f1dca908d61d3b'
 
 function Convert-RDevMirrorUrl([string]$Mirror, [string]$Url) {
     return "https://$Mirror/$Url"

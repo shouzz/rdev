@@ -59,7 +59,7 @@ describe("AI Agent artifact bridge", () => {
       "archive",
     ]);
     expect(repository.rdev.verified_windows_scp.client_version).toBe(
-      "go/v0.2.118-feidu.2",
+      "go/v0.2.121-feidu.1",
     );
     expect(
       repository.rdev.verified_windows_scp.fallback_for_other_versions,
@@ -135,7 +135,7 @@ describe("AI Agent artifact bridge", () => {
     expect(repositoryGuide).toContain("`FEIDU_DRIVE_TOKEN`");
     expect(repositoryGuide).toContain("`/api/config`");
     expect(repositoryGuide).toContain("`operation_id`");
-    expect(repositoryGuide).toContain("`go/v0.2.118-feidu.2`");
+    expect(repositoryGuide).toContain("`go/v0.2.121-feidu.1`");
     expect(repositoryGuide).toContain("`data.credentials.device_id`");
     expect(repositoryGuide).not.toContain(
       "curl -fsS https://r.feidu.fit/api/clients",
@@ -223,7 +223,7 @@ describe("AI Agent artifact bridge", () => {
 
   test("Windows launchers prefer the verified SCP-capable client", async () => {
     const expectedHash =
-      "5bd964ac75331262ac01e21b79ee3af7322b8e34894d46f281f1a8f0667987bd";
+      "d85e262d4b39b065ba0f7cef5bd4f79fba435cd5956080c6f3f1dca908d61d3b";
     const powershell = await readFile(
       resolve(root, "internal/server/static/run.ps1"),
       "utf8",

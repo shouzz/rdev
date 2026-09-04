@@ -26,7 +26,7 @@ RDEV_REPO="icepie/rdev"
 LOCAL_CLIENT_REVISION="feidu-20260903-scp3"
 LOCAL_MANAGED_CLIENT_REVISION="feidu-20260904-managed1"
 LOCAL_WINDOWS_AMD64_ASSET="rdev-client-windows-amd64.exe"
-LOCAL_WINDOWS_AMD64_SHA256="5bd964ac75331262ac01e21b79ee3af7322b8e34894d46f281f1a8f0667987bd"
+LOCAL_WINDOWS_AMD64_SHA256="d85e262d4b39b065ba0f7cef5bd4f79fba435cd5956080c6f3f1dca908d61d3b"
 
 # CN GitHub mirrors (tried first, fallback to direct)
 # Override with: RDEV_MIRRORS="mirror1 mirror2" sh run.sh ...
