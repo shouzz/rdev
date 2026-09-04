@@ -42,13 +42,14 @@
 
 ## AI Agent 与飞度网盘工件中转
 
-RDev 的设备通道可以和飞度网盘开发者 API 配合使用：用户登录飞度网盘后从 `/rdev` 为精确设备复制一次性交接，Agent 兑换得到一小时 RDev 票据和限定目录的云盘令牌。云盘负责长期工件、目录范围和顺序分片恢复，RDev 负责设备连接、SSH/SFTP、端口转发和远程执行。网页文件工作台对大于 `104857600` 字节的上传和下载自动启用账号绑定的云中转，设备直接访问阿里云签名 HTTPS 地址，文件字节不经过 RDev 或飞度应用服务器。
+RDev 的设备通道可以和飞度网盘开发者 API 配合使用：用户登录飞度网盘后从 `/rdev` 为精确设备复制一次性交接，并选择 2、8 或 24 小时的总会话时长。Agent 兑换得到 RDev 票据、限定目录的云盘令牌和续期令牌；会话续期时 `rdvat_`、`fdpat_`、`fdrn_` 的值保持稳定，只在原凭据上延长到期时间。账号、设备与云盘根权限都继承创建交接的登录账号。云盘负责长期工件、目录范围和顺序分片恢复，RDev 负责设备连接、SSH/SFTP、端口转发和远程执行。网页文件工作台对大于 `104857600` 字节的上传和下载自动启用账号绑定的云中转，设备直接访问阿里云签名 HTTPS 地址，文件字节不经过 RDev 或飞度应用服务器。
 
+- [RDev Agent Skill](skills/rdev-agent/SKILL.md)
 - [AI Agent 文件中转手册](docs/ai-agent-artifact-bridge.md)
 - [机器可读能力清单](docs/ai-agent-manifest.json)
-- 线上入口：`/docs/ai-agent-artifact-bridge.md` 与 `/docs/ai-agent-manifest.json`
+- 线上入口：`/skills/rdev-agent/SKILL.md`、`/docs/ai-agent-artifact-bridge.md` 与 `/docs/ai-agent-manifest.json`
 
-兑换得到的云盘令牌通过 `FEIDU_DRIVE_TOKEN` 注入；`fdhc_` claim、RDev 票据、云盘令牌和阿里云短期签名地址均不得写入 RDev 配置、镜像、日志、任务描述或持久 AI 记忆。
+兑换得到的云盘令牌通过 `FEIDU_DRIVE_TOKEN` 注入；官方 `rdev-agent.py` 仅在 Windows 当前用户 DPAPI 或 Unix `0600` 状态文件中保存当前会话凭据。`fdhc_` claim、RDev 票据、云盘令牌和阿里云短期签名地址均不得写入其他 RDev 配置、镜像、日志、任务描述或持久 AI 记忆。
 
 ## 快速开始
 
@@ -71,6 +72,8 @@ RDev 的设备通道可以和飞度网盘开发者 API 配合使用：用户登�
 当前版本不启用 Web 管理员 token。Web/API/文件/终端入口必须放在 HTTPS 反向代理、VPN 或防火墙访问控制之后，不应直接暴露到不受信任的公网。
 
 飞度发布中心接入使用后端专用的 `RDEV_CONTROL_TOKEN_FILE`。直接运行时该变量可省略；生产 Compose 会要求它指向宿主机上的绝对路径，文件内容至少 32 字节，并在 Linux 上使用 `0600` 权限。这个控制密钥不提供给浏览器、客户端或 Agent。
+
+启用网页“一次运行”或“保持在线”前，服务端数据目录的 `releases/` 必须提供当前源码构建的受管 Go 客户端，例如 `rdev-client-linux-amd64`、`rdev-client-linux-arm64` 和对应 Windows 资产。入网模式的启动脚本优先从同源 `/local-release` 下载并检查 `--enroll-stdin`、`--identity-file` 与 `--replace-existing` 能力；GitHub `latest` 不具备这些参数时会明确失败，不会继续建立无效的 systemd 服务。保持在线模式重装时会接管同一账号下的同名受管设备，原地轮换设备密钥、撤销旧票据并断开旧连接；不同账号、已撤销设备或未受管在线设备固定返回冲突，不会被接管。
 
 ### 启动客户端
 

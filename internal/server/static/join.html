@@ -90,7 +90,7 @@
     const origin = location.origin;
     if (state.os === 'windows') {
       const mode = state.mode === 'persistent' ? '-Persist' : '-Enroll';
-      commandNode.textContent = `$env:RDEV_ENROLLMENT_CODE='${invitation}'; iwr -useb '${origin}/run.ps1' | iex; RDev '${origin}' ${mode}`;
+      commandNode.textContent = `powershell -NoProfile -Command "[Environment]::SetEnvironmentVariable('RDEV_ENROLLMENT_CODE','${invitation}','Process'); iwr -useb '${origin}/run.ps1' | iex; RDev '${origin}' ${mode}"`;
     } else {
       const mode = state.mode === 'persistent' ? '--persist' : '--enroll';
       commandNode.textContent = `curl -fsSL '${origin}/run.sh' | RDEV_ENROLLMENT_CODE='${invitation}' sh -s -- '${origin}' ${mode}`;

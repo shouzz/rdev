@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
@@ -18,6 +19,20 @@ type sshAuthTestContext struct {
 	user     string
 	valuesMu sync.Mutex
 	values   map[interface{}]interface{}
+}
+
+type sshTestCloser struct {
+	closeCount int
+	closed     chan struct{}
+}
+
+func (c *sshTestCloser) Close() error {
+	c.closeCount++
+	if c.closed != nil {
+		close(c.closed)
+		c.closed = nil
+	}
+	return nil
 }
 
 func newSSHAuthTestContext(user string) *sshAuthTestContext {
@@ -84,6 +99,125 @@ func TestSSHAccessTicketBindsDeviceAuthorization(t *testing.T) {
 	}
 	if authorized, ok := s.authorizedSSHClient(ctx); !ok || authorized != client {
 		t.Fatal("access-ticket SSH authentication did not bind the device identity")
+	}
+}
+
+func TestSSHAccessTicketAuthorizationStopsAfterTicketRevocation(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	client := &ClientConn{ID: "device", InstanceID: "instance-one", Password: "device-secret"}
+	s.clients[client.ID] = client
+	ticket := issueAccessTicket(t, s, client.ID, 60)
+	sshServer := &SSHServer{srv: s}
+	ctx := newSSHAuthTestContext(client.ID)
+
+	if !sshServer.handlePassword(ctx, ticket) {
+		t.Fatal("access-ticket SSH authentication failed")
+	}
+	authorization, ok := ctx.Value(sshDeviceAuthorizationKey).(deviceAuthorization)
+	if !ok || authorization.TicketID == "" {
+		t.Fatal("access-ticket SSH authentication did not bind the ticket identity")
+	}
+	s.accessTicketMu.Lock()
+	for hash, stored := range s.accessTickets {
+		if stored.ID == authorization.TicketID {
+			delete(s.accessTickets, hash)
+		}
+	}
+	s.accessTicketMu.Unlock()
+	if _, ok = s.authorizedSSHClient(ctx); ok {
+		t.Fatal("revoked access ticket remained authorized in the established SSH context")
+	}
+}
+
+func TestSSHAccessTicketRevokeHookClosesEveryConnectionForExactTicket(t *testing.T) {
+	s := NewServer()
+	sshServer, err := NewSSHServer(s, "127.0.0.1:0", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := &sshTestCloser{}
+	second := &sshTestCloser{}
+	other := &sshTestCloser{}
+	if !sshServer.trackTicketConnection("ticket-one", "connection-one", first) ||
+		!sshServer.trackTicketConnection("ticket-one", "connection-two", second) ||
+		!sshServer.trackTicketConnection("ticket-two", "connection-three", other) {
+		t.Fatal("failed to track ticket connections")
+	}
+
+	s.accessTicketRevoked("ticket-one")
+	if first.closeCount != 1 || second.closeCount != 1 {
+		t.Fatalf("revoked ticket close counts = %d, %d, want 1, 1", first.closeCount, second.closeCount)
+	}
+	if other.closeCount != 0 {
+		t.Fatalf("unrelated ticket close count = %d, want 0", other.closeCount)
+	}
+	sshServer.closeTicketConnections("ticket-one")
+	if first.closeCount != 1 || second.closeCount != 1 {
+		t.Fatal("repeated revocation closed connections more than once")
+	}
+}
+
+func TestSSHAccessTicketNaturalExpiryClosesTrackedConnection(t *testing.T) {
+	s := NewServer()
+	sshServer, err := NewSSHServer(s, "127.0.0.1:0", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan struct{})
+	closer := &sshTestCloser{closed: closed}
+	if !sshServer.trackTicketConnection("expiring-ticket", "connection", closer) {
+		t.Fatal("failed to track ticket connection")
+	}
+	ticketHash := [32]byte{1}
+	s.accessTickets[ticketHash] = accessTicket{ID: "expiring-ticket", ExpiresAt: time.Now().Add(30 * time.Millisecond)}
+	done := make(chan struct{})
+	go sshServer.watchTicketConnection("expiring-ticket", "connection", done)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("ticket connection remained open after natural expiry")
+	}
+	if closer.closeCount != 1 {
+		t.Fatalf("expired ticket close count = %d, want 1", closer.closeCount)
+	}
+}
+
+func TestSSHAccessTicketRenewalKeepsTrackedConnectionOpen(t *testing.T) {
+	s := NewServer()
+	sshServer, err := NewSSHServer(s, "127.0.0.1:0", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan struct{})
+	closer := &sshTestCloser{closed: closed}
+	if !sshServer.trackTicketConnection("renewed-ticket", "connection", closer) {
+		t.Fatal("failed to track ticket connection")
+	}
+	ticketHash := [32]byte{2}
+	s.accessTicketMu.Lock()
+	s.accessTickets[ticketHash] = accessTicket{ID: "renewed-ticket", ExpiresAt: time.Now().Add(30 * time.Millisecond)}
+	s.accessTicketMu.Unlock()
+	done := make(chan struct{})
+	go sshServer.watchTicketConnection("renewed-ticket", "connection", done)
+	time.Sleep(10 * time.Millisecond)
+	s.accessTicketMu.Lock()
+	ticket := s.accessTickets[ticketHash]
+	ticket.ExpiresAt = time.Now().Add(100 * time.Millisecond)
+	s.accessTickets[ticketHash] = ticket
+	s.accessTicketMu.Unlock()
+	select {
+	case <-closed:
+		t.Fatal("renewed ticket connection closed at the original expiry")
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("renewed ticket connection remained open after the extended expiry")
+	}
+	if closer.closeCount != 1 {
+		t.Fatalf("expired renewed ticket close count = %d, want 1", closer.closeCount)
 	}
 }
 

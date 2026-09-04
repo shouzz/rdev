@@ -27,6 +27,9 @@ func TestRegistrationMessageSeparatesAccessPasswordAndDeviceSecret(t *testing.T)
 	if message.Password != "ssh-password" || message.DeviceSecret != "managed-secret" {
 		t.Fatalf("registration credentials were not separated: %#v", message)
 	}
+	if !message.CloudTransferV1 {
+		t.Fatal("registration did not advertise cloud transfer v1")
+	}
 }
 
 func TestRegistrationErrorCompletesAttemptImmediately(t *testing.T) {

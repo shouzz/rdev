@@ -1,9 +1,10 @@
 {
-  "schema": "rdev.ai-agent-manifest.v3",
+  "schema": "rdev.ai-agent-manifest.v4",
   "handoff": {
     "issuer_ui": "https://pan.feidu.fit/rdev",
     "claim_prefix": "fdhc_",
     "claim_ttl_seconds": 300,
+    "claim_input": "stdin_or_hidden_prompt",
     "redeem": {
       "method": "POST",
       "url": "https://pan.feidu.fit/agent/v1/handoffs/redeem",
@@ -15,10 +16,35 @@
     "credential_fields": {
       "device_id": "data.credentials.device_id",
       "rdev_ticket": "data.credentials.rdev_ticket.ticket",
-      "developer_token": "data.credentials.developer_token.token"
+      "developer_token": "data.credentials.developer_token.token",
+      "agent_session_id": "data.credentials.agent_session.agent_session_id",
+      "renewal_token": "data.credentials.agent_session.renewal_token"
     },
-    "credential_ttl_seconds": 3600,
+    "credential_max_ttl_seconds": 28800,
+    "session_duration_hours": [2, 8, 24],
     "single_use": true
+  },
+  "agent_session": {
+    "renewal_token_prefix": "fdrn_",
+    "minimum_safety_margin_seconds": 600,
+    "renew_before_seconds": 900,
+    "endpoints": {
+      "heartbeat": "POST /agent/v1/sessions/{agent_session_id}/heartbeat",
+      "renew": "POST /agent/v1/sessions/{agent_session_id}/renew",
+      "revoke": "DELETE /agent/v1/sessions/{agent_session_id}",
+      "transfer_create": "POST /agent/v1/sessions/{agent_session_id}/transfers",
+      "transfer_get": "GET /agent/v1/sessions/{agent_session_id}/transfers/{transfer_id}",
+      "transfer_pause": "POST /agent/v1/sessions/{agent_session_id}/transfers/{transfer_id}/pause",
+      "transfer_resume": "POST /agent/v1/sessions/{agent_session_id}/transfers/{transfer_id}/resume",
+      "transfer_cancel": "POST /agent/v1/sessions/{agent_session_id}/transfers/{transfer_id}/cancel"
+    },
+    "status_fields": ["ticket_remaining_seconds", "developer_token_remaining_seconds", "estimated_transfer_seconds", "minimum_safety_margin_seconds", "renewal_due_at_ms", "absolute_expires_at_ms", "selected_transport"],
+    "renewal_token_policy": "stable_until_absolute_expiry_or_revoke",
+    "renewal_response": "data.session",
+    "credential_policy": "values_stable_expiry_extended_in_place",
+    "state_storage": {"windows": "current-user DPAPI", "unix": "mode 0600"},
+    "tool": "/skills/rdev-agent/scripts/rdev-agent.py",
+    "skill": "/skills/rdev-agent/SKILL.md"
   },
   "rdev": {
     "base_url": "https://r.feidu.fit",
@@ -46,7 +72,13 @@
       "modes": ["temporary", "persistent"],
       "persistent_identity": "OS-protected identity file",
       "secret_storage": "server bcrypt hash only",
-      "persistent_transport": "wss://r.feidu.fit"
+      "persistent_transport": "wss://r.feidu.fit",
+      "persistent_reenrollment": {
+        "client_flag": "--replace-existing",
+        "allowed_scope": "same owner and exact managed device ID",
+        "effect": "rotate device secret, revoke old access tickets, disconnect old connection",
+        "conflict_http_status": 409
+      }
     }
   },
   "artifact_plane": {
@@ -67,6 +99,10 @@
       "device_to_cloud": ["device_size_sha1_verify", "device_sequential_multipart_to_aliyundrive", "result_content_id_bind", "browser_download_ticket"],
       "transfer_states": ["queued", "running", "paused", "completed", "failed", "cancelled"],
       "transfer_token_prefix": "fdtx_",
+      "transfer_generation": "positive_uint64_monotonic_per_transfer",
+      "dispatch_acceptance": "device_plan_and_running_progress_acknowledged",
+      "client_acceptance_timeout_seconds": 7,
+      "rdev_dispatch_ack_timeout_seconds": 8,
       "download_part_suffix": ".rdev-cloud.part"
     },
     "manual_agent_workflow": {

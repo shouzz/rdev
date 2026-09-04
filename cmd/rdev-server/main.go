@@ -262,6 +262,9 @@ Examples:
 	if err := srv.ConfigureEnrollmentStore(filepath.Join(dataDir, "managed_devices.json"), publicURL); err != nil {
 		log.Fatalf("device enrollment init error: %v", err)
 	}
+	if err := srv.ConfigureAccessTicketStore(filepath.Join(dataDir, "access_tickets.json")); err != nil {
+		log.Fatalf("access ticket init error: %v", err)
+	}
 	srv.ReleaseVersion = version
 	srv.LocalReleaseDir = localReleaseDir
 	if controlTokenPath := os.Getenv("RDEV_CONTROL_TOKEN_FILE"); controlTokenPath != "" {

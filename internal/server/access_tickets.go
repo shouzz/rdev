@@ -8,8 +8,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -22,21 +26,43 @@ const (
 	accessTicketSecretBytes = 32
 	accessTicketMinLifetime = time.Minute
 	accessTicketMaxLifetime = 8 * time.Hour
+	accessTicketRegistryV1  = "rdev-access-ticket-registry.v1"
+	accessTicketRegistryV2  = "rdev-access-ticket-registry.v2"
 )
 
 type accessTicket struct {
-	ID                  string
-	DeviceID            string
-	InstanceID          string
-	PasswordFingerprint string
-	Subject             string
-	ExpiresAt           time.Time
+	ID                      string
+	DeviceID                string
+	DeviceCredentialVersion uint64
+	InstanceID              string
+	PasswordFingerprint     string
+	Subject                 string
+	ExpiresAt               time.Time
+}
+
+type accessTicketRegistry struct {
+	Schema  string                       `json:"schema"`
+	Tickets []accessTicketRegistryRecord `json:"tickets"`
+}
+
+type accessTicketRegistryRecord struct {
+	TicketHash              string `json:"ticket_hash"`
+	ID                      string `json:"id"`
+	DeviceID                string `json:"device_id"`
+	DeviceCredentialVersion uint64 `json:"device_credential_version,omitempty"`
+	InstanceID              string `json:"instance_id"`
+	PasswordFingerprint     string `json:"password_fingerprint"`
+	Subject                 string `json:"subject"`
+	ExpiresAt               string `json:"expires_at"`
 }
 
 type deviceAuthorization struct {
-	DeviceID            string
-	InstanceID          string
-	PasswordFingerprint string
+	DeviceID                string
+	DeviceCredentialVersion uint64
+	InstanceID              string
+	PasswordFingerprint     string
+	TicketID                string
+	TicketExpiresAt         time.Time
 }
 
 type accessTicketCreateRequest struct {
@@ -51,6 +77,154 @@ type accessTicketCreateResponse struct {
 	DeviceID    string `json:"deviceId"`
 	ExpiresAt   string `json:"expiresAt"`
 	ExpiresAtMs int64  `json:"expiresAtMs"`
+}
+
+type accessTicketRevokeRequest struct {
+	TicketID string `json:"ticketId"`
+}
+
+type accessTicketRenewRequest struct {
+	TicketID    string `json:"ticketId"`
+	ExpiresAtMs int64  `json:"expiresAtMs"`
+}
+
+type accessTicketRenewResponse struct {
+	TicketID    string `json:"ticketId"`
+	DeviceID    string `json:"deviceId"`
+	ExpiresAt   string `json:"expiresAt"`
+	ExpiresAtMs int64  `json:"expiresAtMs"`
+}
+
+func (s *Server) ConfigureAccessTicketStore(storePath string) error {
+	if storePath == "" || !filepath.IsAbs(storePath) {
+		return errors.New("access ticket store path must be absolute")
+	}
+	if err := os.MkdirAll(filepath.Dir(storePath), 0700); err != nil {
+		return fmt.Errorf("create access ticket store directory: %w", err)
+	}
+	s.accessTicketMu.Lock()
+	defer s.accessTicketMu.Unlock()
+	s.accessTicketStorePath = storePath
+	return s.loadAccessTicketsLocked()
+}
+
+func (s *Server) loadAccessTicketsLocked() error {
+	s.accessTickets = make(map[[sha256.Size]byte]accessTicket)
+	data, err := os.ReadFile(s.accessTicketStorePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read access ticket store: %w", err)
+	}
+	var registry accessTicketRegistry
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&registry); err != nil {
+		return fmt.Errorf("decode access ticket store: %w", err)
+	}
+	var trailing json.RawMessage
+	if err = decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("decode access ticket store: trailing data")
+	}
+	if registry.Schema != accessTicketRegistryV1 && registry.Schema != accessTicketRegistryV2 {
+		return errors.New("access ticket store schema is invalid")
+	}
+	now := s.accessTicketCurrentTime()
+	seenIDs := make(map[string]struct{}, len(registry.Tickets))
+	for _, record := range registry.Tickets {
+		decodedHash, decodeErr := hex.DecodeString(record.TicketHash)
+		if decodeErr != nil || len(decodedHash) != sha256.Size || hex.EncodeToString(decodedHash) != record.TicketHash {
+			return errors.New("access ticket store ticket_hash is invalid")
+		}
+		decodedID, decodeErr := hex.DecodeString(record.ID)
+		if decodeErr != nil || len(decodedID) != 16 || hex.EncodeToString(decodedID) != record.ID {
+			return errors.New("access ticket store id is invalid")
+		}
+		if _, duplicate := seenIDs[record.ID]; duplicate {
+			return errors.New("access ticket store contains duplicate ids")
+		}
+		seenIDs[record.ID] = struct{}{}
+		if err = validateManagedDeviceID(record.DeviceID); err != nil {
+			return fmt.Errorf("access ticket store device_id: %w", err)
+		}
+		if strings.TrimSpace(record.InstanceID) != record.InstanceID {
+			return errors.New("access ticket store instance_id is invalid")
+		}
+		decodedFingerprint, decodeErr := hex.DecodeString(record.PasswordFingerprint)
+		if decodeErr != nil || len(decodedFingerprint) != sha256.Size || hex.EncodeToString(decodedFingerprint) != record.PasswordFingerprint {
+			return errors.New("access ticket store password_fingerprint is invalid")
+		}
+		if record.Subject == "" || strings.TrimSpace(record.Subject) != record.Subject || len(record.Subject) > 128 {
+			return errors.New("access ticket store subject is invalid")
+		}
+		expiresAt, parseErr := time.Parse(time.RFC3339, record.ExpiresAt)
+		if parseErr != nil || expiresAt.UTC().Format(time.RFC3339) != record.ExpiresAt {
+			return errors.New("access ticket store expires_at is invalid")
+		}
+		if !expiresAt.After(now) {
+			continue
+		}
+		var ticketHash [sha256.Size]byte
+		copy(ticketHash[:], decodedHash)
+		if _, duplicate := s.accessTickets[ticketHash]; duplicate {
+			return errors.New("access ticket store contains duplicate ticket hashes")
+		}
+		s.accessTickets[ticketHash] = accessTicket{
+			ID: record.ID, DeviceID: record.DeviceID, InstanceID: record.InstanceID,
+			DeviceCredentialVersion: record.DeviceCredentialVersion,
+			PasswordFingerprint:     record.PasswordFingerprint, Subject: record.Subject, ExpiresAt: expiresAt,
+		}
+	}
+	return nil
+}
+
+func (s *Server) persistAccessTicketsLocked() error {
+	if s.accessTicketStorePath == "" {
+		return nil
+	}
+	hashes := make([][sha256.Size]byte, 0, len(s.accessTickets))
+	for hash := range s.accessTickets {
+		hashes = append(hashes, hash)
+	}
+	sort.Slice(hashes, func(i, j int) bool {
+		return hex.EncodeToString(hashes[i][:]) < hex.EncodeToString(hashes[j][:])
+	})
+	registry := accessTicketRegistry{Schema: accessTicketRegistryV2, Tickets: make([]accessTicketRegistryRecord, 0, len(hashes))}
+	for _, hash := range hashes {
+		ticket := s.accessTickets[hash]
+		registry.Tickets = append(registry.Tickets, accessTicketRegistryRecord{
+			TicketHash: hex.EncodeToString(hash[:]), ID: ticket.ID, DeviceID: ticket.DeviceID,
+			DeviceCredentialVersion: ticket.DeviceCredentialVersion,
+			InstanceID:              ticket.InstanceID, PasswordFingerprint: ticket.PasswordFingerprint,
+			Subject: ticket.Subject, ExpiresAt: ticket.ExpiresAt.UTC().Format(time.RFC3339),
+		})
+	}
+	data, err := json.MarshalIndent(registry, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	temporary, err := os.CreateTemp(filepath.Dir(s.accessTicketStorePath), ".access-tickets-*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err = temporary.Chmod(0600); err == nil {
+		_, err = temporary.Write(data)
+	}
+	if err == nil {
+		err = temporary.Sync()
+	}
+	closeErr := temporary.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, s.accessTicketStorePath)
 }
 
 func (s *Server) secureControlEnabled() bool {
@@ -112,6 +286,8 @@ func (s *Server) browserAccessTicketValid(value, requestedDeviceID string) bool 
 	}
 	hash := sha256.Sum256([]byte(value))
 	now := s.accessTicketCurrentTime()
+	s.enrollmentMu.Lock()
+	defer s.enrollmentMu.Unlock()
 	s.accessTicketMu.Lock()
 	defer s.accessTicketMu.Unlock()
 	for key, ticket := range s.accessTickets {
@@ -123,6 +299,11 @@ func (s *Server) browserAccessTicketValid(value, requestedDeviceID string) bool 
 	if !ok || !strings.HasPrefix(ticket.Subject, browserTicketSubject) || !ticket.ExpiresAt.After(now) {
 		return false
 	}
+	device, managed := s.managedDevices[ticket.DeviceID]
+	if !managed || !device.RevokedAt.IsZero() ||
+		!accessTicketCredentialVersionMatches(ticket.DeviceCredentialVersion, device.CredentialVersion) {
+		return false
+	}
 	return requestedDeviceID == "" || requestedDeviceID == ticket.DeviceID
 }
 
@@ -131,27 +312,49 @@ func (s *Server) requiresDeviceCredential(client *ClientConn) bool {
 }
 
 func (s *Server) authorizeDeviceCredential(client *ClientConn, credential string) bool {
+	_, ok := s.authorizeDeviceCredentialBinding(client, credential)
+	return ok
+}
+
+func (s *Server) authorizeDeviceCredentialBinding(client *ClientConn, credential string) (deviceAuthorization, bool) {
 	if client == nil {
-		return false
+		return deviceAuthorization{}, false
 	}
-	if credential != "" && s.accessTicketValid(client, credential) {
-		return true
+	if credential != "" {
+		if ticket, ok := s.accessTicketForCredential(client, credential); ok {
+			authorization := deviceAuthorizationFor(client)
+			authorization.TicketID = ticket.ID
+			authorization.TicketExpiresAt = ticket.ExpiresAt
+			authorization.DeviceCredentialVersion = ticket.DeviceCredentialVersion
+			return authorization, true
+		}
 	}
 	if client.Password != "" {
-		return constantTimeEqual(client.Password, credential)
+		return deviceAuthorizationFor(client), constantTimeEqual(client.Password, credential)
 	}
-	return !s.secureControlEnabled()
+	return deviceAuthorizationFor(client), !s.secureControlEnabled()
 }
 
 func (s *Server) accessTicketValid(client *ClientConn, value string) bool {
+	_, ok := s.accessTicketForCredential(client, value)
+	return ok
+}
+
+func (s *Server) accessTicketForCredential(client *ClientConn, value string) (accessTicket, bool) {
 	if client == nil {
-		return false
+		return accessTicket{}, false
 	}
 	if !strings.HasPrefix(value, accessTicketPrefix) {
-		return false
+		return accessTicket{}, false
 	}
 	hash := sha256.Sum256([]byte(value))
 	now := s.accessTicketCurrentTime()
+	s.enrollmentMu.Lock()
+	defer s.enrollmentMu.Unlock()
+	device, managed := s.managedDevices[client.ID]
+	if !managed || !device.RevokedAt.IsZero() {
+		return accessTicket{}, false
+	}
 	s.accessTicketMu.Lock()
 	defer s.accessTicketMu.Unlock()
 	for key, ticket := range s.accessTickets {
@@ -160,10 +363,12 @@ func (s *Server) accessTicketValid(client *ClientConn, value string) bool {
 		}
 	}
 	ticket, ok := s.accessTickets[hash]
-	return ok && ticket.DeviceID == client.ID &&
+	valid := ok && ticket.DeviceID == client.ID &&
+		accessTicketCredentialVersionMatches(ticket.DeviceCredentialVersion, device.CredentialVersion) &&
 		ticket.InstanceID == client.InstanceID &&
 		constantTimeEqual(ticket.PasswordFingerprint, passwordFingerprint(client.Password)) &&
 		ticket.ExpiresAt.After(now)
+	return ticket, valid
 }
 
 func deviceAuthorizationFor(client *ClientConn) deviceAuthorization {
@@ -186,11 +391,57 @@ func (authorization deviceAuthorization) validFor(client *ClientConn) bool {
 		constantTimeEqual(authorization.PasswordFingerprint, passwordFingerprint(client.Password))
 }
 
+func (s *Server) deviceAuthorizationValid(authorization deviceAuthorization, client *ClientConn) bool {
+	if !authorization.validFor(client) {
+		return false
+	}
+	if authorization.TicketID == "" {
+		return true
+	}
+	now := s.accessTicketCurrentTime()
+	s.enrollmentMu.Lock()
+	defer s.enrollmentMu.Unlock()
+	device, managed := s.managedDevices[authorization.DeviceID]
+	if !managed || !device.RevokedAt.IsZero() ||
+		!accessTicketCredentialVersionMatches(authorization.DeviceCredentialVersion, device.CredentialVersion) {
+		return false
+	}
+	s.accessTicketMu.Lock()
+	defer s.accessTicketMu.Unlock()
+	for hash, ticket := range s.accessTickets {
+		if !ticket.ExpiresAt.After(now) {
+			delete(s.accessTickets, hash)
+			continue
+		}
+		if ticket.ID == authorization.TicketID &&
+			accessTicketCredentialVersionMatches(ticket.DeviceCredentialVersion, device.CredentialVersion) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) accessTicketCurrentTime() time.Time {
 	if s.accessTicketNow != nil {
 		return s.accessTicketNow()
 	}
 	return time.Now()
+}
+
+func (s *Server) accessTicketExpiration(ticketID string) (time.Time, bool) {
+	now := s.accessTicketCurrentTime()
+	s.accessTicketMu.Lock()
+	defer s.accessTicketMu.Unlock()
+	for hash, ticket := range s.accessTickets {
+		if !ticket.ExpiresAt.After(now) {
+			delete(s.accessTickets, hash)
+			continue
+		}
+		if ticket.ID == ticketID {
+			return ticket.ExpiresAt, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func (s *Server) authorizeBrowserDeviceRequest(client *ClientConn, r *http.Request) bool {
@@ -209,6 +460,14 @@ func (s *Server) authorizeBrowserDeviceRequest(client *ClientConn, r *http.Reque
 
 func (s *Server) HandleAccessTicketsAPI(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAuth(w, r) {
+		return
+	}
+	if r.Method == http.MethodDelete {
+		s.handleAccessTicketRevoke(w, r)
+		return
+	}
+	if r.Method == http.MethodPatch {
+		s.handleAccessTicketRenew(w, r)
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -247,10 +506,6 @@ func (s *Server) HandleAccessTicketsAPI(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "device is not connected", http.StatusNotFound)
 		return
 	}
-	if !s.managedDeviceOwnerMatches(input.DeviceID, input.Subject) {
-		http.Error(w, "device is not owned by subject", http.StatusForbidden)
-		return
-	}
 	ticketValue, ticketID, err := newAccessTicketValue()
 	if err != nil {
 		http.Error(w, "ticket generation failed", http.StatusInternalServerError)
@@ -258,19 +513,35 @@ func (s *Server) HandleAccessTicketsAPI(w http.ResponseWriter, r *http.Request) 
 	}
 	expiresAt := s.accessTicketCurrentTime().Add(lifetime).UTC().Truncate(time.Second)
 	hash := sha256.Sum256([]byte(ticketValue))
+	s.enrollmentMu.Lock()
+	device, managed := s.managedDevices[input.DeviceID]
+	if !managed || !device.RevokedAt.IsZero() || !managedDeviceOwnerSubjectMatches(device.OwnerSubject, input.Subject) {
+		s.enrollmentMu.Unlock()
+		http.Error(w, "device is not owned by subject", http.StatusForbidden)
+		return
+	}
 	s.accessTicketMu.Lock()
 	if s.accessTickets == nil {
 		s.accessTickets = make(map[[32]byte]accessTicket)
 	}
 	s.accessTickets[hash] = accessTicket{
-		ID:                  ticketID,
-		DeviceID:            client.ID,
-		InstanceID:          client.InstanceID,
-		PasswordFingerprint: passwordFingerprint(client.Password),
-		Subject:             input.Subject,
-		ExpiresAt:           expiresAt,
+		ID:                      ticketID,
+		DeviceID:                client.ID,
+		DeviceCredentialVersion: device.CredentialVersion,
+		InstanceID:              client.InstanceID,
+		PasswordFingerprint:     passwordFingerprint(client.Password),
+		Subject:                 input.Subject,
+		ExpiresAt:               expiresAt,
+	}
+	if err = s.persistAccessTicketsLocked(); err != nil {
+		delete(s.accessTickets, hash)
+		s.accessTicketMu.Unlock()
+		s.enrollmentMu.Unlock()
+		http.Error(w, "access ticket store write failed", http.StatusInternalServerError)
+		return
 	}
 	s.accessTicketMu.Unlock()
+	s.enrollmentMu.Unlock()
 
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
@@ -279,6 +550,212 @@ func (s *Server) HandleAccessTicketsAPI(w http.ResponseWriter, r *http.Request) 
 		Ticket: ticketValue, TicketID: ticketID, DeviceID: input.DeviceID,
 		ExpiresAt: expiresAt.Format(time.RFC3339), ExpiresAtMs: expiresAt.UnixMilli(),
 	})
+}
+
+func (s *Server) handleAccessTicketRenew(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var input accessTicketRenewRequest
+	if err := decoder.Decode(&input); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	decoded, err := hex.DecodeString(input.TicketID)
+	if err != nil || len(decoded) != 16 || hex.EncodeToString(decoded) != input.TicketID {
+		http.Error(w, "ticketId is invalid", http.StatusBadRequest)
+		return
+	}
+	now := s.accessTicketCurrentTime()
+	expiresAt := time.UnixMilli(input.ExpiresAtMs).UTC()
+	lifetime := expiresAt.Sub(now)
+	if input.ExpiresAtMs <= 0 || !expiresAt.Equal(expiresAt.Truncate(time.Second)) ||
+		lifetime < accessTicketMinLifetime || lifetime > accessTicketMaxLifetime {
+		http.Error(w, "expiresAtMs must be an exact second between 60 and 28800 seconds in the future", http.StatusBadRequest)
+		return
+	}
+	var renewed accessTicket
+	var renewedHash [sha256.Size]byte
+	var originalExpiry time.Time
+	changed := false
+	s.enrollmentMu.Lock()
+	defer s.enrollmentMu.Unlock()
+	s.accessTicketMu.Lock()
+	for hash, ticket := range s.accessTickets {
+		if !ticket.ExpiresAt.After(now) {
+			delete(s.accessTickets, hash)
+			continue
+		}
+		if ticket.ID != input.TicketID {
+			continue
+		}
+		device, managed := s.managedDevices[ticket.DeviceID]
+		if !managed || !device.RevokedAt.IsZero() ||
+			!accessTicketCredentialVersionMatches(ticket.DeviceCredentialVersion, device.CredentialVersion) {
+			continue
+		}
+		if ticket.ExpiresAt.After(expiresAt) {
+			expiresAt = ticket.ExpiresAt
+		} else {
+			originalExpiry = ticket.ExpiresAt
+			ticket.ExpiresAt = expiresAt
+			s.accessTickets[hash] = ticket
+			renewedHash = hash
+			changed = true
+		}
+		renewed = ticket
+		break
+	}
+	if changed {
+		if err = s.persistAccessTicketsLocked(); err != nil {
+			ticket := s.accessTickets[renewedHash]
+			ticket.ExpiresAt = originalExpiry
+			s.accessTickets[renewedHash] = ticket
+			s.accessTicketMu.Unlock()
+			http.Error(w, "access ticket store write failed", http.StatusInternalServerError)
+			return
+		}
+	}
+	s.accessTicketMu.Unlock()
+	if renewed.ID == "" {
+		http.Error(w, "ticket was not found or has expired", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(accessTicketRenewResponse{
+		TicketID: renewed.ID, DeviceID: renewed.DeviceID,
+		ExpiresAt: expiresAt.Format(time.RFC3339), ExpiresAtMs: expiresAt.UnixMilli(),
+	})
+}
+
+func (s *Server) handleAccessTicketRevoke(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var input accessTicketRevokeRequest
+	if err := decoder.Decode(&input); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	decoded, err := hex.DecodeString(input.TicketID)
+	if err != nil || len(decoded) != 16 || hex.EncodeToString(decoded) != input.TicketID {
+		http.Error(w, "ticketId is invalid", http.StatusBadRequest)
+		return
+	}
+	s.accessTicketMu.Lock()
+	revoked := false
+	var revokedHash [sha256.Size]byte
+	var revokedTicket accessTicket
+	for hash, ticket := range s.accessTickets {
+		if ticket.ID == input.TicketID {
+			delete(s.accessTickets, hash)
+			revokedHash = hash
+			revokedTicket = ticket
+			revoked = true
+			break
+		}
+	}
+	if revoked {
+		if err = s.persistAccessTicketsLocked(); err != nil {
+			s.accessTickets[revokedHash] = revokedTicket
+			s.accessTicketMu.Unlock()
+			http.Error(w, "access ticket store write failed", http.StatusInternalServerError)
+			return
+		}
+	}
+	s.accessTicketMu.Unlock()
+	if revoked && s.accessTicketRevoked != nil {
+		s.accessTicketRevoked(input.TicketID)
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func cloneAccessTickets(tickets map[[sha256.Size]byte]accessTicket) map[[sha256.Size]byte]accessTicket {
+	cloned := make(map[[sha256.Size]byte]accessTicket, len(tickets))
+	for hash, ticket := range tickets {
+		cloned[hash] = ticket
+	}
+	return cloned
+}
+
+func (s *Server) rebindManagedAccessTickets(deviceID, instanceID, fingerprint string) error {
+	s.mu.RLock()
+	connected := s.clients[deviceID]
+	s.mu.RUnlock()
+	if connected != nil && connected.InstanceID != instanceID {
+		return nil
+	}
+	if connected != nil {
+		return nil
+	}
+	now := s.accessTicketCurrentTime()
+	s.enrollmentMu.Lock()
+	defer s.enrollmentMu.Unlock()
+	device, managed := s.managedDevices[deviceID]
+	if !managed || !device.RevokedAt.IsZero() {
+		return nil
+	}
+	s.accessTicketMu.Lock()
+	defer s.accessTicketMu.Unlock()
+	original := cloneAccessTickets(s.accessTickets)
+	changed := false
+	for hash, ticket := range s.accessTickets {
+		if ticket.DeviceID != deviceID ||
+			!accessTicketCredentialVersionMatches(ticket.DeviceCredentialVersion, device.CredentialVersion) ||
+			!ticket.ExpiresAt.After(now) ||
+			!constantTimeEqual(ticket.PasswordFingerprint, fingerprint) || ticket.InstanceID == instanceID {
+			continue
+		}
+		ticket.InstanceID = instanceID
+		s.accessTickets[hash] = ticket
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.persistAccessTicketsLocked(); err != nil {
+		s.accessTickets = original
+		return err
+	}
+	return nil
+}
+
+func accessTicketCredentialVersionMatches(ticketVersion, deviceVersion uint64) bool {
+	if deviceVersion == 0 {
+		return false
+	}
+	return ticketVersion == deviceVersion || (ticketVersion == 0 && deviceVersion == 1)
+}
+
+func (s *Server) invalidateAccessTicketConnectionsForDevice(deviceID string) {
+	if s.accessTicketRevoked == nil {
+		return
+	}
+	s.accessTicketMu.Lock()
+	ticketIDs := make([]string, 0)
+	for _, ticket := range s.accessTickets {
+		if ticket.DeviceID == deviceID && ticket.ID != "" {
+			ticketIDs = append(ticketIDs, ticket.ID)
+		}
+	}
+	s.accessTicketMu.Unlock()
+	for _, ticketID := range ticketIDs {
+		s.accessTicketRevoked(ticketID)
+	}
 }
 
 func newAccessTicketValue() (string, string, error) {

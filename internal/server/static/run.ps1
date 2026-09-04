@@ -250,6 +250,33 @@ function Get-RDevSHA256([string]$Path) {
     }
 }
 
+function Test-RDevManagedEnrollmentSupport([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $HelpBase = Join-Path $env:TEMP ("rdev-managed-help-" + [Guid]::NewGuid().ToString('N'))
+    $StdoutPath = "$HelpBase.stdout"
+    $StderrPath = "$HelpBase.stderr"
+    $Process = $null
+    try {
+        $Process = Start-Process -FilePath $Path -ArgumentList @('--help') -PassThru -WindowStyle Hidden -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath
+        if (-not $Process.WaitForExit(5000)) {
+            try { $Process.Kill() } catch {}
+            return $false
+        }
+        $Process.WaitForExit()
+        if ($Process.ExitCode -ne 0) { return $false }
+        $Help = ''
+        if (Test-Path -LiteralPath $StdoutPath -PathType Leaf) { $Help += [IO.File]::ReadAllText($StdoutPath) }
+        if (Test-Path -LiteralPath $StderrPath -PathType Leaf) { $Help += "`n" + [IO.File]::ReadAllText($StderrPath) }
+        return $Help.Contains('--enroll-stdin') -and $Help.Contains('--identity-file') -and $Help.Contains('--replace-existing')
+    } catch {
+        return $false
+    } finally {
+        if ($Process) { $Process.Dispose() }
+        Remove-Item -LiteralPath $StdoutPath -Force -EA SilentlyContinue
+        Remove-Item -LiteralPath $StderrPath -Force -EA SilentlyContinue
+    }
+}
+
 function Install-WinPTYIfRequired([string]$Arch, [string]$Mirror) {
     if (-not (Requires-WinPTY)) { return '' }
     $Dll = Join-Path $script:WinPTYDir 'winpty.dll'
@@ -363,15 +390,15 @@ function global:RDev {
         [string]$IdentityFile = ''
     )
 
-    # Join links provide the code through a process-local environment variable,
-    # keeping it out of the client process argument list. Consume it once.
-    $EnrollmentCode = $env:RDEV_ENROLLMENT_CODE
-    $env:RDEV_ENROLLMENT_CODE = $null
+    # The process-local enrollment code is read only after the downloaded
+    # client has passed the managed-enrollment capability check.
+    $EnrollmentCode = $null
 
     if ($Server -is [Array]) { $Server = ($Server -join ',') }
     $Server = [string]$Server
     $Server = $Server.Trim()
     if (-not $Server) { Write-Error "Server is required"; return }
+    $ManagedEnrollment = [bool]($Enroll -or $Persist)
 
     $Elevate = $false
     if (-not $Enroll -and -not $Persist -and -not (Test-RDevAdministrator)) {
@@ -465,7 +492,11 @@ function global:RDev {
     }
     $CacheDir = Join-Path $CacheBase $CacheKey
     $CacheRunPath = Join-Path $CacheDir $CacheRunName
-    if (Test-RDevCache $CacheRunPath $CacheDir) {
+    $CacheReady = Test-RDevCache $CacheRunPath $CacheDir
+    if ($CacheReady -and $ManagedEnrollment -and -not (Test-RDevManagedEnrollmentSupport $CacheRunPath)) {
+        $CacheReady = $false
+    }
+    if ($CacheReady) {
         $RunPath = $CacheRunPath
         Write-Host "  Using cached $ClientName ($ResolvedTag, windows/$Arch)." -ForegroundColor Green
     } else {
@@ -550,6 +581,16 @@ function global:RDev {
     if ($Published) { $RunPath = $Published }
     }
 
+    if ($ManagedEnrollment) {
+        if ($Client -ne 'go') { Write-Error 'Managed enrollment requires the compatible Go client.'; return }
+        if (-not (Test-RDevManagedEnrollmentSupport $RunPath)) {
+            Write-Error 'Downloaded client does not support managed enrollment.'
+            return
+        }
+        $EnrollmentCode = $env:RDEV_ENROLLMENT_CODE
+        $env:RDEV_ENROLLMENT_CODE = $null
+    }
+
     $WinPTYDir = Install-WinPTYIfRequired $Arch $Mirror
 
     # ── Run ──────────────────────────────────────────────────
@@ -581,7 +622,7 @@ function global:RDev {
         if (-not $EnrollmentCode) { $EnrollmentCode = Read-Host '  One-time enrollment code' }
         $EnrollArgs = @('-s', $Server)
         if ($Id) { $EnrollArgs += @('-i', $Id) }
-        $EnrollArgs += @('--enroll-stdin', '--enroll-only', '--identity-file', $IdentityFile)
+        $EnrollArgs += @('--enroll-stdin', '--enroll-only', '--replace-existing', '--identity-file', $IdentityFile)
         $EnrollmentCode | & $InstalledPath @EnrollArgs
         $EnrollExitCode = $LASTEXITCODE
         $EnrollmentCode = $null

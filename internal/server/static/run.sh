@@ -24,6 +24,7 @@ RDEV_IDENTITY_FILE=""
 RDEV_ENROLLMENT_CODE="${RDEV_ENROLLMENT_CODE:-}"
 RDEV_REPO="icepie/rdev"
 LOCAL_CLIENT_REVISION="feidu-20260903-scp3"
+LOCAL_MANAGED_CLIENT_REVISION="feidu-20260904-managed1"
 LOCAL_WINDOWS_AMD64_ASSET="rdev-client-windows-amd64.exe"
 LOCAL_WINDOWS_AMD64_SHA256="5bd964ac75331262ac01e21b79ee3af7322b8e34894d46f281f1a8f0667987bd"
 
@@ -116,7 +117,10 @@ wait_elevation_key() {
         rm -f "$key_file" 2>/dev/null
         return 1
     fi
+    # POSIX sh has no timed read; probe the active shell before using its -t extension.
+    # shellcheck disable=SC3045
     if (IFS= read -r -t 0 _ </dev/tty) 2>/dev/null; then
+        # shellcheck disable=SC3045
         if IFS= read -r -t 3 _ </dev/tty; then
             printf '\n' >/dev/tty
             return 0
@@ -236,6 +240,16 @@ local_release_url() {
     echo "$base/local-release?asset=$1"
 }
 
+client_supports_managed_enrollment() {
+    managed_client_path="$1"
+    [ -s "$managed_client_path" ] || return 1
+    chmod +x "$managed_client_path" 2>/dev/null || true
+    help_output="$($managed_client_path --help 2>&1 || true)"
+    printf '%s\n' "$help_output" | grep -F -- '--enroll-stdin' >/dev/null 2>&1 &&
+        printf '%s\n' "$help_output" | grep -F -- '--identity-file' >/dev/null 2>&1 &&
+        printf '%s\n' "$help_output" | grep -F -- '--replace-existing' >/dev/null 2>&1
+}
+
 sha256_file() {
     file="$1"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -298,7 +312,9 @@ cache_lock_acquire() {
 }
 
 cache_lock_release() {
-    [ -n "${CACHE_LOCK_DIR:-}" ] && rmdir "$CACHE_LOCK_DIR" 2>/dev/null || true
+    if [ -n "${CACHE_LOCK_DIR:-}" ]; then
+        rmdir "$CACHE_LOCK_DIR" 2>/dev/null || true
+    fi
     CACHE_LOCK_DIR=""
 }
 
@@ -329,7 +345,18 @@ download_with_fallback() {
     asset="$3"
     [ -n "$asset" ] || asset="${url##*/}"
     ok=0
-    if [ "$asset" = "$LOCAL_WINDOWS_AMD64_ASSET" ]; then
+    if [ "$RDEV_CLIENT" = "go" ] && [ "$RDEV_ENROLL" = "1" ] && [ "$OS" = "linux" ]; then
+        local_url="$(local_release_url "$asset" 2>/dev/null || true)"
+        if [ -n "$local_url" ]; then
+            echo "  Trying managed RDev client..." >&2
+            if dl "$local_url" "$out" && client_supports_managed_enrollment "$out"; then
+                ok=1
+                echo "  ok via managed RDev client" >&2
+            fi
+            [ "$ok" = "1" ] || rm -f "$out" 2>/dev/null
+        fi
+    fi
+    if [ "$ok" = "0" ] && [ "$asset" = "$LOCAL_WINDOWS_AMD64_ASSET" ]; then
         local_url="$(local_release_url "$asset" 2>/dev/null || true)"
         if [ -n "$local_url" ]; then
             echo "  Trying verified RDev client..." >&2
@@ -373,6 +400,11 @@ download_with_fallback() {
             if dl "$proxy_url" "$out" && [ -s "$out" ]; then ok=1; echo "  ok via RDev server proxy" >&2; fi
             [ "$ok" = "1" ] || rm -f "$out" 2>/dev/null
         fi
+    fi
+    if [ "$ok" = "1" ] && [ "$RDEV_CLIENT" = "go" ] && [ "$RDEV_ENROLL" = "1" ] && ! client_supports_managed_enrollment "$out"; then
+        echo "  Downloaded client does not support managed enrollment." >&2
+        rm -f "$out" 2>/dev/null
+        ok=0
     fi
     [ "$ok" = "1" ]
 }
@@ -538,9 +570,10 @@ else
     GH_URL="$(release_url "$BINARY")"
     CACHE_KEY="go-${SAFE_TAG}-${OS}-${ASSET_ARCH}-$(safe_name "$BINARY")"
     [ "$BINARY" = "$LOCAL_WINDOWS_AMD64_ASSET" ] && CACHE_KEY="${CACHE_KEY}-${LOCAL_CLIENT_REVISION}"
+    [ "$RDEV_ENROLL" = "1" ] && CACHE_KEY="${CACHE_KEY}-${LOCAL_MANAGED_CLIENT_REVISION}"
     CACHE_DIR="$CACHE_BASE/$CACHE_KEY"
     CACHE_BIN="$CACHE_DIR/$BINARY"
-    if cache_complete "$CACHE_BIN" "$CACHE_DIR"; then
+    if cache_complete "$CACHE_BIN" "$CACHE_DIR" && { [ "$RDEV_ENROLL" != "1" ] || client_supports_managed_enrollment "$CACHE_BIN"; }; then
         RUN_BIN="$CACHE_BIN"
         echo "  Using cached rdev-client (${RESOLVED_TAG}, ${OS}/${ARCH})." >&2
     else
@@ -609,9 +642,13 @@ read_enrollment_code() {
     [ -r /dev/tty ] || { echo "Error: enrollment requires an interactive terminal" >&2; return 1; }
     printf '%s' "  One-time enrollment code: " >/dev/tty
     old_stty="$(stty -g </dev/tty 2>/dev/null || true)"
-    [ -n "$old_stty" ] && stty -echo </dev/tty 2>/dev/null || true
+    if [ -n "$old_stty" ]; then
+        stty -echo </dev/tty 2>/dev/null || true
+    fi
     IFS= read -r ENROLLMENT_CODE </dev/tty
-    [ -n "$old_stty" ] && stty "$old_stty" </dev/tty 2>/dev/null || true
+    if [ -n "$old_stty" ]; then
+        stty "$old_stty" </dev/tty 2>/dev/null || true
+    fi
     printf '\n' >/dev/tty
     [ -n "$ENROLLMENT_CODE" ] || { echo "Error: enrollment code is empty" >&2; return 1; }
 }
@@ -644,7 +681,7 @@ if [ "$RDEV_PERSIST" = "1" ]; then
     run_as_root install -m 0755 "$RUN_BIN" "$INSTALLED_BIN"
     set -- -s "$RDEV_SERVER"
     [ -n "$RDEV_ID" ] && set -- "$@" -i "$RDEV_ID"
-    set -- "$@" --enroll-stdin --enroll-only --identity-file "$IDENTITY_PATH"
+    set -- "$@" --enroll-stdin --enroll-only --replace-existing --identity-file "$IDENTITY_PATH"
     printf '%s\n' "$ENROLLMENT_CODE" | run_as_root "$INSTALLED_BIN" "$@"
     ENROLLMENT_CODE=""
     umask 077

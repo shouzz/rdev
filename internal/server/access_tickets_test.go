@@ -2,10 +2,14 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -94,6 +98,30 @@ func TestBrowserSocketAuthAcceptsOnlyScopedFeiduTicket(t *testing.T) {
 	}
 }
 
+func TestBrowserAccessTicketRejectsChangedOrRevokedManagedDeviceCredential(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.clients["device-a"] = &ClientConn{ID: "device-a", InstanceID: "one", Password: "secret"}
+	ticket := issueAccessTicketWithSubject(t, s, "device-a", "feidu-browser:42", 60)
+	if !s.browserAccessTicketValid(ticket, "device-a") {
+		t.Fatal("fresh browser access ticket was rejected")
+	}
+
+	device := s.managedDevices["device-a"]
+	device.CredentialVersion++
+	s.managedDevices["device-a"] = device
+	if s.browserAccessTicketValid(ticket, "device-a") {
+		t.Fatal("browser access ticket survived a device credential version change")
+	}
+
+	device.CredentialVersion--
+	device.RevokedAt = time.Now()
+	s.managedDevices["device-a"] = device
+	if s.browserAccessTicketValid(ticket, "device-a") {
+		t.Fatal("browser access ticket remained valid for a revoked managed device")
+	}
+}
+
 func TestBrowserWebSocketHandlersNegotiateProtocol(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -150,7 +178,7 @@ func TestManagedDeviceAccessTicketRequiresExactOwnerSubject(t *testing.T) {
 	s := NewServer()
 	s.ControlToken = "control-secret"
 	s.managedDevices["managed-device"] = managedDevice{
-		ID: "managed-device", OwnerSubject: "feidu-user:42", SecretHash: "$2a$10$abcdefghijklmnopqrstuv012345678901234567890123456789012",
+		ID: "managed-device", OwnerSubject: "feidu-user:42", SecretHash: "$2a$10$abcdefghijklmnopqrstuv012345678901234567890123456789012", CredentialVersion: 1,
 	}
 	s.clients["managed-device"] = &ClientConn{ID: "managed-device", InstanceID: "online"}
 	body := []byte(`{"deviceId":"managed-device","subject":"feidu-user:7","expiresInSeconds":600}`)
@@ -160,6 +188,55 @@ func TestManagedDeviceAccessTicketRequiresExactOwnerSubject(t *testing.T) {
 	s.HandleAccessTicketsAPI(response, request)
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", response.Code)
+	}
+}
+
+func TestUnmanagedDeviceAccessTicketIsRejected(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.clients["legacy-device"] = &ClientConn{ID: "legacy-device", InstanceID: "online"}
+	body := []byte(`{"deviceId":"legacy-device","subject":"feidu-user:42","expiresInSeconds":600}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/control/access-tickets", bytes.NewReader(body))
+	request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	response := httptest.NewRecorder()
+
+	s.HandleAccessTicketsAPI(response, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusForbidden)
+	}
+}
+
+func TestManagedDeviceBrowserTicketMapsToExactAccountOwner(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.managedDevices["managed-device"] = managedDevice{
+		ID: "managed-device", OwnerSubject: "feidu-user:42", SecretHash: "$2a$10$abcdefghijklmnopqrstuv012345678901234567890123456789012", CredentialVersion: 1,
+	}
+	s.clients["managed-device"] = &ClientConn{ID: "managed-device", InstanceID: "online"}
+
+	for _, test := range []struct {
+		subject string
+		want    int
+	}{
+		{subject: "feidu-user:42", want: http.StatusOK},
+		{subject: "feidu-browser:42", want: http.StatusOK},
+		{subject: "feidu-browser:7", want: http.StatusForbidden},
+		{subject: "feidu-agent-handoff:42", want: http.StatusForbidden},
+	} {
+		body, err := json.Marshal(accessTicketCreateRequest{
+			DeviceID: "managed-device", Subject: test.subject, ExpiresInSecond: 600,
+		})
+		if err != nil {
+			t.Fatalf("encode request: %v", err)
+		}
+		request := httptest.NewRequest(http.MethodPost, "/api/control/access-tickets", bytes.NewReader(body))
+		request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+		response := httptest.NewRecorder()
+		s.HandleAccessTicketsAPI(response, request)
+		if response.Code != test.want {
+			t.Fatalf("subject %q status = %d, want %d", test.subject, response.Code, test.want)
+		}
 	}
 }
 
@@ -219,6 +296,7 @@ func TestAccessTicketResponseUsesOneExactSecondPrecision(t *testing.T) {
 	s.ControlToken = "control-secret"
 	s.accessTicketNow = func() time.Time { return now }
 	s.clients["device"] = &ClientConn{ID: "device", InstanceID: "one"}
+	s.managedDevices["device"] = managedDevice{ID: "device", OwnerSubject: "feidu-user:42", CredentialVersion: 1}
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/api/control/access-tickets",
@@ -242,6 +320,491 @@ func TestAccessTicketResponseUsesOneExactSecondPrecision(t *testing.T) {
 	}
 	if access.ExpiresAtMs != wantExpiresAt.UnixMilli() {
 		t.Fatalf("expiresAtMs = %d, want %d", access.ExpiresAtMs, wantExpiresAt.UnixMilli())
+	}
+}
+
+func TestAccessTicketCanBeRevokedByControlAPI(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	client := &ClientConn{ID: "device", InstanceID: "one", Password: "device-secret"}
+	s.clients[client.ID] = client
+	s.managedDevices[client.ID] = managedDevice{ID: client.ID, OwnerSubject: "feidu-user:42", CredentialVersion: 1}
+
+	create := httptest.NewRequest(
+		http.MethodPost,
+		"/api/control/access-tickets",
+		strings.NewReader("{\"deviceId\":\"device\",\"subject\":\"feidu-browser:42\",\"expiresInSeconds\":600}"),
+	)
+	create.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	created := httptest.NewRecorder()
+	s.HandleAccessTicketsAPI(created, create)
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status = %d, want %d", created.Code, http.StatusOK)
+	}
+	var access accessTicketCreateResponse
+	if err := json.Unmarshal(created.Body.Bytes(), &access); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if !s.authorizeDeviceCredential(client, access.Ticket) {
+		t.Fatal("fresh ticket was rejected")
+	}
+
+	body, err := json.Marshal(accessTicketRevokeRequest{TicketID: access.TicketID})
+	if err != nil {
+		t.Fatalf("encode revoke request: %v", err)
+	}
+	revoke := httptest.NewRequest(http.MethodDelete, "/api/control/access-tickets", bytes.NewReader(body))
+	revoke.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	revoked := httptest.NewRecorder()
+	s.HandleAccessTicketsAPI(revoked, revoke)
+	if revoked.Code != http.StatusNoContent {
+		t.Fatalf("revoke status = %d, want %d", revoked.Code, http.StatusNoContent)
+	}
+	if s.authorizeDeviceCredential(client, access.Ticket) {
+		t.Fatal("revoked ticket remained valid")
+	}
+
+	missing := httptest.NewRecorder()
+	s.HandleAccessTicketsAPI(missing, httptest.NewRequest(http.MethodDelete, "/api/control/access-tickets", bytes.NewReader(body)))
+	if missing.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated revoke status = %d, want %d", missing.Code, http.StatusUnauthorized)
+	}
+
+	repeated := httptest.NewRequest(http.MethodDelete, "/api/control/access-tickets", bytes.NewReader(body))
+	repeated.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	repeatedResponse := httptest.NewRecorder()
+	s.HandleAccessTicketsAPI(repeatedResponse, repeated)
+	if repeatedResponse.Code != http.StatusNoContent {
+		t.Fatalf("repeated revoke status = %d, want %d", repeatedResponse.Code, http.StatusNoContent)
+	}
+}
+
+func TestAccessTicketCanBeRenewedWithoutChangingCredential(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.accessTicketNow = func() time.Time { return now }
+	client := &ClientConn{ID: "device", InstanceID: "one", Password: "device-secret"}
+	s.clients[client.ID] = client
+	s.managedDevices[client.ID] = managedDevice{ID: client.ID, OwnerSubject: "feidu-user:42", CredentialVersion: 1}
+
+	ticket := issueAccessTicket(t, s, client.ID, 60)
+	var ticketID string
+	s.accessTicketMu.Lock()
+	for _, stored := range s.accessTickets {
+		ticketID = stored.ID
+	}
+	s.accessTicketMu.Unlock()
+	if ticketID == "" {
+		t.Fatal("issued ticket id was not stored")
+	}
+
+	now = now.Add(30 * time.Second)
+	wantExpiry := now.Add(10 * time.Minute)
+	body, err := json.Marshal(accessTicketRenewRequest{TicketID: ticketID, ExpiresAtMs: wantExpiry.UnixMilli()})
+	if err != nil {
+		t.Fatalf("encode renew request: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPatch, "/api/control/access-tickets", bytes.NewReader(body))
+	request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	response := httptest.NewRecorder()
+	s.HandleAccessTicketsAPI(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("renew status = %d, want %d", response.Code, http.StatusOK)
+	}
+	var renewed accessTicketRenewResponse
+	if err = json.Unmarshal(response.Body.Bytes(), &renewed); err != nil {
+		t.Fatalf("decode renew response: %v", err)
+	}
+	if renewed.TicketID != ticketID || renewed.DeviceID != client.ID || renewed.ExpiresAtMs != wantExpiry.UnixMilli() {
+		t.Fatalf("renew response = %#v", renewed)
+	}
+	shorterExpiry := wantExpiry.Add(-time.Minute)
+	shorterBody, err := json.Marshal(accessTicketRenewRequest{TicketID: ticketID, ExpiresAtMs: shorterExpiry.UnixMilli()})
+	if err != nil {
+		t.Fatalf("encode shorter renew request: %v", err)
+	}
+	shorterRequest := httptest.NewRequest(http.MethodPatch, "/api/control/access-tickets", bytes.NewReader(shorterBody))
+	shorterRequest.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	shorterResponse := httptest.NewRecorder()
+	s.HandleAccessTicketsAPI(shorterResponse, shorterRequest)
+	if shorterResponse.Code != http.StatusOK {
+		t.Fatalf("shorter renew status = %d, want %d", shorterResponse.Code, http.StatusOK)
+	}
+	var notShortened accessTicketRenewResponse
+	if err = json.Unmarshal(shorterResponse.Body.Bytes(), &notShortened); err != nil {
+		t.Fatalf("decode shorter renew response: %v", err)
+	}
+	if notShortened.ExpiresAtMs != wantExpiry.UnixMilli() {
+		t.Fatalf("shorter renew changed expiry to %d, want %d", notShortened.ExpiresAtMs, wantExpiry.UnixMilli())
+	}
+	now = now.Add(31 * time.Second)
+	if !s.authorizeDeviceCredential(client, ticket) {
+		t.Fatal("renewed ticket credential was not valid after its original expiry")
+	}
+}
+
+func TestAccessTicketSurvivesServerRestartRenewalAndRevocation(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	storePath := t.TempDir() + string(os.PathSeparator) + "access_tickets.json"
+	original := NewServer()
+	original.ControlToken = "control-secret"
+	original.accessTicketNow = func() time.Time { return now }
+	if err := original.ConfigureAccessTicketStore(storePath); err != nil {
+		t.Fatalf("configure original store: %v", err)
+	}
+	client := &ClientConn{ID: "device", InstanceID: "instance-one", Password: "device-secret"}
+	original.clients[client.ID] = client
+	original.managedDevices[client.ID] = managedDevice{ID: client.ID, OwnerSubject: "feidu-user:42", CredentialVersion: 1}
+	ticketValue := issueAccessTicketWithSubject(t, original, client.ID, "feidu-user:42", 600)
+	storedBytes, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatalf("read access ticket store: %v", err)
+	}
+	if bytes.Contains(storedBytes, []byte(ticketValue)) {
+		t.Fatal("access ticket store contains the plaintext ticket credential")
+	}
+	var ticketID string
+	for _, ticket := range original.accessTickets {
+		ticketID = ticket.ID
+	}
+
+	restarted := NewServer()
+	restarted.ControlToken = original.ControlToken
+	restarted.accessTicketNow = func() time.Time { return now }
+	if err := restarted.ConfigureAccessTicketStore(storePath); err != nil {
+		t.Fatalf("configure restarted store: %v", err)
+	}
+	restarted.managedDevices[client.ID] = managedDevice{ID: client.ID, OwnerSubject: "feidu-user:42", CredentialVersion: 1}
+	restarted.clients[client.ID] = &ClientConn{ID: client.ID, InstanceID: client.InstanceID, Password: client.Password}
+	if !restarted.authorizeDeviceCredential(restarted.clients[client.ID], ticketValue) {
+		t.Fatal("restarted server rejected the original ticket credential")
+	}
+
+	expiresAt := now.Add(time.Hour)
+	renewBody, err := json.Marshal(accessTicketRenewRequest{TicketID: ticketID, ExpiresAtMs: expiresAt.UnixMilli()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewRequest := httptest.NewRequest(http.MethodPatch, "/api/control/access-tickets", bytes.NewReader(renewBody))
+	renewRequest.Header.Set("X-RDev-Control-Token", restarted.ControlToken)
+	renewResponse := httptest.NewRecorder()
+	restarted.HandleAccessTicketsAPI(renewResponse, renewRequest)
+	if renewResponse.Code != http.StatusOK {
+		t.Fatalf("renew after restart status = %d, body = %q", renewResponse.Code, renewResponse.Body.String())
+	}
+	now = now.Add(11 * time.Minute)
+	afterRenewRestart := NewServer()
+	afterRenewRestart.ControlToken = original.ControlToken
+	afterRenewRestart.accessTicketNow = func() time.Time { return now }
+	if err = afterRenewRestart.ConfigureAccessTicketStore(storePath); err != nil {
+		t.Fatalf("configure post-renew restart store: %v", err)
+	}
+	afterRenewRestart.managedDevices[client.ID] = managedDevice{ID: client.ID, OwnerSubject: "feidu-user:42", CredentialVersion: 1}
+	afterRenewRestart.clients[client.ID] = &ClientConn{ID: client.ID, InstanceID: client.InstanceID, Password: client.Password}
+	if !afterRenewRestart.authorizeDeviceCredential(afterRenewRestart.clients[client.ID], ticketValue) {
+		t.Fatal("persisted renewal did not keep the original ticket valid beyond its first expiry")
+	}
+
+	revokeBody, err := json.Marshal(accessTicketRevokeRequest{TicketID: ticketID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokeRequest := httptest.NewRequest(http.MethodDelete, "/api/control/access-tickets", bytes.NewReader(revokeBody))
+	revokeRequest.Header.Set("X-RDev-Control-Token", afterRenewRestart.ControlToken)
+	revokeResponse := httptest.NewRecorder()
+	afterRenewRestart.HandleAccessTicketsAPI(revokeResponse, revokeRequest)
+	if revokeResponse.Code != http.StatusNoContent {
+		t.Fatalf("revoke after restart status = %d, body = %q", revokeResponse.Code, revokeResponse.Body.String())
+	}
+
+	verified := NewServer()
+	verified.accessTicketNow = func() time.Time { return now }
+	if err = verified.ConfigureAccessTicketStore(storePath); err != nil {
+		t.Fatalf("configure verification store: %v", err)
+	}
+	verified.managedDevices[client.ID] = managedDevice{ID: client.ID, OwnerSubject: "feidu-user:42", CredentialVersion: 1}
+	verified.clients[client.ID] = &ClientConn{ID: client.ID, InstanceID: client.InstanceID, Password: client.Password}
+	if verified.authorizeDeviceCredential(verified.clients[client.ID], ticketValue) {
+		t.Fatal("revoked ticket returned after another server restart")
+	}
+}
+
+func TestAccessTicketRegistryV1IsCompatibleOnlyWithInitialDeviceCredentialVersion(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 15, 0, 0, time.UTC)
+	storePath := t.TempDir() + string(os.PathSeparator) + "access_tickets.json"
+	ticketValue := "rdvat_legacy-registry-ticket"
+	ticketHash := sha256.Sum256([]byte(ticketValue))
+	client := &ClientConn{ID: "legacy-ticket-device", InstanceID: "legacy-instance", Password: "legacy-password"}
+	legacy := accessTicketRegistry{
+		Schema: accessTicketRegistryV1,
+		Tickets: []accessTicketRegistryRecord{{
+			TicketHash: fmt.Sprintf("%x", ticketHash[:]), ID: "11111111111111111111111111111111",
+			DeviceID: client.ID, InstanceID: client.InstanceID, PasswordFingerprint: passwordFingerprint(client.Password),
+			Subject: "feidu-user:42", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339),
+		}},
+	}
+	data, err := json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	if err = os.WriteFile(storePath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewServer()
+	s.accessTicketNow = func() time.Time { return now }
+	s.managedDevices[client.ID] = managedDevice{ID: client.ID, OwnerSubject: "feidu-user:42", CredentialVersion: 1}
+	if err = s.ConfigureAccessTicketStore(storePath); err != nil {
+		t.Fatal(err)
+	}
+	if !s.accessTicketValid(client, ticketValue) {
+		t.Fatal("initial device credential version rejected a legacy ticket")
+	}
+	device := s.managedDevices[client.ID]
+	device.CredentialVersion = 2
+	s.managedDevices[client.ID] = device
+	if s.accessTicketValid(client, ticketValue) {
+		t.Fatal("new device credential version accepted a legacy ticket")
+	}
+}
+
+func TestManagedReconnectRebindsTicketOnlyWhenPreviousInstanceIsOffline(t *testing.T) {
+	s := NewServer()
+	client := &ClientConn{ID: "device", InstanceID: "instance-one", Password: "device-secret"}
+	s.clients[client.ID] = client
+	ticketValue := issueAccessTicket(t, s, client.ID, 600)
+
+	if err := s.rebindManagedAccessTickets(client.ID, "instance-two", passwordFingerprint(client.Password)); err != nil {
+		t.Fatalf("rebind while connected: %v", err)
+	}
+	replacement := &ClientConn{ID: client.ID, InstanceID: "instance-two", Password: client.Password}
+	if s.authorizeDeviceCredential(replacement, ticketValue) {
+		t.Fatal("ticket moved while its original instance was still connected")
+	}
+
+	delete(s.clients, client.ID)
+	if err := s.rebindManagedAccessTickets(client.ID, replacement.InstanceID, passwordFingerprint(replacement.Password)); err != nil {
+		t.Fatalf("rebind after disconnect: %v", err)
+	}
+	if !s.authorizeDeviceCredential(replacement, ticketValue) {
+		t.Fatal("ticket did not follow an authenticated managed-device reconnect")
+	}
+}
+
+func TestAccessTicketRenewRejectsMissingTicket(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	expiresAt := time.Now().UTC().Truncate(time.Second).Add(10 * time.Minute)
+	body, err := json.Marshal(accessTicketRenewRequest{TicketID: strings.Repeat("0", 32), ExpiresAtMs: expiresAt.UnixMilli()})
+	if err != nil {
+		t.Fatalf("encode renew request: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPatch, "/api/control/access-tickets", bytes.NewReader(body))
+	request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	response := httptest.NewRecorder()
+	s.HandleAccessTicketsAPI(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("renew missing status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+}
+
+func TestAccessTicketRenewRejectsInvalidRequests(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.accessTicketNow = func() time.Time { return now }
+	s.clients["device"] = &ClientConn{ID: "device", InstanceID: "one"}
+	issueAccessTicket(t, s, "device", 600)
+	var ticketID string
+	s.accessTicketMu.Lock()
+	for _, stored := range s.accessTickets {
+		ticketID = stored.ID
+	}
+	s.accessTicketMu.Unlock()
+	validExpiry := now.Add(10 * time.Minute).UnixMilli()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "unknown field", body: fmt.Sprintf(`{"ticketId":%q,"expiresAtMs":%d,"extra":true}`, ticketID, validExpiry)},
+		{name: "trailing JSON", body: fmt.Sprintf(`{"ticketId":%q,"expiresAtMs":%d}{}`, ticketID, validExpiry)},
+		{name: "uppercase ticket id", body: fmt.Sprintf(`{"ticketId":%q,"expiresAtMs":%d}`, strings.Repeat("A", 32), validExpiry)},
+		{name: "non-second expiry", body: fmt.Sprintf(`{"ticketId":%q,"expiresAtMs":%d}`, ticketID, now.Add(10*time.Minute+time.Millisecond).UnixMilli())},
+		{name: "short lifetime", body: fmt.Sprintf(`{"ticketId":%q,"expiresAtMs":%d}`, ticketID, now.Add(59*time.Second).UnixMilli())},
+		{name: "long lifetime", body: fmt.Sprintf(`{"ticketId":%q,"expiresAtMs":%d}`, ticketID, now.Add(8*time.Hour+time.Second).UnixMilli())},
+		{name: "past expiry", body: fmt.Sprintf(`{"ticketId":%q,"expiresAtMs":%d}`, ticketID, now.Add(-time.Second).UnixMilli())},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPatch, "/api/control/access-tickets", strings.NewReader(test.body))
+			request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+			response := httptest.NewRecorder()
+			s.HandleAccessTicketsAPI(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+			}
+		})
+	}
+}
+
+func TestAccessTicketRenewAndRevokeRaceEndsRevoked(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.accessTicketNow = func() time.Time { return now }
+	client := &ClientConn{ID: "device", InstanceID: "one"}
+	s.clients[client.ID] = client
+	ticketValue := issueAccessTicket(t, s, client.ID, 600)
+	var ticketID string
+	s.accessTicketMu.Lock()
+	for _, stored := range s.accessTickets {
+		ticketID = stored.ID
+	}
+	s.accessTicketMu.Unlock()
+	renewBody, err := json.Marshal(accessTicketRenewRequest{TicketID: ticketID, ExpiresAtMs: now.Add(time.Hour).UnixMilli()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokeBody, err := json.Marshal(accessTicketRevokeRequest{TicketID: ticketID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	statuses := make(chan int, 2)
+	var workers sync.WaitGroup
+	for _, operation := range []struct {
+		method string
+		body   []byte
+	}{
+		{method: http.MethodPatch, body: renewBody},
+		{method: http.MethodDelete, body: revokeBody},
+	} {
+		workers.Add(1)
+		go func(operation struct {
+			method string
+			body   []byte
+		}) {
+			defer workers.Done()
+			<-start
+			request := httptest.NewRequest(operation.method, "/api/control/access-tickets", bytes.NewReader(operation.body))
+			request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+			response := httptest.NewRecorder()
+			s.HandleAccessTicketsAPI(response, request)
+			statuses <- response.Code
+		}(operation)
+	}
+	close(start)
+	workers.Wait()
+	close(statuses)
+	seenRevoke := false
+	for status := range statuses {
+		if status == http.StatusNoContent {
+			seenRevoke = true
+			continue
+		}
+		if status != http.StatusOK && status != http.StatusNotFound {
+			t.Fatalf("unexpected concurrent status %d", status)
+		}
+	}
+	if !seenRevoke || s.authorizeDeviceCredential(client, ticketValue) {
+		t.Fatal("concurrent revoke did not leave the ticket revoked")
+	}
+}
+
+func TestAccessTicketRenewRejectsExpiredAndRevokedTickets(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		revoke bool
+	}{
+		{name: "expired"},
+		{name: "revoked", revoke: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+			s := NewServer()
+			s.ControlToken = "control-secret"
+			s.accessTicketNow = func() time.Time { return now }
+			s.clients["device"] = &ClientConn{ID: "device", InstanceID: "one"}
+			issueAccessTicket(t, s, "device", 60)
+			var ticketID string
+			s.accessTicketMu.Lock()
+			for _, stored := range s.accessTickets {
+				ticketID = stored.ID
+			}
+			s.accessTicketMu.Unlock()
+			if test.revoke {
+				body, err := json.Marshal(accessTicketRevokeRequest{TicketID: ticketID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				request := httptest.NewRequest(http.MethodDelete, "/api/control/access-tickets", bytes.NewReader(body))
+				request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+				response := httptest.NewRecorder()
+				s.HandleAccessTicketsAPI(response, request)
+				if response.Code != http.StatusNoContent {
+					t.Fatalf("revoke status = %d", response.Code)
+				}
+			} else {
+				now = now.Add(61 * time.Second)
+			}
+			body, err := json.Marshal(accessTicketRenewRequest{TicketID: ticketID, ExpiresAtMs: now.Add(10 * time.Minute).UnixMilli()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPatch, "/api/control/access-tickets", bytes.NewReader(body))
+			request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+			response := httptest.NewRecorder()
+			s.HandleAccessTicketsAPI(response, request)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("renew status = %d, want %d", response.Code, http.StatusNotFound)
+			}
+		})
+	}
+}
+
+func TestAccessTicketRevokeHookRunsOnlyForExistingTicket(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	client := &ClientConn{ID: "device", InstanceID: "one", Password: "device-secret"}
+	s.clients[client.ID] = client
+	s.managedDevices[client.ID] = managedDevice{ID: client.ID, OwnerSubject: "feidu-user:42", CredentialVersion: 1}
+	revokedTicketIDs := make([]string, 0, 1)
+	s.accessTicketRevoked = func(ticketID string) {
+		revokedTicketIDs = append(revokedTicketIDs, ticketID)
+	}
+
+	create := httptest.NewRequest(
+		http.MethodPost,
+		"/api/control/access-tickets",
+		strings.NewReader("{\"deviceId\":\"device\",\"subject\":\"feidu-browser:42\",\"expiresInSeconds\":600}"),
+	)
+	create.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	created := httptest.NewRecorder()
+	s.HandleAccessTicketsAPI(created, create)
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status = %d, want %d", created.Code, http.StatusOK)
+	}
+	var access accessTicketCreateResponse
+	if err := json.Unmarshal(created.Body.Bytes(), &access); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	body, err := json.Marshal(accessTicketRevokeRequest{TicketID: access.TicketID})
+	if err != nil {
+		t.Fatalf("encode revoke request: %v", err)
+	}
+	for range 2 {
+		request := httptest.NewRequest(http.MethodDelete, "/api/control/access-tickets", bytes.NewReader(body))
+		request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+		response := httptest.NewRecorder()
+		s.HandleAccessTicketsAPI(response, request)
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("revoke status = %d, want %d", response.Code, http.StatusNoContent)
+		}
+	}
+	if len(revokedTicketIDs) != 1 || revokedTicketIDs[0] != access.TicketID {
+		t.Fatalf("revoke hook ticket ids = %v, want [%s]", revokedTicketIDs, access.TicketID)
 	}
 }
 
@@ -356,6 +919,13 @@ func issueAccessTicket(t *testing.T, s *Server, deviceID string, lifetimeSeconds
 
 func issueAccessTicketWithSubject(t *testing.T, s *Server, deviceID, subject string, lifetimeSeconds int64) string {
 	t.Helper()
+	device := s.managedDevices[deviceID]
+	device.ID = deviceID
+	device.OwnerSubject = subject
+	if device.CredentialVersion == 0 {
+		device.CredentialVersion = 1
+	}
+	s.managedDevices[deviceID] = device
 	body, err := json.Marshal(accessTicketCreateRequest{
 		DeviceID:        deviceID,
 		Subject:         subject,

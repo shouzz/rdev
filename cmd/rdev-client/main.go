@@ -24,17 +24,18 @@ var version = "dev"
 
 func main() {
 	var (
-		serverURL      string
-		clientID       string
-		password       string
-		identityFile   string
-		enrollStdin    bool
-		enrollOnly     bool
-		shell          string
-		autoUpdate     = true
-		updateInterval = time.Minute
-		reconnectMin   = time.Second
-		reconnectMax   = 30 * time.Second
+		serverURL       string
+		clientID        string
+		password        string
+		identityFile    string
+		enrollStdin     bool
+		enrollOnly      bool
+		replaceExisting bool
+		shell           string
+		autoUpdate      = true
+		updateInterval  = time.Minute
+		reconnectMin    = time.Second
+		reconnectMax    = 30 * time.Second
 	)
 
 	for i := 1; i < len(os.Args); i++ {
@@ -63,6 +64,8 @@ func main() {
 			enrollStdin = true
 		case "--enroll-only":
 			enrollOnly = true
+		case "--replace-existing":
+			replaceExisting = true
 		case "--shell", "-S":
 			if i+1 < len(os.Args) {
 				shell = os.Args[i+1]
@@ -109,6 +112,7 @@ Options:
 	  --identity-file Read or store the protected managed-device identity
 	  --enroll-stdin  Read a one-time enrollment code from standard input
 	  --enroll-only   Store the enrolled identity and exit without connecting
+	  --replace-existing Replace a same-owner managed device with the requested ID
   --shell, -S     Shell to use (default: $SHELL or /bin/sh or cmd.exe)
   --no-auto-update Disable built-in GitHub release auto-update
   --auto-update    Enable/disable auto-update explicitly (true/false)
@@ -140,6 +144,9 @@ Environment variables:
 
 	if serverURL == "" {
 		serverURL = os.Getenv("RDEV_SERVER")
+	}
+	if replaceExisting && !enrollStdin {
+		log.Fatal("--replace-existing requires --enroll-stdin")
 	}
 	if clientID == "" {
 		clientID = os.Getenv("RDEV_ID")
@@ -208,7 +215,7 @@ Environment variables:
 		if err != nil {
 			log.Fatalf("read device enrollment: %v", err)
 		}
-		result, err := redeemEnrollment(serverURL, enrollmentCode, clientID)
+		result, err := redeemEnrollment(serverURL, enrollmentCode, clientID, replaceExisting)
 		if err != nil {
 			log.Fatalf("redeem device enrollment: %v", err)
 		}
@@ -318,12 +325,16 @@ type clientIdentity struct {
 	DeviceSecret string `json:"deviceSecret"`
 }
 
-func redeemEnrollment(serverURL, code, deviceID string) (enrollmentResult, error) {
+func redeemEnrollment(serverURL, code, deviceID string, replaceExisting bool) (enrollmentResult, error) {
 	baseURL, err := enrollmentHTTPBase(serverURL)
 	if err != nil {
 		return enrollmentResult{}, err
 	}
-	body, err := json.Marshal(map[string]string{"code": code, "deviceId": deviceID})
+	body, err := json.Marshal(struct {
+		Code            string `json:"code"`
+		DeviceID        string `json:"deviceId"`
+		ReplaceExisting bool   `json:"replaceExisting"`
+	}{Code: code, DeviceID: deviceID, ReplaceExisting: replaceExisting})
 	if err != nil {
 		return enrollmentResult{}, err
 	}

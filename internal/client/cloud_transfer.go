@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -24,13 +25,32 @@ import (
 )
 
 const (
-	cloudTransferSchema         = "feidu.rdev-cloud-transfer.v1"
-	cloudTransferDownload       = "cloud_to_device"
-	cloudTransferUpload         = "device_to_cloud"
-	cloudTransferAPIBodyLimit   = 2 * 1024 * 1024
-	cloudTransferBufferSize     = 1024 * 1024
-	cloudTransferMaxPartRetries = 3
+	cloudTransferSchema            = "feidu.rdev-cloud-transfer.v1"
+	cloudTransferDownload          = "cloud_to_device"
+	cloudTransferUpload            = "device_to_cloud"
+	cloudTransferAPIBodyLimit      = 2 * 1024 * 1024
+	cloudTransferBufferSize        = 1024 * 1024
+	cloudTransferMaxPartRetries    = 3
+	cloudTransferResultRetention   = 10 * time.Minute
+	cloudTransferAcceptanceTimeout = 7 * time.Second
 )
+
+var (
+	cloudTransferAPIHTTPClient      = newCloudTransferHTTPClient(false, 30*time.Second)
+	cloudTransferUploadHTTPClient   = newCloudTransferHTTPClient(false, 0)
+	cloudTransferDownloadHTTPClient = newCloudTransferHTTPClient(true, 0)
+)
+
+type cloudTransferRun struct {
+	transferID   string
+	generation   uint64
+	bootstrapURL string
+	tokenHash    [sha256.Size]byte
+	ctx          context.Context
+	cancel       context.CancelFunc
+	state        string
+	requestIDs   map[string]struct{}
+}
 
 type cloudTransferEnvelope[T any] struct {
 	Code    int    `json:"code"`
@@ -89,49 +109,105 @@ type cloudTransferReporter struct {
 }
 
 func (c *Client) handleCloudTransferStart(msg *protocol.Message) {
-	if msg == nil || !validCloudTransferID(msg.TransferID) || !validCloudTransferBootstrapURL(msg.BootstrapURL) || !validCloudTransferCredential(msg.TransferToken) {
+	if msg == nil || !validCloudTransferID(msg.TransferID) || msg.TransferGeneration == 0 ||
+		!validCloudTransferRequestID(msg.RequestID) || !validCloudTransferBootstrapURL(msg.BootstrapURL) ||
+		!validCloudTransferCredential(msg.TransferToken) {
 		return
 	}
-	c.mu.Lock()
-	if _, exists := c.cloudTransfers[msg.TransferID]; exists {
-		c.mu.Unlock()
+	run, start := c.prepareCloudTransfer(msg)
+	if !start {
 		return
 	}
-	c.cloudTransfers[msg.TransferID] = struct{}{}
-	c.mu.Unlock()
+	go c.runCloudTransfer(run, msg.BootstrapURL, msg.TransferToken)
+}
 
-	transferID := msg.TransferID
-	bootstrapURL := msg.BootstrapURL
-	token := msg.TransferToken
-	go func() {
-		err := executeCloudTransfer(context.Background(), bootstrapURL, token, transferID)
-		c.mu.Lock()
-		delete(c.cloudTransfers, transferID)
-		c.mu.Unlock()
-		result := &protocol.Message{Type: protocol.MsgCloudTransferResult, TransferID: transferID, TransferState: "completed"}
-		if err != nil {
-			result.TransferState = "failed"
-			result.Error = "cloud transfer failed"
+func (c *Client) prepareCloudTransfer(msg *protocol.Message) (*cloudTransferRun, bool) {
+	tokenHash := sha256.Sum256([]byte(msg.TransferToken))
+	c.mu.Lock()
+	if existing := c.cloudTransfers[msg.TransferID]; existing != nil {
+		if msg.TransferGeneration < existing.generation {
+			c.mu.Unlock()
+			_ = c.sendCloudTransferResult(msg.RequestID, msg.TransferID, msg.TransferGeneration, "failed")
+			return existing, false
 		}
-		_ = c.send(result)
-	}()
+		if msg.TransferGeneration == existing.generation {
+			if existing.bootstrapURL != msg.BootstrapURL || existing.tokenHash != tokenHash {
+				c.mu.Unlock()
+				_ = c.sendCloudTransferResult(msg.RequestID, msg.TransferID, msg.TransferGeneration, "failed")
+				return existing, false
+			}
+			state := existing.state
+			if state == "starting" {
+				existing.requestIDs[msg.RequestID] = struct{}{}
+				c.mu.Unlock()
+				return existing, false
+			}
+			c.mu.Unlock()
+			_ = c.sendCloudTransferResult(msg.RequestID, msg.TransferID, msg.TransferGeneration, state)
+			return existing, false
+		}
+		existing.cancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	run := &cloudTransferRun{
+		transferID: msg.TransferID, generation: msg.TransferGeneration, bootstrapURL: msg.BootstrapURL,
+		tokenHash: tokenHash, ctx: ctx, cancel: cancel,
+		state: "starting", requestIDs: map[string]struct{}{msg.RequestID: {}},
+	}
+	c.cloudTransfers[msg.TransferID] = run
+	c.mu.Unlock()
+	return run, true
+}
+
+func (c *Client) runCloudTransfer(run *cloudTransferRun, bootstrapURL, token string) {
+	c.mu.Lock()
+	if c.cloudTransfers[run.transferID] != run {
+		c.mu.Unlock()
+		run.cancel()
+		return
+	}
+	c.mu.Unlock()
+	err := executeCloudTransferWithAccepted(run.ctx, bootstrapURL, token, run.transferID, func() error {
+		return c.publishCloudTransferState(run, "running")
+	})
+	state := "completed"
+	if err != nil {
+		state = "failed"
+	}
+	_ = c.finishCloudTransfer(run, state)
 }
 
 func executeCloudTransfer(ctx context.Context, bootstrapURL, token, transferID string) error {
+	return executeCloudTransferWithAccepted(ctx, bootstrapURL, token, transferID, nil)
+}
+
+func executeCloudTransferWithAccepted(ctx context.Context, bootstrapURL, token, transferID string, accepted func() error) error {
 	if !validCloudTransferID(transferID) || !validCloudTransferBootstrapURL(bootstrapURL) || !validCloudTransferCredential(token) {
 		return errors.New("invalid cloud transfer dispatch")
 	}
+	acceptanceContext := ctx
+	cancelAcceptance := func() {}
+	if accepted != nil {
+		acceptanceContext, cancelAcceptance = context.WithTimeout(ctx, cloudTransferAcceptanceTimeout)
+	}
+	defer cancelAcceptance()
 	var plan cloudTransferPlan
-	if err := cloudTransferAPI(ctx, http.MethodGet, bootstrapURL, token, nil, &plan); err != nil {
+	if err := cloudTransferAPI(acceptanceContext, http.MethodGet, bootstrapURL, token, nil, &plan); err != nil {
 		return err
 	}
 	if plan.Schema != cloudTransferSchema || plan.TransferID != transferID || plan.SizeBytes < 0 {
 		return errors.New("cloud transfer plan is inconsistent")
 	}
 	reporter := &cloudTransferReporter{bootstrapURL: bootstrapURL, token: token}
-	if err := reporter.report(ctx, "running", 0, "", true); err != nil {
+	if err := reporter.report(acceptanceContext, "running", 0, "", true); err != nil {
 		return err
 	}
+	if accepted != nil {
+		if err := accepted(); err != nil {
+			return err
+		}
+	}
+	cancelAcceptance()
 	var err error
 	switch plan.Direction {
 	case cloudTransferDownload:
@@ -146,6 +222,68 @@ func executeCloudTransfer(ctx context.Context, bootstrapURL, token, transferID s
 		return err
 	}
 	return nil
+}
+
+func (c *Client) publishCloudTransferState(run *cloudTransferRun, state string) error {
+	c.mu.Lock()
+	if c.cloudTransfers[run.transferID] != run {
+		c.mu.Unlock()
+		return context.Canceled
+	}
+	run.state = state
+	requestIDs := drainCloudTransferRequestIDs(run)
+	c.mu.Unlock()
+	var firstErr error
+	for _, requestID := range requestIDs {
+		if err := c.sendCloudTransferResult(requestID, run.transferID, run.generation, state); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (c *Client) finishCloudTransfer(run *cloudTransferRun, state string) error {
+	c.mu.Lock()
+	active := c.cloudTransfers[run.transferID] == run
+	run.state = state
+	requestIDs := drainCloudTransferRequestIDs(run)
+	c.mu.Unlock()
+	var firstErr error
+	for _, requestID := range requestIDs {
+		if err := c.sendCloudTransferResult(requestID, run.transferID, run.generation, state); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if active {
+		time.AfterFunc(cloudTransferResultRetention, func() {
+			c.mu.Lock()
+			if c.cloudTransfers[run.transferID] == run {
+				delete(c.cloudTransfers, run.transferID)
+			}
+			c.mu.Unlock()
+		})
+	}
+	return firstErr
+}
+
+func drainCloudTransferRequestIDs(run *cloudTransferRun) []string {
+	requestIDs := make([]string, 0, len(run.requestIDs))
+	for requestID := range run.requestIDs {
+		requestIDs = append(requestIDs, requestID)
+	}
+	run.requestIDs = make(map[string]struct{})
+	return requestIDs
+}
+
+func (c *Client) sendCloudTransferResult(requestID, transferID string, generation uint64, state string) error {
+	result := &protocol.Message{
+		Type: protocol.MsgCloudTransferResult, RequestID: requestID, TransferID: transferID,
+		TransferGeneration: generation, TransferState: state,
+	}
+	if state == "failed" {
+		result.Error = "cloud transfer failed"
+	}
+	return c.send(result)
 }
 
 func executeCloudDownload(ctx context.Context, plan cloudTransferPlan, bootstrapURL, token string, reporter *cloudTransferReporter) error {
@@ -527,20 +665,28 @@ func cloudTransferAPI(ctx context.Context, method, endpoint, token string, input
 }
 
 func cloudTransferAPIClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	return &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
+	return cloudTransferAPIHTTPClient
 }
 
 func cloudTransferDownloadClient() *http.Client {
-	return cloudTransferDataClient(true)
+	return cloudTransferDownloadHTTPClient
 }
 
 func cloudTransferDataClient(followRedirects bool) *http.Client {
+	if followRedirects {
+		return cloudTransferDownloadHTTPClient
+	}
+	return cloudTransferUploadHTTPClient
+}
+
+func newCloudTransferHTTPClient(followRedirects bool, timeout time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = 30 * time.Second
-	client := &http.Client{Transport: transport, CheckRedirect: func(request *http.Request, via []*http.Request) error {
+	transport.MaxIdleConns = 16
+	transport.MaxIdleConnsPerHost = 4
+	transport.MaxConnsPerHost = 8
+	transport.IdleConnTimeout = 90 * time.Second
+	client := &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(request *http.Request, via []*http.Request) error {
 		if !followRedirects {
 			return http.ErrUseLastResponse
 		}
@@ -633,6 +779,14 @@ func validCloudTransferID(value string) bool {
 	compact := strings.ReplaceAll(value, "-", "")
 	_, err := hex.DecodeString(compact)
 	return len(compact) == 32 && err == nil
+}
+
+func validCloudTransferRequestID(value string) bool {
+	if len(value) != 32 || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 16
 }
 
 func validCloudTransferCredential(value string) bool {

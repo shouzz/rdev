@@ -4,6 +4,7 @@
 
 Before any device or artifact file-transfer task, read:
 
+- `skills/rdev-agent/SKILL.md`
 - `docs/ai-agent-artifact-bridge.md`
 - `docs/ai-agent-manifest.json`
 
@@ -13,7 +14,7 @@ Use `tools/feidu-drive.py` for the Feidu developer API. The public copy at `http
 
 1. Start from the handoff copied by an authenticated user at `https://pan.feidu.fit/rdev`.
 2. Redeem its `fdhc_` claim once through the exact `redeem_path`. Require HTTP 200 and JSON `code == 0`.
-3. Read the device ID only from `data.credentials.device_id`, the RDev credential only from `data.credentials.rdev_ticket.ticket`, and the Feidu token only from `data.credentials.developer_token.token`.
+3. Read the device ID only from `data.credentials.device_id`, the RDev credential only from `data.credentials.rdev_ticket.ticket`, the Feidu token only from `data.credentials.developer_token.token`, and the renewable session only from `data.credentials.agent_session`.
 4. Read `https://r.feidu.fit/api/config` for the current RDev ports. Do not call the protected `/api/clients` endpoint; the exact device ID came from the redemption response.
 5. Set the Feidu token as `FEIDU_DRIVE_TOKEN`, then call `python3 tools/feidu-drive.py capabilities` before cloud operations.
 6. Use the returned `content_id`; never infer identity from names, paths, hashes, sizes, casing, or similar content.
@@ -27,6 +28,7 @@ Do not hard-code a previously observed device, port, upload session, cloud objec
 - Never write claims, tokens, account passwords, RDev tickets, cookies, signed download URLs, or upload URLs to source files, logs, task descriptions, checkpoints, or persistent AI memory.
 - Never forward the Feidu `Authorization` header to a redirected download host.
 - The RDev ticket and Feidu developer token expire independently even though one handoff issues both.
+- Authenticate heartbeat, renewal, revocation, and Agent cloud-transfer operations only with `data.credentials.agent_session.renewal_token`. It remains stable until the delegated session is revoked or reaches its absolute deadline. A successful renewal extends the existing RDev ticket and developer token in place; their credential values remain unchanged.
 
 ## Transfer boundary
 

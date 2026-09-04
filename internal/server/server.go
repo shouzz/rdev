@@ -21,6 +21,7 @@ import (
 
 	"github.com/lxzan/gws"
 	kcp "github.com/xtaci/kcp-go/v5"
+	"golang.org/x/crypto/bcrypt"
 	gossh "golang.org/x/crypto/ssh"
 	"rdev/internal/protocol"
 	tframe "rdev/internal/transport"
@@ -69,22 +70,23 @@ var (
 
 // ClientConn represents a connected client device
 type ClientConn struct {
-	ID           string
-	RequestedID  string
-	InstanceID   string
-	Version      string
-	Conn         *gws.Conn
-	Transport    DeviceTransport
-	ConnectedAt  time.Time
-	Password     string
-	Managed      bool
-	OwnerSubject string
-	Sessions     map[string]*ProxySession
-	Forwards     map[string]*ProxyForward
-	Desktop      *protocol.DesktopCapabilities
-	LogSupported bool
-	writeMu      sync.Mutex
-	mu           sync.Mutex
+	ID              string
+	RequestedID     string
+	InstanceID      string
+	Version         string
+	Conn            *gws.Conn
+	Transport       DeviceTransport
+	ConnectedAt     time.Time
+	Password        string
+	Managed         bool
+	OwnerSubject    string
+	Sessions        map[string]*ProxySession
+	Forwards        map[string]*ProxyForward
+	Desktop         *protocol.DesktopCapabilities
+	LogSupported    bool
+	CloudTransferV1 bool
+	writeMu         sync.Mutex
+	mu              sync.Mutex
 }
 
 type DeviceTransport interface {
@@ -555,7 +557,12 @@ type Server struct {
 	gpuDesktopTunnels      map[string]*gpuDesktopTunnel
 	accessTicketMu         sync.Mutex
 	accessTickets          map[[32]byte]accessTicket
+	accessTicketStorePath  string
 	accessTicketNow        func() time.Time
+	accessTicketRevoked    func(string)
+	cloudTransferMu        sync.Mutex
+	cloudTransferPending   map[string]*cloudTransferDispatchPending
+	cloudTransferAckWait   time.Duration
 	enrollmentMu           sync.Mutex
 	enrollments            map[[32]byte]enrollmentInvite
 	managedDevices         map[string]managedDevice
@@ -585,26 +592,28 @@ type Server struct {
 // NewServer creates a new Server
 func NewServer() *Server {
 	s := &Server{
-		clients:           make(map[string]*ClientConn),
-		sessions:          make(map[string]*ProxySession),
-		forwards:          make(map[string]*ProxyForward),
-		revForwards:       make(map[string]*ReverseForward),
-		fileResults:       make(map[string]chan *protocol.Message),
-		fileRequests:      make(map[string]*fileSocket),
-		fileTasks:         make(map[string]*fileTaskRoute),
-		desktops:          make(map[string]*desktopRoute),
-		vncSettings:       make(map[string]protocol.Message),
-		vncStreams:        make(map[string]*vncDesktopStream),
-		gpuDesktopTunnels: make(map[string]*gpuDesktopTunnel),
-		accessTickets:     make(map[[32]byte]accessTicket),
-		accessTicketNow:   time.Now,
-		enrollments:       make(map[[32]byte]enrollmentInvite),
-		managedDevices:    make(map[string]managedDevice),
-		enrollmentNow:     time.Now,
-		MaxSessions:       256,
-		MaxForwards:       1024,
-		BatchConcurrency:  runtime.GOMAXPROCS(0) * 8,
-		ClientLogs:        NewClientLogManager("", 0, 0),
+		clients:              make(map[string]*ClientConn),
+		sessions:             make(map[string]*ProxySession),
+		forwards:             make(map[string]*ProxyForward),
+		revForwards:          make(map[string]*ReverseForward),
+		fileResults:          make(map[string]chan *protocol.Message),
+		fileRequests:         make(map[string]*fileSocket),
+		fileTasks:            make(map[string]*fileTaskRoute),
+		desktops:             make(map[string]*desktopRoute),
+		vncSettings:          make(map[string]protocol.Message),
+		vncStreams:           make(map[string]*vncDesktopStream),
+		gpuDesktopTunnels:    make(map[string]*gpuDesktopTunnel),
+		accessTickets:        make(map[[32]byte]accessTicket),
+		cloudTransferPending: make(map[string]*cloudTransferDispatchPending),
+		cloudTransferAckWait: cloudTransferAckTimeout,
+		accessTicketNow:      time.Now,
+		enrollments:          make(map[[32]byte]enrollmentInvite),
+		managedDevices:       make(map[string]managedDevice),
+		enrollmentNow:        time.Now,
+		MaxSessions:          256,
+		MaxForwards:          1024,
+		BatchConcurrency:     runtime.GOMAXPROCS(0) * 8,
+		ClientLogs:           NewClientLogManager("", 0, 0),
 	}
 	s.upgrader = gws.NewUpgrader(&wsHandler{srv: s}, &gws.ServerOption{
 		ReadMaxPayloadSize: 16 * 1024 * 1024,
@@ -760,25 +769,38 @@ func (h *wsHandler) handleRegister(socket *gws.Conn, msg *protocol.Message) {
 		return
 	}
 	instanceID := strings.TrimSpace(msg.InstanceID)
+	if managed {
+		if err := h.srv.rebindManagedAccessTickets(clientID, instanceID, passwordFingerprint(msg.Password)); err != nil {
+			_ = socket.WriteMessage(gws.OpcodeText, []byte(`{"type":"register_error","error":"managed device access ticket restore failed"}`))
+			_ = socket.WriteClose(1011, []byte("managed device access ticket restore failed"))
+			return
+		}
+	}
 	client := &ClientConn{
-		ID:           clientID,
-		RequestedID:  clientID,
-		InstanceID:   instanceID,
-		Version:      msg.ClientVersion,
-		Conn:         socket,
-		Transport:    &wsDeviceTransport{conn: socket},
-		ConnectedAt:  time.Now(),
-		Password:     msg.Password,
-		Managed:      managed,
-		OwnerSubject: h.srv.managedDeviceOwner(clientID),
-		Desktop:      cloneDesktopCapabilities(msg.DesktopCapabilities),
-		LogSupported: msg.LogSupported,
-		Sessions:     make(map[string]*ProxySession),
-		Forwards:     make(map[string]*ProxyForward),
+		ID:              clientID,
+		RequestedID:     clientID,
+		InstanceID:      instanceID,
+		Version:         msg.ClientVersion,
+		Conn:            socket,
+		Transport:       &wsDeviceTransport{conn: socket},
+		ConnectedAt:     time.Now(),
+		Password:        msg.Password,
+		Managed:         managed,
+		OwnerSubject:    h.srv.managedDeviceOwner(clientID),
+		Desktop:         cloneDesktopCapabilities(msg.DesktopCapabilities),
+		LogSupported:    msg.LogSupported,
+		CloudTransferV1: msg.CloudTransferV1,
+		Sessions:        make(map[string]*ProxySession),
+		Forwards:        make(map[string]*ProxyForward),
 	}
 
 	socket.Session().Store("clientID", clientID)
-	old, assignedID, duplicate := h.srv.registerClient(client)
+	old, assignedID, duplicate, authorizationCurrent := h.srv.registerClientIfAuthorizationCurrent(client, msg.DeviceSecret)
+	if !authorizationCurrent {
+		_ = socket.WriteMessage(gws.OpcodeText, []byte(`{"type":"register_error","error":"device authorization changed"}`))
+		_ = socket.WriteClose(1008, []byte("device authorization changed"))
+		return
+	}
 	socket.Session().Store("clientID", assignedID)
 
 	if old != nil && old.Transport != client.Transport {
@@ -904,6 +926,30 @@ func (s *Server) registerClient(client *ClientConn) (*ClientConn, string, bool) 
 	client.ID = assignedID
 	s.clients[assignedID] = client
 	return nil, assignedID, true
+}
+
+func (s *Server) registerClientIfAuthorizationCurrent(client *ClientConn, deviceSecret string) (*ClientConn, string, bool, bool) {
+	s.enrollmentMu.Lock()
+	defer s.enrollmentMu.Unlock()
+	requestedID := strings.TrimSpace(client.RequestedID)
+	if requestedID == "" {
+		requestedID = strings.TrimSpace(client.ID)
+	}
+	device, managed := s.managedDevices[requestedID]
+	if managed && (!device.RevokedAt.IsZero() || !client.Managed) {
+		return nil, "", false, false
+	}
+	if !managed && client.Managed {
+		return nil, "", false, false
+	}
+	if managed && bcrypt.CompareHashAndPassword([]byte(device.SecretHash), []byte(deviceSecret)) != nil {
+		return nil, "", false, false
+	}
+	if managed {
+		client.OwnerSubject = device.OwnerSubject
+	}
+	old, assignedID, duplicate := s.registerClient(client)
+	return old, assignedID, duplicate, true
 }
 
 func (s *Server) nextAvailableClientID(base string) string {
@@ -1100,22 +1146,37 @@ func (s *Server) registerStreamClient(transport DeviceTransport, msg *protocol.M
 		return "", false
 	}
 	instanceID := strings.TrimSpace(msg.InstanceID)
-	client := &ClientConn{
-		ID:           clientID,
-		RequestedID:  clientID,
-		InstanceID:   instanceID,
-		Version:      msg.ClientVersion,
-		Transport:    transport,
-		ConnectedAt:  time.Now(),
-		Password:     msg.Password,
-		Managed:      managed,
-		OwnerSubject: s.managedDeviceOwner(clientID),
-		Desktop:      cloneDesktopCapabilities(msg.DesktopCapabilities),
-		LogSupported: msg.LogSupported,
-		Sessions:     make(map[string]*ProxySession),
-		Forwards:     make(map[string]*ProxyForward),
+	if managed {
+		if err := s.rebindManagedAccessTickets(clientID, instanceID, passwordFingerprint(msg.Password)); err != nil {
+			data, _ := protocol.Encode(&protocol.Message{Type: protocol.MsgRegisterError, Error: "managed device access ticket restore failed"})
+			_ = transport.WriteJSON(data)
+			_ = transport.Close("managed device access ticket restore failed")
+			return "", false
+		}
 	}
-	old, assignedID, duplicate := s.registerClient(client)
+	client := &ClientConn{
+		ID:              clientID,
+		RequestedID:     clientID,
+		InstanceID:      instanceID,
+		Version:         msg.ClientVersion,
+		Transport:       transport,
+		ConnectedAt:     time.Now(),
+		Password:        msg.Password,
+		Managed:         managed,
+		OwnerSubject:    s.managedDeviceOwner(clientID),
+		Desktop:         cloneDesktopCapabilities(msg.DesktopCapabilities),
+		LogSupported:    msg.LogSupported,
+		CloudTransferV1: msg.CloudTransferV1,
+		Sessions:        make(map[string]*ProxySession),
+		Forwards:        make(map[string]*ProxyForward),
+	}
+	old, assignedID, duplicate, authorizationCurrent := s.registerClientIfAuthorizationCurrent(client, msg.DeviceSecret)
+	if !authorizationCurrent {
+		data, _ := protocol.Encode(&protocol.Message{Type: protocol.MsgRegisterError, Error: "device authorization changed"})
+		_ = transport.WriteJSON(data)
+		_ = transport.Close("device authorization changed")
+		return "", false
+	}
 	if old != nil && old.Transport != transport {
 		log.Printf("client reconnected via %s: requested=%s assigned=%s", label, clientID, assignedID)
 		closeClientResources(s, old)
@@ -1239,6 +1300,8 @@ func (s *Server) handleClientMessage(client *ClientConn, msg *protocol.Message) 
 		s.handleDesktopMessage(msg)
 	case protocol.MsgLogBatch:
 		s.handleClientLogBatch(client, msg)
+	case protocol.MsgCloudTransferResult:
+		s.handleCloudTransferResult(client, msg)
 	}
 }
 
@@ -1460,18 +1523,19 @@ func (s *Server) HandleAPI(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.RUnlock()
 
 	type clientInfo struct {
-		ID           string                        `json:"id"`
-		RequestedID  string                        `json:"requestedId,omitempty"`
-		InstanceID   string                        `json:"instanceId,omitempty"`
-		Version      string                        `json:"version,omitempty"`
-		ConnectedAt  string                        `json:"connectedAt"`
-		Sessions     int                           `json:"sessions"`
-		Forwards     int                           `json:"forwards"`
-		HasPassword  bool                          `json:"hasPassword"`
-		Desktop      *protocol.DesktopCapabilities `json:"desktop,omitempty"`
-		GPUDesktop   bool                          `json:"gpuDesktop,omitempty"`
-		LogSupported bool                          `json:"logSupported,omitempty"`
-		OwnerSubject string                        `json:"ownerSubject,omitempty"`
+		ID              string                        `json:"id"`
+		RequestedID     string                        `json:"requestedId,omitempty"`
+		InstanceID      string                        `json:"instanceId,omitempty"`
+		Version         string                        `json:"version,omitempty"`
+		ConnectedAt     string                        `json:"connectedAt"`
+		Sessions        int                           `json:"sessions"`
+		Forwards        int                           `json:"forwards"`
+		HasPassword     bool                          `json:"hasPassword"`
+		Desktop         *protocol.DesktopCapabilities `json:"desktop,omitempty"`
+		GPUDesktop      bool                          `json:"gpuDesktop,omitempty"`
+		LogSupported    bool                          `json:"logSupported,omitempty"`
+		CloudTransferV1 bool                          `json:"cloudTransferV1,omitempty"`
+		OwnerSubject    string                        `json:"ownerSubject,omitempty"`
 	}
 
 	clients := make([]clientInfo, 0, len(s.clients))
@@ -1481,18 +1545,19 @@ func (s *Server) HandleAPI(w http.ResponseWriter, r *http.Request) {
 		f := len(c.Forwards)
 		c.mu.Unlock()
 		clients = append(clients, clientInfo{
-			ID:           c.ID,
-			RequestedID:  c.RequestedID,
-			InstanceID:   c.InstanceID,
-			Version:      c.Version,
-			ConnectedAt:  c.ConnectedAt.Format(time.RFC3339),
-			Sessions:     n,
-			Forwards:     f,
-			HasPassword:  c.Password != "",
-			Desktop:      publicDesktopCapabilities(c.Desktop),
-			GPUDesktop:   s.clientGPUDesktopAvailable(c),
-			LogSupported: c.LogSupported,
-			OwnerSubject: c.OwnerSubject,
+			ID:              c.ID,
+			RequestedID:     c.RequestedID,
+			InstanceID:      c.InstanceID,
+			Version:         c.Version,
+			ConnectedAt:     c.ConnectedAt.Format(time.RFC3339),
+			Sessions:        n,
+			Forwards:        f,
+			HasPassword:     c.Password != "",
+			Desktop:         publicDesktopCapabilities(c.Desktop),
+			GPUDesktop:      s.clientGPUDesktopAvailable(c),
+			LogSupported:    c.LogSupported,
+			CloudTransferV1: c.CloudTransferV1,
+			OwnerSubject:    c.OwnerSubject,
 		})
 	}
 
@@ -1616,33 +1681,50 @@ func fastestReleaseDownloadCandidate(ctx context.Context, candidates []string) s
 	defer cancel()
 
 	results := make(chan releaseDownloadProbeResult, len(candidates))
+	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for _, candidate := range candidates {
 		candidate := candidate
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			started := time.Now()
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate, nil)
-			if err != nil {
-				return
+			<-start
+			var best releaseDownloadProbeResult
+			var bestRate float64
+			for attempt := 0; attempt < 3; attempt++ {
+				started := time.Now()
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate, nil)
+				if err != nil {
+					return
+				}
+				req.Header.Set("Range", "bytes=0-65535")
+				req.Header.Set("User-Agent", "rdev-server")
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					continue
+				}
+				if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+					_ = resp.Body.Close()
+					continue
+				}
+				n, _ := io.CopyN(io.Discard, resp.Body, releaseDownloadProbeBytes)
+				_ = resp.Body.Close()
+				duration := time.Since(started)
+				if n <= 0 || duration <= 0 {
+					continue
+				}
+				rate := float64(n) / duration.Seconds()
+				if rate > bestRate {
+					bestRate = rate
+					best = releaseDownloadProbeResult{candidate: candidate, bytes: n, duration: duration}
+				}
 			}
-			req.Header.Set("Range", "bytes=0-65535")
-			req.Header.Set("User-Agent", "rdev-server")
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				return
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-				return
-			}
-			n, _ := io.CopyN(io.Discard, resp.Body, releaseDownloadProbeBytes)
-			if n > 0 {
-				results <- releaseDownloadProbeResult{candidate: candidate, bytes: n, duration: time.Since(started)}
+			if best.bytes > 0 {
+				results <- best
 			}
 		}()
 	}
+	close(start)
 	go func() {
 		wg.Wait()
 		close(results)
@@ -1843,29 +1925,31 @@ func (s *Server) HandleTerminalAPI(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.RUnlock()
 
 	type deviceInfo struct {
-		ID           string                        `json:"id"`
-		RequestedID  string                        `json:"requestedId,omitempty"`
-		ConnectedAt  string                        `json:"connectedAt"`
-		Version      string                        `json:"version,omitempty"`
-		HasPassword  bool                          `json:"hasPassword"`
-		Desktop      *protocol.DesktopCapabilities `json:"desktop,omitempty"`
-		GPUDesktop   bool                          `json:"gpuDesktop,omitempty"`
-		LogSupported bool                          `json:"logSupported,omitempty"`
-		OwnerSubject string                        `json:"ownerSubject,omitempty"`
+		ID              string                        `json:"id"`
+		RequestedID     string                        `json:"requestedId,omitempty"`
+		ConnectedAt     string                        `json:"connectedAt"`
+		Version         string                        `json:"version,omitempty"`
+		HasPassword     bool                          `json:"hasPassword"`
+		Desktop         *protocol.DesktopCapabilities `json:"desktop,omitempty"`
+		GPUDesktop      bool                          `json:"gpuDesktop,omitempty"`
+		LogSupported    bool                          `json:"logSupported,omitempty"`
+		CloudTransferV1 bool                          `json:"cloudTransferV1,omitempty"`
+		OwnerSubject    string                        `json:"ownerSubject,omitempty"`
 	}
 
 	devices := make([]deviceInfo, 0, len(s.clients))
 	for _, c := range s.clients {
 		devices = append(devices, deviceInfo{
-			ID:           c.ID,
-			RequestedID:  c.RequestedID,
-			ConnectedAt:  c.ConnectedAt.Format(time.RFC3339),
-			Version:      c.Version,
-			HasPassword:  c.Password != "",
-			Desktop:      publicDesktopCapabilities(c.Desktop),
-			GPUDesktop:   s.clientGPUDesktopAvailable(c),
-			LogSupported: c.LogSupported,
-			OwnerSubject: c.OwnerSubject,
+			ID:              c.ID,
+			RequestedID:     c.RequestedID,
+			ConnectedAt:     c.ConnectedAt.Format(time.RFC3339),
+			Version:         c.Version,
+			HasPassword:     c.Password != "",
+			Desktop:         publicDesktopCapabilities(c.Desktop),
+			GPUDesktop:      s.clientGPUDesktopAvailable(c),
+			LogSupported:    c.LogSupported,
+			CloudTransferV1: c.CloudTransferV1,
+			OwnerSubject:    c.OwnerSubject,
 		})
 	}
 

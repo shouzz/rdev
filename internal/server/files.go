@@ -271,7 +271,7 @@ func (h *filesWSHandler) handleFileOp(socket *fileSocket, msg fileMsg) {
 	h.srv.fileRequests[msg.RequestID] = socket
 	h.srv.fileMu.Unlock()
 	typ := protocol.MessageType("file_" + msg.Op)
-	if err := client.Send(&protocol.Message{Type: typ, RequestID: msg.RequestID, Path: msg.Path, ParentPath: msg.ParentPath, Name: msg.Name, Success: msg.Recursive, Data: msg.From, FilePath: msg.To}); err != nil {
+	if err := client.Send(&protocol.Message{Type: typ, RequestID: msg.RequestID, Path: msg.Path, ParentPath: msg.ParentPath, Name: msg.Name, Recursive: msg.Recursive, Data: msg.From, FilePath: msg.To}); err != nil {
 		h.srv.removeFileRequest(msg.RequestID)
 		socket.writeText(fileMsg{Op: "error", DeviceID: msg.DeviceID, RequestID: msg.RequestID, Message: "failed to reach device"})
 	}

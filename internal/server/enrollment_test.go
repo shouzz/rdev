@@ -95,6 +95,368 @@ func TestEnrollmentCreatesOneTimeManagedDeviceCredential(t *testing.T) {
 	}
 }
 
+func TestPersistentReEnrollmentReplacesSameOwnerDevice(t *testing.T) {
+	now := time.Date(2026, 9, 4, 9, 0, 0, 0, time.UTC)
+	registryPath := filepath.Join(t.TempDir(), "managed_devices.json")
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.enrollmentNow = func() time.Time { return now }
+	if err := s.ConfigureEnrollmentStore(registryPath, "https://rdev.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	firstInvite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
+	first := redeemEnrollmentForTest(t, s, firstInvite.Code, "workstation-01")
+	createdAt := s.managedDevices[first.DeviceID].CreatedAt
+	transport := &enrollmentTestTransport{closed: make(chan string, 1)}
+	s.mu.Lock()
+	s.clients[first.DeviceID] = &ClientConn{
+		ID: first.DeviceID, RequestedID: first.DeviceID, InstanceID: "old-instance", Transport: transport,
+	}
+	s.mu.Unlock()
+	ticketValue := "rdvat_replacement-test-ticket"
+	ticketHash := sha256.Sum256([]byte(ticketValue))
+	s.accessTicketMu.Lock()
+	s.accessTickets[ticketHash] = accessTicket{
+		ID: "11111111111111111111111111111111", DeviceID: first.DeviceID,
+		InstanceID: "old-instance", Subject: "feidu-user:42", ExpiresAt: now.Add(time.Hour),
+	}
+	s.accessTicketMu.Unlock()
+
+	now = now.Add(time.Minute)
+	secondInvite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
+	body, err := json.Marshal(enrollmentRedeemRequest{
+		Code: secondInvite.Code, DeviceID: first.DeviceID, ReplaceExisting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	s.HandleEnrollmentRedeemAPI(response, httptest.NewRequest(http.MethodPost, "/api/enrollments/redeem", bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("replace status = %d, body = %q", response.Code, response.Body.String())
+	}
+	var replaced enrollmentRedeemResponse
+	if err = json.Unmarshal(response.Body.Bytes(), &replaced); err != nil {
+		t.Fatal(err)
+	}
+	if replaced.DeviceID != first.DeviceID || replaced.DeviceSecret == first.DeviceSecret {
+		t.Fatalf("replacement identity = %#v", replaced)
+	}
+	if len(s.managedDevices) != 1 {
+		t.Fatalf("managed devices = %d, want 1", len(s.managedDevices))
+	}
+	record := s.managedDevices[first.DeviceID]
+	if !record.CreatedAt.Equal(createdAt) || !record.UpdatedAt.Equal(now.UTC().Truncate(time.Second)) {
+		t.Fatalf("replacement timestamps = created %s updated %s", record.CreatedAt, record.UpdatedAt)
+	}
+	if allowed, managed := s.authorizeManagedRegistration(first.DeviceID, first.DeviceSecret); !managed || allowed {
+		t.Fatal("old managed-device secret remained valid")
+	}
+	if allowed, managed := s.authorizeManagedRegistration(replaced.DeviceID, replaced.DeviceSecret); !managed || !allowed {
+		t.Fatal("replacement managed-device secret was rejected")
+	}
+	staleLegacy := &ClientConn{ID: replaced.DeviceID, RequestedID: replaced.DeviceID}
+	if _, _, _, registered := s.registerClientIfAuthorizationCurrent(staleLegacy, ""); registered {
+		t.Fatal("stale unmanaged authorization registered over a managed device")
+	}
+	s.mu.RLock()
+	registeredAfterReplacement := s.clients[replaced.DeviceID]
+	s.mu.RUnlock()
+	if registeredAfterReplacement != nil {
+		t.Fatal("replacement retained the old client in the online registry")
+	}
+	oldClient := &ClientConn{ID: first.DeviceID, InstanceID: "old-instance"}
+	if s.accessTicketValid(oldClient, ticketValue) {
+		t.Fatal("replacement left the old access ticket usable")
+	}
+	select {
+	case reason := <-transport.closed:
+		if reason != "managed device replaced" {
+			t.Fatalf("device close reason = %q", reason)
+		}
+	default:
+		t.Fatal("old managed-device connection was not closed")
+	}
+
+	reloaded := NewServer()
+	if err = reloaded.ConfigureEnrollmentStore(registryPath, "https://rdev.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, managed := reloaded.authorizeManagedRegistration(replaced.DeviceID, replaced.DeviceSecret); !managed || !allowed {
+		t.Fatal("reloaded registry rejected replacement secret")
+	}
+}
+
+func TestManagedDeviceRegistryV2LoadsWithInitialCredentialVersion(t *testing.T) {
+	now := time.Date(2026, 9, 4, 9, 30, 0, 0, time.UTC)
+	registryPath := filepath.Join(t.TempDir(), "managed_devices.json")
+	original := NewServer()
+	original.ControlToken = "control-secret"
+	original.enrollmentNow = func() time.Time { return now }
+	if err := original.ConfigureEnrollmentStore(registryPath, "https://rdev.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	invite := createEnrollmentForTest(t, original, "feidu-user:42", 600)
+	redeemed := redeemEnrollmentForTest(t, original, invite.Code, "legacy-registry-device")
+	device := original.managedDevices[redeemed.DeviceID]
+	legacy := managedDeviceRegistry{
+		Schema: managedDeviceRegistryV2,
+		Devices: []managedDeviceRegistryRecord{{
+			ID: device.ID, OwnerSubject: device.OwnerSubject, SecretHash: device.SecretHash,
+			CreatedAt: device.CreatedAt.UTC().Format(time.RFC3339), UpdatedAt: device.UpdatedAt.UTC().Format(time.RFC3339),
+		}},
+	}
+	data, err := json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	if err = os.WriteFile(registryPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := NewServer()
+	if err = reloaded.ConfigureEnrollmentStore(registryPath, "https://rdev.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	loaded := reloaded.managedDevices[redeemed.DeviceID]
+	if loaded.CredentialVersion != 1 {
+		t.Fatalf("legacy device credential version = %d, want 1", loaded.CredentialVersion)
+	}
+	if allowed, managed := reloaded.authorizeManagedRegistration(redeemed.DeviceID, redeemed.DeviceSecret); !managed || !allowed {
+		t.Fatal("legacy registry device secret was rejected")
+	}
+}
+
+func TestPersistentReEnrollmentRejectsAnotherOwner(t *testing.T) {
+	now := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.enrollmentNow = func() time.Time { return now }
+	if err := s.ConfigureEnrollmentStore(filepath.Join(t.TempDir(), "managed_devices.json"), "https://rdev.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	firstInvite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
+	first := redeemEnrollmentForTest(t, s, firstInvite.Code, "shared-name")
+	secondInvite := createEnrollmentForTest(t, s, "feidu-user:43", 600)
+	body, err := json.Marshal(enrollmentRedeemRequest{
+		Code: secondInvite.Code, DeviceID: first.DeviceID, ReplaceExisting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	s.HandleEnrollmentRedeemAPI(response, httptest.NewRequest(http.MethodPost, "/api/enrollments/redeem", bytes.NewReader(body)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("cross-owner replacement status = %d, want 409", response.Code)
+	}
+	if allowed, managed := s.authorizeManagedRegistration(first.DeviceID, first.DeviceSecret); !managed || !allowed {
+		t.Fatal("rejected replacement changed the existing device secret")
+	}
+	if status := getEnrollmentStatusForTest(t, s, secondInvite.EnrollmentID); status.State != "active" {
+		t.Fatalf("rejected replacement consumed the invitation: %#v", status)
+	}
+}
+
+func TestPersistentReEnrollmentInvalidatesTicketsWithoutTicketStoreMutation(t *testing.T) {
+	now := time.Date(2026, 9, 4, 10, 15, 0, 0, time.UTC)
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.enrollmentNow = func() time.Time { return now }
+	if err := s.ConfigureEnrollmentStore(filepath.Join(t.TempDir(), "managed_devices.json"), "https://rdev.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	firstInvite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
+	first := redeemEnrollmentForTest(t, s, firstInvite.Code, "ticket-persist-failure")
+	transport := &enrollmentTestTransport{closed: make(chan string, 1)}
+	s.mu.Lock()
+	s.clients[first.DeviceID] = &ClientConn{
+		ID: first.DeviceID, RequestedID: first.DeviceID, InstanceID: "old-instance", Transport: transport,
+	}
+	s.mu.Unlock()
+	ticketValue := "rdvat_ticket-that-must-be-invalidated"
+	ticketHash := sha256.Sum256([]byte(ticketValue))
+	s.accessTicketMu.Lock()
+	s.accessTickets[ticketHash] = accessTicket{
+		ID: "22222222222222222222222222222222", DeviceID: first.DeviceID,
+		InstanceID: "old-instance", Subject: "feidu-user:42", ExpiresAt: now.Add(time.Hour),
+	}
+	ticketStoreDirectory := filepath.Join(t.TempDir(), "existing-directory")
+	if err := os.Mkdir(ticketStoreDirectory, 0700); err != nil {
+		s.accessTicketMu.Unlock()
+		t.Fatal(err)
+	}
+	s.accessTicketStorePath = ticketStoreDirectory
+	s.accessTicketMu.Unlock()
+
+	secondInvite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
+	body, err := json.Marshal(enrollmentRedeemRequest{
+		Code: secondInvite.Code, DeviceID: first.DeviceID, ReplaceExisting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	s.HandleEnrollmentRedeemAPI(response, httptest.NewRequest(http.MethodPost, "/api/enrollments/redeem", bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("replacement status = %d, want 200; body = %q", response.Code, response.Body.String())
+	}
+	if allowed, managed := s.authorizeManagedRegistration(first.DeviceID, first.DeviceSecret); !managed || allowed {
+		t.Fatal("replacement left the old device secret usable")
+	}
+	s.accessTicketMu.Lock()
+	_, ticketExists := s.accessTickets[ticketHash]
+	s.accessTicketMu.Unlock()
+	if !ticketExists {
+		t.Fatal("replacement unexpectedly required a ticket-store rewrite")
+	}
+	oldClient := &ClientConn{ID: first.DeviceID, InstanceID: "old-instance"}
+	if s.accessTicketValid(oldClient, ticketValue) {
+		t.Fatal("retained old access ticket remained usable after replacement")
+	}
+	if status := getEnrollmentStatusForTest(t, s, secondInvite.EnrollmentID); status.State != "consumed" {
+		t.Fatalf("replacement invitation status = %#v", status)
+	}
+	select {
+	case reason := <-transport.closed:
+		if reason != "managed device replaced" {
+			t.Fatalf("replacement close reason = %q", reason)
+		}
+	default:
+		t.Fatal("replacement did not disconnect the old device")
+	}
+}
+
+func TestFinalManagedRegistrationRejectsSecretReplacedAfterInitialAuthorization(t *testing.T) {
+	now := time.Date(2026, 9, 4, 10, 20, 0, 0, time.UTC)
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.enrollmentNow = func() time.Time { return now }
+	if err := s.ConfigureEnrollmentStore(filepath.Join(t.TempDir(), "managed_devices.json"), "https://rdev.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	firstInvite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
+	first := redeemEnrollmentForTest(t, s, firstInvite.Code, "registration-race")
+	if allowed, managed := s.authorizeManagedRegistration(first.DeviceID, first.DeviceSecret); !managed || !allowed {
+		t.Fatal("initial managed-device authorization failed")
+	}
+	now = now.Add(time.Minute)
+	secondInvite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
+	body, err := json.Marshal(enrollmentRedeemRequest{
+		Code: secondInvite.Code, DeviceID: first.DeviceID, ReplaceExisting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	s.HandleEnrollmentRedeemAPI(response, httptest.NewRequest(http.MethodPost, "/api/enrollments/redeem", bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("replacement status = %d, body = %q", response.Code, response.Body.String())
+	}
+	stale := &ClientConn{ID: first.DeviceID, RequestedID: first.DeviceID, Managed: true}
+	if _, _, _, registered := s.registerClientIfAuthorizationCurrent(stale, first.DeviceSecret); registered {
+		t.Fatal("old device secret completed registration after replacement")
+	}
+	if client := s.clientByID(first.DeviceID); client != nil {
+		t.Fatal("old device secret created an online client")
+	}
+}
+
+func TestFinalUnmanagedRegistrationRejectsDeviceCreatedAndRevokedAfterInitialAuthorization(t *testing.T) {
+	s := NewServer()
+	deviceID := "registration-revocation-race"
+	if allowed, managed := s.authorizeManagedRegistration(deviceID, ""); allowed || managed {
+		t.Fatal("device unexpectedly existed during initial authorization")
+	}
+
+	s.enrollmentMu.Lock()
+	s.managedDevices[deviceID] = managedDevice{
+		ID: deviceID, OwnerSubject: "feidu-user:42", SecretHash: "unused",
+		CredentialVersion: 2, RevokedAt: time.Now(),
+	}
+	s.enrollmentMu.Unlock()
+	stale := &ClientConn{ID: deviceID, RequestedID: deviceID}
+	if _, _, _, registered := s.registerClientIfAuthorizationCurrent(stale, ""); registered {
+		t.Fatal("stale unmanaged authorization registered over a revoked managed device")
+	}
+	if client := s.clientByID(deviceID); client != nil {
+		t.Fatal("stale unmanaged authorization created an online client")
+	}
+}
+
+func TestPersistentReEnrollmentRejectsRevokedManagedDevice(t *testing.T) {
+	now := time.Date(2026, 9, 4, 10, 30, 0, 0, time.UTC)
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.enrollmentNow = func() time.Time { return now }
+	if err := s.ConfigureEnrollmentStore(filepath.Join(t.TempDir(), "managed_devices.json"), "https://rdev.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	firstInvite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
+	first := redeemEnrollmentForTest(t, s, firstInvite.Code, "revoked-device")
+	if err := s.revokeManagedDevice(first.DeviceID); err != nil {
+		t.Fatal(err)
+	}
+	secondInvite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
+	body, err := json.Marshal(enrollmentRedeemRequest{
+		Code: secondInvite.Code, DeviceID: first.DeviceID, ReplaceExisting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	s.HandleEnrollmentRedeemAPI(response, httptest.NewRequest(http.MethodPost, "/api/enrollments/redeem", bytes.NewReader(body)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("revoked replacement status = %d, want 409", response.Code)
+	}
+	if allowed, managed := s.authorizeManagedRegistration(first.DeviceID, first.DeviceSecret); !managed || allowed {
+		t.Fatal("revoked device became authorized")
+	}
+	if status := getEnrollmentStatusForTest(t, s, secondInvite.EnrollmentID); status.State != "active" {
+		t.Fatalf("revoked replacement consumed the invitation: %#v", status)
+	}
+}
+
+func TestPersistentReEnrollmentRejectsUnmanagedOnlineDevice(t *testing.T) {
+	now := time.Date(2026, 9, 4, 11, 0, 0, 0, time.UTC)
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.enrollmentNow = func() time.Time { return now }
+	if err := s.ConfigureEnrollmentStore(filepath.Join(t.TempDir(), "managed_devices.json"), "https://rdev.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	transport := &enrollmentTestTransport{closed: make(chan string, 1)}
+	s.mu.Lock()
+	s.clients["legacy-online"] = &ClientConn{
+		ID: "legacy-online", RequestedID: "legacy-online", InstanceID: "legacy-instance", Transport: transport,
+	}
+	s.mu.Unlock()
+	invite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
+	body, err := json.Marshal(enrollmentRedeemRequest{
+		Code: invite.Code, DeviceID: "legacy-online", ReplaceExisting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	s.HandleEnrollmentRedeemAPI(response, httptest.NewRequest(http.MethodPost, "/api/enrollments/redeem", bytes.NewReader(body)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("unmanaged online replacement status = %d, want 409", response.Code)
+	}
+	if _, managed := s.authorizeManagedRegistration("legacy-online", "unused"); managed {
+		t.Fatal("unmanaged online device became managed")
+	}
+	if status := getEnrollmentStatusForTest(t, s, invite.EnrollmentID); status.State != "active" {
+		t.Fatalf("unmanaged replacement consumed the invitation: %#v", status)
+	}
+	select {
+	case reason := <-transport.closed:
+		t.Fatalf("unmanaged online device was disconnected: %q", reason)
+	default:
+	}
+}
+
 func TestEnrollmentExpiryAndStrictJSON(t *testing.T) {
 	now := time.Date(2026, 9, 3, 9, 0, 0, 0, time.UTC)
 	s := NewServer()
@@ -269,7 +631,8 @@ func TestManagedDeviceRotateRevokeAndRestart(t *testing.T) {
 		ID: redeemed.DeviceID, RequestedID: redeemed.DeviceID, InstanceID: "connected-instance", Transport: transport,
 	}
 	s.mu.Unlock()
-	ticketHash := sha256.Sum256([]byte("temporary-access-ticket"))
+	ticketValue := "rdvat_temporary-access-ticket"
+	ticketHash := sha256.Sum256([]byte(ticketValue))
 	s.accessTicketMu.Lock()
 	s.accessTickets[ticketHash] = accessTicket{DeviceID: redeemed.DeviceID, InstanceID: "connected-instance", ExpiresAt: now.Add(time.Hour)}
 	s.accessTicketMu.Unlock()
@@ -303,11 +666,12 @@ func TestManagedDeviceRotateRevokeAndRestart(t *testing.T) {
 	default:
 		t.Fatal("rotated device connection was not closed")
 	}
-	s.accessTicketMu.Lock()
-	remainingTickets := len(s.accessTickets)
-	s.accessTicketMu.Unlock()
-	if remainingTickets != 0 {
-		t.Fatalf("access tickets after rotation = %d, want 0", remainingTickets)
+	if _, connected := s.GetClient(redeemed.DeviceID); connected {
+		t.Fatal("rotated device remained in the online registry")
+	}
+	oldClient := &ClientConn{ID: redeemed.DeviceID, InstanceID: "connected-instance"}
+	if s.accessTicketValid(oldClient, ticketValue) {
+		t.Fatal("access ticket remained usable after secret rotation")
 	}
 	registryBytes, err := os.ReadFile(registryPath)
 	if err != nil {
@@ -345,6 +709,58 @@ func TestManagedDeviceRotateRevokeAndRestart(t *testing.T) {
 	}
 	if allowed, managed := restarted.authorizeManagedRegistration(redeemed.DeviceID, rotated.DeviceSecret); !managed || allowed {
 		t.Fatal("restarted registry accepted a revoked device")
+	}
+}
+
+func TestManagedDeviceRotationInvalidatesPersistedAccessTicketAcrossRestart(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 30, 0, 0, time.UTC)
+	dataDir := t.TempDir()
+	registryPath := filepath.Join(dataDir, "managed_devices.json")
+	ticketPath := filepath.Join(dataDir, "access_tickets.json")
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.enrollmentNow = func() time.Time { return now }
+	s.accessTicketNow = func() time.Time { return now }
+	if err := s.ConfigureEnrollmentStore(registryPath, "https://rdev.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ConfigureAccessTicketStore(ticketPath); err != nil {
+		t.Fatal(err)
+	}
+	invite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
+	redeemed := redeemEnrollmentForTest(t, s, invite.Code, "persisted-ticket-device")
+	client := &ClientConn{
+		ID: redeemed.DeviceID, RequestedID: redeemed.DeviceID, InstanceID: "instance-one",
+		Password: "device-password", Managed: true,
+	}
+	s.clients[client.ID] = client
+	ticketValue := issueAccessTicketWithSubject(t, s, client.ID, "feidu-user:42", 600)
+
+	rotateRequest := httptest.NewRequest(http.MethodPost, "/api/control/devices/"+client.ID+"/rotate-secret", nil)
+	rotateRequest.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	rotateResponse := httptest.NewRecorder()
+	s.HandleManagedDeviceLifecycleAPI(rotateResponse, rotateRequest)
+	if rotateResponse.Code != http.StatusOK {
+		t.Fatalf("rotate status = %d, body = %q", rotateResponse.Code, rotateResponse.Body.String())
+	}
+	if s.accessTicketValid(client, ticketValue) {
+		t.Fatal("rotated device accepted its previous access ticket")
+	}
+
+	reloaded := NewServer()
+	reloaded.enrollmentNow = func() time.Time { return now }
+	reloaded.accessTicketNow = func() time.Time { return now }
+	if err := reloaded.ConfigureEnrollmentStore(registryPath, "https://rdev.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reloaded.ConfigureAccessTicketStore(ticketPath); err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.accessTickets) != 1 {
+		t.Fatalf("persisted stale ticket count = %d, want 1", len(reloaded.accessTickets))
+	}
+	if reloaded.accessTicketValid(client, ticketValue) {
+		t.Fatal("server restart restored an access ticket from an older device credential version")
 	}
 }
 

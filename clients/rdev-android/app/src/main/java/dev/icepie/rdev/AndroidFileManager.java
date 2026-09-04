@@ -194,7 +194,7 @@ final class AndroidFileManager {
         String path = canonicalPath(msg.optString("path", ""));
         try {
             File file = new File(path);
-            deleteRecursive(file, msg.optBoolean("recursive", msg.optBoolean("success", true)));
+            deleteRecursive(file, msg.optBoolean("recursive", false));
             sendOpResult("file_delete_result", requestId, path, true, "");
         } catch (Exception e) {
             sendOpResult("file_delete_result", requestId, path, false, e.getMessage());

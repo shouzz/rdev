@@ -35,18 +35,22 @@ func TestRedeemEnrollmentUsesExactResponse(t *testing.T) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/enrollments/redeem" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
-		var input map[string]string
+		var input struct {
+			Code            string `json:"code"`
+			DeviceID        string `json:"deviceId"`
+			ReplaceExisting bool   `json:"replaceExisting"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			t.Fatal(err)
 		}
-		if input["code"] != "one-time" || input["deviceId"] != "workstation" {
+		if input.Code != "one-time" || input.DeviceID != "workstation" || !input.ReplaceExisting {
 			t.Fatalf("request body = %#v", input)
 		}
 		_ = json.NewEncoder(w).Encode(enrollmentResult{DeviceID: "workstation", DeviceSecret: "device-secret", ServerURL: "https://rdev.example.com"})
 	}))
 	defer server.Close()
 
-	result, err := redeemEnrollment(server.URL, "one-time", "workstation")
+	result, err := redeemEnrollment(server.URL, "one-time", "workstation", true)
 	if err != nil {
 		t.Fatal(err)
 	}

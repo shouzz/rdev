@@ -24,20 +24,22 @@ import (
 
 // SSHServer wraps the gliderlabs SSH server
 type SSHServer struct {
-	server     *ssh.Server
-	srv        *Server
-	hostKey    gossh.Signer
-	authKeys   []gossh.PublicKey
-	authKeysMu sync.RWMutex
-	fwdHandler *ForwardedTCPHandler // for -R port forwarding
+	server              *ssh.Server
+	srv                 *Server
+	hostKey             gossh.Signer
+	authKeys            []gossh.PublicKey
+	authKeysMu          sync.RWMutex
+	fwdHandler          *ForwardedTCPHandler // for -R port forwarding
+	ticketConnectionsMu sync.Mutex
+	ticketConnections   map[string]map[string]io.Closer
 }
 
 type sshContextKey struct{}
 
 var sshDeviceAuthorizationKey sshContextKey
 
-func bindSSHDeviceAuthorization(ctx ssh.Context, client *ClientConn) {
-	ctx.SetValue(sshDeviceAuthorizationKey, deviceAuthorizationFor(client))
+func bindSSHDeviceAuthorization(ctx ssh.Context, authorization deviceAuthorization) {
+	ctx.SetValue(sshDeviceAuthorizationKey, authorization)
 }
 
 func (s *Server) authorizedSSHClient(ctx ssh.Context) (*ClientConn, bool) {
@@ -49,15 +51,106 @@ func (s *Server) authorizedSSHClient(ctx ssh.Context) (*ClientConn, bool) {
 		return nil, false
 	}
 	client, ok := s.GetClient(ctx.User())
-	if !ok || !authorization.validFor(client) {
+	if !ok || !s.deviceAuthorizationValid(authorization, client) {
 		return nil, false
 	}
 	return client, true
 }
 
+func (s *SSHServer) trackTicketConnection(ticketID, connectionID string, connection io.Closer) bool {
+	if ticketID == "" || connectionID == "" || connection == nil {
+		return false
+	}
+	s.ticketConnectionsMu.Lock()
+	defer s.ticketConnectionsMu.Unlock()
+	if s.ticketConnections == nil {
+		s.ticketConnections = make(map[string]map[string]io.Closer)
+	}
+	if s.ticketConnections[ticketID] == nil {
+		s.ticketConnections[ticketID] = make(map[string]io.Closer)
+	}
+	if _, exists := s.ticketConnections[ticketID][connectionID]; exists {
+		return false
+	}
+	s.ticketConnections[ticketID][connectionID] = connection
+	return true
+}
+
+func (s *SSHServer) untrackTicketConnection(ticketID, connectionID string) {
+	s.ticketConnectionsMu.Lock()
+	defer s.ticketConnectionsMu.Unlock()
+	delete(s.ticketConnections[ticketID], connectionID)
+	if len(s.ticketConnections[ticketID]) == 0 {
+		delete(s.ticketConnections, ticketID)
+	}
+}
+
+func (s *SSHServer) registerTicketConnection(ctx ssh.Context, authorization deviceAuthorization) {
+	if authorization.TicketID == "" || ctx == nil {
+		return
+	}
+	connection, ok := ctx.Value(ssh.ContextKeyConn).(*gossh.ServerConn)
+	if !ok || connection == nil {
+		return
+	}
+	connectionID := ctx.SessionID()
+	if s.trackTicketConnection(authorization.TicketID, connectionID, connection) {
+		go s.watchTicketConnection(authorization.TicketID, connectionID, ctx.Done())
+	}
+}
+
+func (s *SSHServer) watchTicketConnection(ticketID, connectionID string, done <-chan struct{}) {
+	for {
+		expiresAt, ok := s.srv.accessTicketExpiration(ticketID)
+		if !ok {
+			s.closeTicketConnections(ticketID)
+			return
+		}
+		delay := time.Until(expiresAt)
+		if delay <= 0 {
+			s.closeTicketConnections(ticketID)
+			return
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			s.untrackTicketConnection(ticketID, connectionID)
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *SSHServer) authorizedTicketConnection(ctx ssh.Context) (*ClientConn, bool) {
+	authorization, _ := ctx.Value(sshDeviceAuthorizationKey).(deviceAuthorization)
+	s.registerTicketConnection(ctx, authorization)
+	client, authorized := s.srv.authorizedSSHClient(ctx)
+	if !authorized && authorization.TicketID != "" {
+		s.closeTicketConnections(authorization.TicketID)
+	}
+	return client, authorized
+}
+
+func (s *SSHServer) closeTicketConnections(ticketID string) {
+	s.ticketConnectionsMu.Lock()
+	connections := make([]io.Closer, 0, len(s.ticketConnections[ticketID]))
+	for _, connection := range s.ticketConnections[ticketID] {
+		connections = append(connections, connection)
+	}
+	delete(s.ticketConnections, ticketID)
+	s.ticketConnectionsMu.Unlock()
+	for _, connection := range connections {
+		_ = connection.Close()
+	}
+}
+
 // NewSSHServer creates a new SSH server
 func NewSSHServer(srv *Server, addr, hostKeyPath, authorizedKeysPath string) (*SSHServer, error) {
-	s := &SSHServer{srv: srv}
+	s := &SSHServer{srv: srv, ticketConnections: make(map[string]map[string]io.Closer)}
+	s.srv.accessTicketRevoked = s.closeTicketConnections
 
 	signer, err := s.loadOrGenerateHostKey(hostKeyPath)
 	if err != nil {
@@ -95,7 +188,7 @@ func NewSSHServer(srv *Server, addr, hostKeyPath, authorizedKeysPath string) (*S
 		// Allow all port forwarding by default
 		LocalPortForwardingCallback: func(ctx ssh.Context, destAddr string, destPort uint32) bool {
 			clientID := ctx.User()
-			_, ok := srv.authorizedSSHClient(ctx)
+			_, ok := s.authorizedTicketConnection(ctx)
 			if !ok {
 				log.Printf("ssh fwd -L: client %s authorization is no longer valid, denied", clientID)
 				return false
@@ -104,7 +197,7 @@ func NewSSHServer(srv *Server, addr, hostKeyPath, authorizedKeysPath string) (*S
 			return true
 		},
 		ReversePortForwardingCallback: func(ctx ssh.Context, bindAddr string, bindPort uint32) bool {
-			if _, ok := srv.authorizedSSHClient(ctx); !ok {
+			if _, ok := s.authorizedTicketConnection(ctx); !ok {
 				log.Printf("ssh fwd -R: client %s authorization is no longer valid, denied", ctx.User())
 				return false
 			}
@@ -192,14 +285,14 @@ func (s *SSHServer) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	defer s.authKeysMu.RUnlock()
 	for _, authKey := range s.authKeys {
 		if ssh.KeysEqual(key, authKey) {
-			bindSSHDeviceAuthorization(ctx, client)
+			bindSSHDeviceAuthorization(ctx, deviceAuthorizationFor(client))
 			log.Printf("ssh auth: %s authenticated via public key", clientID)
 			return true
 		}
 	}
 	// Legacy open mode is available only when the protected control plane is disabled.
 	if client.Password == "" && !s.srv.secureControlEnabled() {
-		bindSSHDeviceAuthorization(ctx, client)
+		bindSSHDeviceAuthorization(ctx, deviceAuthorizationFor(client))
 		log.Printf("ssh auth: %s accepted (no auth required)", clientID)
 		return true
 	}
@@ -212,8 +305,9 @@ func (s *SSHServer) handlePassword(ctx ssh.Context, pass string) bool {
 	if !ok {
 		return !s.srv.secureControlEnabled()
 	}
-	if s.srv.authorizeDeviceCredential(client, pass) {
-		bindSSHDeviceAuthorization(ctx, client)
+	if authorization, authorized := s.srv.authorizeDeviceCredentialBinding(client, pass); authorized {
+		bindSSHDeviceAuthorization(ctx, authorization)
+		s.registerTicketConnection(ctx, authorization)
 		log.Printf("ssh auth: %s authenticated", clientID)
 		return true
 	}
@@ -228,7 +322,7 @@ func (s *SSHServer) handleKeyboardInteractive(ctx ssh.Context, challenger gossh.
 	}
 	// Legacy open mode is available only when the protected control plane is disabled.
 	if client.Password == "" && !s.srv.secureControlEnabled() {
-		bindSSHDeviceAuthorization(ctx, client)
+		bindSSHDeviceAuthorization(ctx, deviceAuthorizationFor(client))
 		log.Printf("ssh auth: %s accepted via keyboard-interactive (no auth required)", clientID)
 		return true
 	}
@@ -237,8 +331,9 @@ func (s *SSHServer) handleKeyboardInteractive(ctx ssh.Context, challenger gossh.
 	if err != nil || len(answers) == 0 {
 		return false
 	}
-	if s.srv.authorizeDeviceCredential(client, answers[0]) {
-		bindSSHDeviceAuthorization(ctx, client)
+	if authorization, authorized := s.srv.authorizeDeviceCredentialBinding(client, answers[0]); authorized {
+		bindSSHDeviceAuthorization(ctx, authorization)
+		s.registerTicketConnection(ctx, authorization)
 		log.Printf("ssh auth: %s authenticated via keyboard-interactive", clientID)
 		return true
 	}
@@ -261,13 +356,12 @@ func (s *SSHServer) handleSession(sess ssh.Session) {
 		}
 	}()
 	clientID := sess.User()
-	client, ok := s.srv.authorizedSSHClient(sess.Context())
+	client, ok := s.authorizedTicketConnection(sess.Context())
 	if !ok {
 		fmt.Fprintf(sess, "rdev: authorization for client '%s' is no longer valid\n", clientID)
 		sess.Exit(1)
 		return
 	}
-
 	sessionID := generateID()
 	subsystem := sess.Subsystem()
 	ptyReq, winCh, isPty := sess.Pty()
@@ -391,7 +485,7 @@ func (s *SSHServer) handleSession(sess ssh.Session) {
 
 func (s *SSHServer) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx ssh.Context) {
 	clientID := ctx.User()
-	client, ok := s.srv.authorizedSSHClient(ctx)
+	client, ok := s.authorizedTicketConnection(ctx)
 	if !ok {
 		newChan.Reject(gossh.Prohibited, "device authorization is no longer valid")
 		return

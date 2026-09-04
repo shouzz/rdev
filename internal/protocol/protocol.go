@@ -14,7 +14,7 @@ const (
 	// Control (text frames)
 	MsgRegister      MessageType = "register"       // C->S: register with ID + password
 	MsgRegisterError MessageType = "register_error" // S->C: registration rejected
-	MsgNewSession MessageType = "new_session" // S->C: create a proxied SSH session
+	MsgNewSession    MessageType = "new_session"    // S->C: create a proxied SSH session
 
 	MsgStdinClose MessageType = "stdin_close" // S->C: remote closed stdin (EOF)
 	MsgClose      MessageType = "close"       // bidir: session done, clean up
@@ -40,6 +40,12 @@ const (
 	// File manager (text frames for control/metadata, binary for data)
 	MsgFileListRequest    MessageType = "file_list"            // S->C: list a directory
 	MsgFileListResult     MessageType = "file_list_result"     // C->S: directory listing
+	MsgFileMkdir          MessageType = "file_mkdir"           // S->C: create a directory
+	MsgFileMkdirResult    MessageType = "file_mkdir_result"    // C->S: directory creation result
+	MsgFileDelete         MessageType = "file_delete"          // S->C: delete a file or directory
+	MsgFileDeleteResult   MessageType = "file_delete_result"   // C->S: deletion result
+	MsgFileRename         MessageType = "file_rename"          // S->C: rename or move a path
+	MsgFileRenameResult   MessageType = "file_rename_result"   // C->S: rename result
 	MsgFileUploadStart    MessageType = "file_upload_start"    // S->C: prepare resumable upload
 	MsgFileUploadReady    MessageType = "file_upload_ready"    // C->S: upload resume offset
 	MsgFileUploadEnd      MessageType = "file_upload_end"      // S->C: finish upload
@@ -156,16 +162,18 @@ type Message struct {
 	ModTime     string      `json:"modTime,omitempty"`
 	IsDir       bool        `json:"isDir,omitempty"`
 	Truncated   bool        `json:"truncated,omitempty"`
+	Recursive   bool        `json:"recursive,omitempty"`
 	HomePath    string      `json:"homePath,omitempty"`
 	FileEntries []FileEntry `json:"entries,omitempty"`
 
 	// Cloud artifact transfer. TransferToken is only present in the one-time
 	// S->C dispatch and must never be persisted or logged.
-	TransferID    string `json:"transferId,omitempty"`
-	BootstrapURL  string `json:"bootstrapUrl,omitempty"`
-	TransferToken string `json:"transferToken,omitempty"`
-	TransferState string `json:"transferState,omitempty"`
-	BytesDone     int64  `json:"bytesDone,omitempty"`
+	TransferID         string `json:"transferId,omitempty"`
+	TransferGeneration uint64 `json:"transferGeneration,omitempty"`
+	BootstrapURL       string `json:"bootstrapUrl,omitempty"`
+	TransferToken      string `json:"transferToken,omitempty"`
+	TransferState      string `json:"transferState,omitempty"`
+	BytesDone          int64  `json:"bytesDone,omitempty"`
 
 	// Session management
 	SessionType string        `json:"sessionType,omitempty"` // "shell", "exec", "sftp"
@@ -204,6 +212,7 @@ type Message struct {
 
 	// Client log collection
 	LogSupported    bool       `json:"logSupported,omitempty"`
+	CloudTransferV1 bool       `json:"cloudTransferV1,omitempty"`
 	LogEnabled      bool       `json:"logEnabled,omitempty"`
 	LogLevel        string     `json:"logLevel,omitempty"`
 	SampleRate      float64    `json:"sampleRate,omitempty"`

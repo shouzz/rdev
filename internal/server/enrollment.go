@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,6 +30,7 @@ const (
 	enrollmentRequestMaxBytes = 16 * 1024
 	managedDeviceIDMaxBytes   = 128
 	managedDeviceRegistryV2   = "rdev-device-registry.v2"
+	managedDeviceRegistryV3   = "rdev-device-registry.v3"
 )
 
 var (
@@ -47,12 +49,13 @@ type enrollmentInvite struct {
 }
 
 type managedDevice struct {
-	ID           string
-	OwnerSubject string
-	SecretHash   string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	RevokedAt    time.Time
+	ID                string
+	OwnerSubject      string
+	SecretHash        string
+	CredentialVersion uint64
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	RevokedAt         time.Time
 }
 
 type managedDeviceRegistry struct {
@@ -62,12 +65,13 @@ type managedDeviceRegistry struct {
 }
 
 type managedDeviceRegistryRecord struct {
-	ID           string `json:"id"`
-	OwnerSubject string `json:"owner_subject"`
-	SecretHash   string `json:"secret_hash"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
-	RevokedAt    string `json:"revoked_at,omitempty"`
+	ID                string `json:"id"`
+	OwnerSubject      string `json:"owner_subject"`
+	SecretHash        string `json:"secret_hash"`
+	CredentialVersion uint64 `json:"credential_version,omitempty"`
+	CreatedAt         string `json:"created_at"`
+	UpdatedAt         string `json:"updated_at"`
+	RevokedAt         string `json:"revoked_at,omitempty"`
 }
 
 type enrollmentRegistryRecord struct {
@@ -95,8 +99,9 @@ type enrollmentCreateResponse struct {
 }
 
 type enrollmentRedeemRequest struct {
-	Code     string `json:"code"`
-	DeviceID string `json:"deviceId"`
+	Code            string `json:"code"`
+	DeviceID        string `json:"deviceId"`
+	ReplaceExisting bool   `json:"replaceExisting"`
 }
 
 type enrollmentRedeemResponse struct {
@@ -321,37 +326,109 @@ func (s *Server) HandleEnrollmentRedeemAPI(w http.ResponseWriter, r *http.Reques
 	hash := sha256.Sum256([]byte(input.Code))
 	now := s.enrollmentCurrentTime()
 	s.enrollmentMu.Lock()
-	defer s.enrollmentMu.Unlock()
 	invite, ok := s.enrollments[hash]
 	if !ok || !invite.ExpiresAt.After(now) || !invite.ConsumedAt.IsZero() || !invite.RevokedAt.IsZero() {
+		s.enrollmentMu.Unlock()
 		http.Error(w, "invalid or expired enrollment", http.StatusUnauthorized)
 		return
 	}
 	secret, err := newDeviceSecret()
 	if err != nil {
+		s.enrollmentMu.Unlock()
 		http.Error(w, "device secret generation failed", http.StatusInternalServerError)
 		return
 	}
-	assignedID := s.nextManagedDeviceIDLocked(input.DeviceID)
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.DefaultCost)
 	if err != nil {
+		s.enrollmentMu.Unlock()
 		http.Error(w, "device secret hash failed", http.StatusInternalServerError)
 		return
 	}
-	storedAt := now.UTC().Truncate(time.Second)
-	s.managedDevices[assignedID] = managedDevice{
-		ID: assignedID, OwnerSubject: invite.Subject, SecretHash: string(passwordHash), CreatedAt: storedAt, UpdatedAt: storedAt,
+	assignedID := input.DeviceID
+	originalDevice, deviceExists := s.managedDevices[input.DeviceID]
+	replacing := false
+	type replacedConnection struct {
+		id     string
+		client *ClientConn
 	}
+	replacedConnections := make([]replacedConnection, 0, 1)
+	if input.ReplaceExisting {
+		if deviceExists {
+			if originalDevice.OwnerSubject != invite.Subject {
+				s.enrollmentMu.Unlock()
+				http.Error(w, "managed device replacement is not allowed", http.StatusConflict)
+				return
+			}
+			if !originalDevice.RevokedAt.IsZero() {
+				s.enrollmentMu.Unlock()
+				http.Error(w, errManagedDeviceRevoked.Error(), http.StatusConflict)
+				return
+			}
+			replacing = true
+			s.mu.RLock()
+			for id, client := range s.clients {
+				if client.RequestedID == input.DeviceID || (client.RequestedID == "" && client.ID == input.DeviceID) {
+					replacedConnections = append(replacedConnections, replacedConnection{id: id, client: client})
+				}
+			}
+			s.mu.RUnlock()
+		} else if s.clientByID(input.DeviceID) != nil {
+			s.enrollmentMu.Unlock()
+			http.Error(w, "managed device replacement is not allowed", http.StatusConflict)
+			return
+		}
+	} else {
+		assignedID = s.nextManagedDeviceIDLocked(input.DeviceID)
+	}
+	storedAt := now.UTC().Truncate(time.Second)
+	updatedDevice := managedDevice{
+		ID: assignedID, OwnerSubject: invite.Subject, SecretHash: string(passwordHash), CredentialVersion: 1,
+		CreatedAt: storedAt, UpdatedAt: storedAt,
+	}
+	if replacing {
+		updatedDevice.CreatedAt = originalDevice.CreatedAt
+		updatedDevice.CredentialVersion, err = nextManagedDeviceCredentialVersion(originalDevice.CredentialVersion)
+		if err != nil {
+			s.enrollmentMu.Unlock()
+			http.Error(w, "managed device credential version exhausted", http.StatusConflict)
+			return
+		}
+	}
+	s.managedDevices[assignedID] = updatedDevice
 	invite.ConsumedAt = storedAt
 	invite.IssuedDeviceID = assignedID
 	s.enrollments[hash] = invite
 	if err = s.persistManagedDeviceRegistryLocked(); err != nil {
-		delete(s.managedDevices, assignedID)
+		if replacing {
+			s.managedDevices[assignedID] = originalDevice
+		} else {
+			delete(s.managedDevices, assignedID)
+		}
 		invite.ConsumedAt = time.Time{}
 		invite.IssuedDeviceID = ""
 		s.enrollments[hash] = invite
+		s.enrollmentMu.Unlock()
 		http.Error(w, "managed device registry write failed", http.StatusInternalServerError)
 		return
+	}
+	if replacing {
+		s.mu.Lock()
+		for _, connected := range replacedConnections {
+			if s.clients[connected.id] == connected.client {
+				delete(s.clients, connected.id)
+			}
+		}
+		s.mu.Unlock()
+	}
+	s.enrollmentMu.Unlock()
+	if replacing {
+		s.invalidateAccessTicketConnectionsForDevice(input.DeviceID)
+		for _, connected := range replacedConnections {
+			closeClientResources(s, connected.client)
+			if connected.client.Transport != nil {
+				_ = connected.client.Transport.Close("managed device replaced")
+			}
+		}
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
@@ -508,6 +585,10 @@ func (s *Server) rotateManagedDeviceSecret(deviceID string) (string, time.Time, 
 	}
 	original := device
 	device.SecretHash = string(secretHash)
+	device.CredentialVersion, err = nextManagedDeviceCredentialVersion(device.CredentialVersion)
+	if err != nil {
+		return "", time.Time{}, err
+	}
 	device.UpdatedAt = now
 	s.managedDevices[deviceID] = device
 	if err = s.persistManagedDeviceRegistryLocked(); err != nil {
@@ -529,6 +610,11 @@ func (s *Server) revokeManagedDevice(deviceID string) error {
 		return nil
 	}
 	original := device
+	var err error
+	device.CredentialVersion, err = nextManagedDeviceCredentialVersion(device.CredentialVersion)
+	if err != nil {
+		return err
+	}
 	device.RevokedAt = now
 	device.UpdatedAt = now
 	s.managedDevices[deviceID] = device
@@ -541,35 +627,34 @@ func (s *Server) revokeManagedDevice(deviceID string) error {
 
 func (s *Server) disconnectManagedDevice(deviceID, reason string) {
 	type connectedTransport struct {
-		id        string
-		transport DeviceTransport
+		client *ClientConn
 	}
-	s.mu.RLock()
+	s.mu.Lock()
 	connected := make([]connectedTransport, 0, 1)
 	for id, client := range s.clients {
 		if client.RequestedID == deviceID || (client.RequestedID == "" && client.ID == deviceID) {
-			connected = append(connected, connectedTransport{id: id, transport: client.Transport})
+			connected = append(connected, connectedTransport{client: client})
+			delete(s.clients, id)
 		}
 	}
-	s.mu.RUnlock()
+	s.mu.Unlock()
+	s.invalidateAccessTicketConnectionsForDevice(deviceID)
 	if len(connected) == 0 {
 		return
 	}
-	s.accessTicketMu.Lock()
-	for hash, ticket := range s.accessTickets {
-		for _, client := range connected {
-			if ticket.DeviceID == client.id {
-				delete(s.accessTickets, hash)
-				break
-			}
+	for _, connectedClient := range connected {
+		closeClientResources(s, connectedClient.client)
+		if connectedClient.client.Transport != nil {
+			_ = connectedClient.client.Transport.Close(reason)
 		}
 	}
-	s.accessTicketMu.Unlock()
-	for _, client := range connected {
-		if client.transport != nil {
-			_ = client.transport.Close(reason)
-		}
+}
+
+func nextManagedDeviceCredentialVersion(current uint64) (uint64, error) {
+	if current == 0 || current == math.MaxUint64 {
+		return 0, errors.New("managed device credential version is invalid")
 	}
+	return current + 1, nil
 }
 
 func (s *Server) authorizeManagedRegistration(deviceID, secret string) (bool, bool) {
@@ -589,7 +674,25 @@ func (s *Server) managedDeviceOwnerMatches(deviceID, subject string) bool {
 	s.enrollmentMu.Lock()
 	device, managed := s.managedDevices[deviceID]
 	s.enrollmentMu.Unlock()
-	return !managed || (device.RevokedAt.IsZero() && device.OwnerSubject == subject)
+	if !managed {
+		return false
+	}
+	if !device.RevokedAt.IsZero() {
+		return false
+	}
+	return managedDeviceOwnerSubjectMatches(device.OwnerSubject, subject)
+}
+
+func managedDeviceOwnerSubjectMatches(ownerSubject, subject string) bool {
+	if ownerSubject == subject {
+		return true
+	}
+	const ownerPrefix = "feidu-user:"
+	const browserPrefix = "feidu-browser:"
+	return strings.HasPrefix(ownerSubject, ownerPrefix) &&
+		strings.HasPrefix(subject, browserPrefix) &&
+		strings.TrimPrefix(ownerSubject, ownerPrefix) != "" &&
+		strings.TrimPrefix(ownerSubject, ownerPrefix) == strings.TrimPrefix(subject, browserPrefix)
 }
 
 func (s *Server) managedDeviceOwner(deviceID string) string {
@@ -687,7 +790,7 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 	if err = decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return errors.New("decode managed device registry: trailing data")
 	}
-	if registry.Schema != managedDeviceRegistryV2 {
+	if registry.Schema != managedDeviceRegistryV2 && registry.Schema != managedDeviceRegistryV3 {
 		return errors.New("managed device registry schema is invalid")
 	}
 	for _, record := range registry.Devices {
@@ -699,6 +802,13 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 		}
 		if _, hashErr := bcrypt.Cost([]byte(record.SecretHash)); hashErr != nil {
 			return errors.New("managed device registry secret hash is invalid")
+		}
+		credentialVersion := record.CredentialVersion
+		if registry.Schema == managedDeviceRegistryV2 {
+			credentialVersion = 1
+		}
+		if credentialVersion == 0 {
+			return errors.New("managed device registry credential_version is invalid")
 		}
 		createdAt, parseErr := parseRegistryTime(record.CreatedAt, true)
 		if parseErr != nil {
@@ -720,7 +830,7 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 		}
 		s.managedDevices[record.ID] = managedDevice{
 			ID: record.ID, OwnerSubject: record.OwnerSubject, SecretHash: record.SecretHash,
-			CreatedAt: createdAt, UpdatedAt: updatedAt, RevokedAt: revokedAt,
+			CredentialVersion: credentialVersion, CreatedAt: createdAt, UpdatedAt: updatedAt, RevokedAt: revokedAt,
 		}
 	}
 	seenEnrollmentIDs := make(map[string]struct{}, len(registry.Enrollments))
@@ -795,14 +905,15 @@ func (s *Server) persistManagedDeviceRegistryLocked() error {
 	}
 	sort.Strings(ids)
 	registry := managedDeviceRegistry{
-		Schema: managedDeviceRegistryV2, Devices: make([]managedDeviceRegistryRecord, 0, len(ids)),
+		Schema: managedDeviceRegistryV3, Devices: make([]managedDeviceRegistryRecord, 0, len(ids)),
 		Enrollments: make([]enrollmentRegistryRecord, 0, len(s.enrollments)),
 	}
 	for _, id := range ids {
 		device := s.managedDevices[id]
 		record := managedDeviceRegistryRecord{
 			ID: id, OwnerSubject: device.OwnerSubject, SecretHash: device.SecretHash,
-			CreatedAt: device.CreatedAt.UTC().Format(time.RFC3339), UpdatedAt: device.UpdatedAt.UTC().Format(time.RFC3339),
+			CredentialVersion: device.CredentialVersion,
+			CreatedAt:         device.CreatedAt.UTC().Format(time.RFC3339), UpdatedAt: device.UpdatedAt.UTC().Format(time.RFC3339),
 		}
 		if !device.RevokedAt.IsZero() {
 			record.RevokedAt = device.RevokedAt.UTC().Format(time.RFC3339)

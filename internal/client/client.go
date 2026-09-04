@@ -234,7 +234,7 @@ type Client struct {
 	uploads         map[string]*managedUpload
 	downloads       map[string]chan struct{}
 	desktopSessions map[string]*desktopSession
-	cloudTransfers  map[string]struct{}
+	cloudTransfers  map[string]*cloudTransferRun
 	mu              sync.Mutex
 	done            chan struct{}
 	reconnectReset  chan struct{}
@@ -335,7 +335,7 @@ func NewClient(serverURL, clientID, password, shell string) *Client {
 		uploads:         make(map[string]*managedUpload),
 		downloads:       make(map[string]chan struct{}),
 		desktopSessions: make(map[string]*desktopSession),
-		cloudTransfers:  make(map[string]struct{}),
+		cloudTransfers:  make(map[string]*cloudTransferRun),
 		done:            make(chan struct{}, 1),
 		reconnectReset:  make(chan struct{}, 1),
 		reconnectMin:    defaultReconnectMin,
@@ -1030,6 +1030,12 @@ func (c *Client) handleMessage(msg *protocol.Message) {
 		c.handleTCPClose(msg)
 	case protocol.MsgFileListRequest:
 		go c.handleFileListRequest(msg)
+	case protocol.MsgFileMkdir:
+		go c.handleFileMkdir(msg)
+	case protocol.MsgFileDelete:
+		go c.handleFileDelete(msg)
+	case protocol.MsgFileRename:
+		go c.handleFileRename(msg)
 	case protocol.MsgFileUploadStart:
 		go c.handleManagedUploadStart(msg)
 	case protocol.MsgFileUploadEnd:
@@ -1055,7 +1061,7 @@ func (c *Client) registrationMessage() *protocol.Message {
 	return &protocol.Message{
 		Type: protocol.MsgRegister, ClientID: c.requestedID, InstanceID: c.instanceID,
 		ClientVersion: c.version, Password: c.password, DeviceSecret: c.deviceSecret,
-		DesktopCapabilities: desktopCapabilities(), LogSupported: true,
+		DesktopCapabilities: desktopCapabilities(), LogSupported: true, CloudTransferV1: true,
 	}
 }
 
@@ -1147,14 +1153,85 @@ func listFileEntries(path string, limit int) ([]protocol.FileEntry, bool, error)
 	return entries, truncated, nil
 }
 
-func safeJoinFile(dir, name string) string {
-	if name == "" {
-		return filepath.Clean(dir)
+func safeJoinFile(dir, name string) (string, error) {
+	if name == "" || name == "." || name == ".." || filepath.IsAbs(name) || filepath.VolumeName(name) != "" ||
+		strings.ContainsAny(name, `/\`) || filepath.Base(name) != name {
+		return "", errors.New("file name must be one path segment")
 	}
-	if filepath.IsAbs(name) {
-		return filepath.Clean(name)
+	return filepath.Join(defaultFilePath(dir), name), nil
+}
+
+func (c *Client) sendFileOpResult(typ protocol.MessageType, requestID, path string, err error) {
+	result := &protocol.Message{Type: typ, RequestID: requestID, Path: path, Success: err == nil}
+	if err != nil {
+		result.Error = err.Error()
 	}
-	return filepath.Join(defaultFilePath(dir), filepath.Base(name))
+	c.send(result)
+}
+
+func (c *Client) handleFileMkdir(msg *protocol.Message) {
+	path := msg.Path
+	if path == "" && (msg.ParentPath != "" || msg.Name != "") {
+		var err error
+		path, err = safeJoinFile(msg.ParentPath, msg.Name)
+		if err != nil {
+			c.sendFileOpResult(protocol.MsgFileMkdirResult, msg.RequestID, "", err)
+			return
+		}
+	}
+	if path == "" {
+		c.sendFileOpResult(protocol.MsgFileMkdirResult, msg.RequestID, "", errors.New("missing directory path"))
+		return
+	}
+	path = filepath.Clean(path)
+	err := os.MkdirAll(path, 0755)
+	c.sendFileOpResult(protocol.MsgFileMkdirResult, msg.RequestID, path, err)
+}
+
+func (c *Client) handleFileDelete(msg *protocol.Message) {
+	if msg.Path == "" {
+		c.sendFileOpResult(protocol.MsgFileDeleteResult, msg.RequestID, "", errors.New("missing delete path"))
+		return
+	}
+	path := filepath.Clean(msg.Path)
+	var err error
+	if msg.Recursive {
+		err = os.RemoveAll(path)
+	} else {
+		err = os.Remove(path)
+	}
+	c.sendFileOpResult(protocol.MsgFileDeleteResult, msg.RequestID, path, err)
+}
+
+func (c *Client) handleFileRename(msg *protocol.Message) {
+	if msg.Path == "" {
+		c.sendFileOpResult(protocol.MsgFileRenameResult, msg.RequestID, "", errors.New("missing source path"))
+		return
+	}
+	target := msg.FilePath
+	if target == "" && (msg.ParentPath != "" || msg.Name != "") {
+		var err error
+		target, err = safeJoinFile(msg.ParentPath, msg.Name)
+		if err != nil {
+			c.sendFileOpResult(protocol.MsgFileRenameResult, msg.RequestID, filepath.Clean(msg.Path), err)
+			return
+		}
+	}
+	source := filepath.Clean(msg.Path)
+	if target == "" {
+		c.sendFileOpResult(protocol.MsgFileRenameResult, msg.RequestID, source, errors.New("missing target path"))
+		return
+	}
+	target = filepath.Clean(target)
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		c.sendFileOpResult(protocol.MsgFileRenameResult, msg.RequestID, source, err)
+		return
+	}
+	if err := os.Rename(source, target); err != nil {
+		c.sendFileOpResult(protocol.MsgFileRenameResult, msg.RequestID, source, err)
+		return
+	}
+	c.sendFileOpResult(protocol.MsgFileRenameResult, msg.RequestID, target, nil)
 }
 
 func (c *Client) handleManagedUploadStart(msg *protocol.Message) {
@@ -1164,7 +1241,12 @@ func (c *Client) handleManagedUploadStart(msg *protocol.Message) {
 	}
 	target := msg.Path
 	if target == "" {
-		target = safeJoinFile(msg.ParentPath, msg.Name)
+		var err error
+		target, err = safeJoinFile(msg.ParentPath, msg.Name)
+		if err != nil {
+			c.sendFileTransferError(taskID, "", err.Error())
+			return
+		}
 	}
 	if target == "" {
 		c.sendFileTransferError(taskID, "", "missing target path")

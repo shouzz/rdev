@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -18,12 +19,189 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"rdev/internal/protocol"
 )
 
 const cloudTransferTestID = "12345678-1234-1234-1234-1234567890ab"
 
+type cloudTransferMessageTransport struct {
+	mu       sync.Mutex
+	messages [][]byte
+}
+
+func (t *cloudTransferMessageTransport) WriteJSON(data []byte) error {
+	t.mu.Lock()
+	t.messages = append(t.messages, append([]byte(nil), data...))
+	t.mu.Unlock()
+	return nil
+}
+
+func (*cloudTransferMessageTransport) WriteBinary([]byte) error { return nil }
+func (*cloudTransferMessageTransport) WritePing([]byte) error   { return nil }
+func (*cloudTransferMessageTransport) Close(string) error       { return nil }
+
+func (t *cloudTransferMessageTransport) decoded(tst *testing.T) []*protocol.Message {
+	tst.Helper()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	result := make([]*protocol.Message, 0, len(t.messages))
+	for _, raw := range t.messages {
+		message, err := protocol.Decode(raw)
+		if err != nil {
+			tst.Fatalf("decode cloud transfer result: %v", err)
+		}
+		result = append(result, message)
+	}
+	return result
+}
+
 func cloudTransferTestToken() string {
 	return "fdtx_" + base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
+}
+
+func TestCloudTransferHTTPClientsAreReused(t *testing.T) {
+	if cloudTransferAPIClient() != cloudTransferAPIClient() {
+		t.Fatal("cloud transfer API client was recreated")
+	}
+	if cloudTransferDataClient(false) != cloudTransferDataClient(false) {
+		t.Fatal("cloud transfer upload client was recreated")
+	}
+	if cloudTransferDownloadClient() != cloudTransferDownloadClient() {
+		t.Fatal("cloud transfer download client was recreated")
+	}
+	if cloudTransferDataClient(false) == cloudTransferDownloadClient() {
+		t.Fatal("upload and redirecting download clients were not separated")
+	}
+}
+
+func TestCloudTransferSameGenerationRedispatchAcknowledgesExistingRun(t *testing.T) {
+	client := NewClient("wss://rdev.example.com", "device", "", "")
+	transport := &cloudTransferMessageTransport{}
+	client.transport = transport
+	runContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bootstrapURL := "https://pan.feidu.fit/device/v1/rdev-transfers/" + cloudTransferTestID
+	tokenHash := sha256.Sum256([]byte(cloudTransferTestToken()))
+	client.cloudTransfers[cloudTransferTestID] = &cloudTransferRun{
+		transferID: cloudTransferTestID, generation: 4, bootstrapURL: bootstrapURL, tokenHash: tokenHash,
+		ctx: runContext, cancel: cancel,
+		state: "running", requestIDs: make(map[string]struct{}),
+	}
+	client.handleCloudTransferStart(&protocol.Message{
+		Type: protocol.MsgCloudTransferStart, RequestID: strings.Repeat("1", 32),
+		TransferID: cloudTransferTestID, TransferGeneration: 4,
+		BootstrapURL:  bootstrapURL,
+		TransferToken: cloudTransferTestToken(),
+	})
+	messages := transport.decoded(t)
+	if len(messages) != 1 || messages[0].Type != protocol.MsgCloudTransferResult ||
+		messages[0].RequestID != strings.Repeat("1", 32) || messages[0].TransferID != cloudTransferTestID ||
+		messages[0].TransferGeneration != 4 || messages[0].TransferState != "running" {
+		t.Fatalf("same-generation ACK = %#v", messages)
+	}
+}
+
+func TestCloudTransferSameGenerationRejectsDifferentCredentialIdentity(t *testing.T) {
+	client := NewClient("wss://rdev.example.com", "device", "", "")
+	transport := &cloudTransferMessageTransport{}
+	client.transport = transport
+	bootstrapURL := "https://pan.feidu.fit/device/v1/rdev-transfers/" + cloudTransferTestID
+	firstToken := cloudTransferTestToken()
+	firstTokenHash := sha256.Sum256([]byte(firstToken))
+	runContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client.cloudTransfers[cloudTransferTestID] = &cloudTransferRun{
+		transferID: cloudTransferTestID, generation: 4, bootstrapURL: bootstrapURL, tokenHash: firstTokenHash,
+		ctx: runContext, cancel: cancel, state: "running", requestIDs: make(map[string]struct{}),
+	}
+	differentToken := "fdtx_" + base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x43}, 32))
+	client.handleCloudTransferStart(&protocol.Message{
+		Type: protocol.MsgCloudTransferStart, RequestID: strings.Repeat("5", 32),
+		TransferID: cloudTransferTestID, TransferGeneration: 4,
+		BootstrapURL: bootstrapURL, TransferToken: differentToken,
+	})
+	messages := transport.decoded(t)
+	if len(messages) != 1 || messages[0].TransferState != "failed" || messages[0].TransferGeneration != 4 {
+		t.Fatalf("mismatched same-generation result = %#v", messages)
+	}
+}
+
+func TestCloudTransferNewGenerationCancelsOldRunAndOldCleanupKeepsNewRun(t *testing.T) {
+	client := NewClient("wss://rdev.example.com", "device", "", "")
+	oldContext, oldCancel := context.WithCancel(context.Background())
+	oldRun := &cloudTransferRun{
+		transferID: cloudTransferTestID, generation: 2, ctx: oldContext, cancel: oldCancel,
+		state: "running", requestIDs: make(map[string]struct{}),
+	}
+	client.cloudTransfers[cloudTransferTestID] = oldRun
+	message := &protocol.Message{
+		Type: protocol.MsgCloudTransferStart, RequestID: strings.Repeat("2", 32),
+		TransferID: cloudTransferTestID, TransferGeneration: 3,
+		BootstrapURL:  "https://pan.feidu.fit/device/v1/rdev-transfers/" + cloudTransferTestID,
+		TransferToken: cloudTransferTestToken(),
+	}
+	newRun, start := client.prepareCloudTransfer(message)
+	if !start || newRun == oldRun || newRun.generation != 3 {
+		t.Fatalf("new generation preparation = run:%#v start:%v", newRun, start)
+	}
+	select {
+	case <-oldContext.Done():
+	default:
+		t.Fatal("new generation did not cancel the old execution context")
+	}
+	if err := client.finishCloudTransfer(oldRun, "failed"); err != nil {
+		t.Fatalf("finish old generation: %v", err)
+	}
+	client.mu.Lock()
+	current := client.cloudTransfers[cloudTransferTestID]
+	client.mu.Unlock()
+	if current != newRun {
+		t.Fatal("old generation cleanup removed the new generation")
+	}
+	newRun.cancel()
+}
+
+func TestCloudTransferStartingGenerationAcknowledgesEveryRedispatchAfterAcceptance(t *testing.T) {
+	client := NewClient("wss://rdev.example.com", "device", "", "")
+	transport := &cloudTransferMessageTransport{}
+	client.transport = transport
+	runContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bootstrapURL := "https://pan.feidu.fit/device/v1/rdev-transfers/" + cloudTransferTestID
+	tokenHash := sha256.Sum256([]byte(cloudTransferTestToken()))
+	run := &cloudTransferRun{
+		transferID: cloudTransferTestID, generation: 5, bootstrapURL: bootstrapURL, tokenHash: tokenHash,
+		ctx: runContext, cancel: cancel,
+		state: "starting", requestIDs: map[string]struct{}{strings.Repeat("3", 32): {}},
+	}
+	client.cloudTransfers[cloudTransferTestID] = run
+	client.handleCloudTransferStart(&protocol.Message{
+		Type: protocol.MsgCloudTransferStart, RequestID: strings.Repeat("4", 32),
+		TransferID: cloudTransferTestID, TransferGeneration: 5,
+		BootstrapURL:  bootstrapURL,
+		TransferToken: cloudTransferTestToken(),
+	})
+	if messages := transport.decoded(t); len(messages) != 0 {
+		t.Fatalf("starting generation acknowledged before acceptance: %#v", messages)
+	}
+	if err := client.publishCloudTransferState(run, "running"); err != nil {
+		t.Fatalf("publish accepted generation: %v", err)
+	}
+	messages := transport.decoded(t)
+	if len(messages) != 2 {
+		t.Fatalf("accepted ACK count = %d, want 2", len(messages))
+	}
+	seen := map[string]bool{}
+	for _, message := range messages {
+		if message.TransferGeneration != 5 || message.TransferState != "running" {
+			t.Fatalf("accepted ACK = %#v", message)
+		}
+		seen[message.RequestID] = true
+	}
+	if !seen[strings.Repeat("3", 32)] || !seen[strings.Repeat("4", 32)] {
+		t.Fatalf("accepted request IDs = %#v", seen)
+	}
 }
 
 func TestCloudDownloadResumesAndStripsAuthorizationOnRedirect(t *testing.T) {

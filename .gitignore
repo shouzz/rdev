@@ -42,3 +42,6 @@ authorized_keys
 
 # Test artifacts
 /tmp/
+/artifacts/
+__pycache__/
+*.py[cod]
