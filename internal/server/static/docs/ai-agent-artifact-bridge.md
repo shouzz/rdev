@@ -167,12 +167,15 @@ python3 tools/feidu-drive.py resume-upload '<session_id>' ./staging/ota.img
 浏览器文件页连接 `wss://<rdev-host>/files`，先发送 JSON `{"op":"auth","deviceId":"<id>","password":"<设备密码>"}`。成功后可使用：
 
 - `{"op":"list","deviceId":"<id>","path":"<目录>","offset":0,"limit":200}`
+- `{"op":"list","deviceId":"<id>","location":"desktop","offset":0,"limit":200}`
 - `{"op":"upload_start","deviceId":"<id>","taskId":"<任务>","parentPath":"<目录>","name":"<文件名>","size":<字节数>}`
 - `{"op":"download_start","deviceId":"<id>","taskId":"<任务>","path":"<文件>","offset":<已接收字节>}`
 - `{"op":"upload_end","taskId":"<任务>","path":"<设备路径>","size":<字节数>}`
 - `{"op":"cancel","taskId":"<任务>","offset":<当前偏移>}`
 
 文件数据使用二进制帧，不使用 Base64 文本帧。帧头为 `[类型 1 字节][任务 ID 长度 1 字节][任务 ID][偏移 8 字节，大端][负载]`；上传块类型为 `0x20`，上传确认 `0x21`，下载块 `0x22`，传输结束 `0x23`，取消 `0x24`。收到 `upload_ready` 后从服务端给出的 `offset` 继续；收到连接断开时保留任务元数据，重连后重新发送 `upload_start`。这部分协议优先用于浏览器或专用 Agent；命令行自动化优先使用 SSH/SCP/SFTP。
+
+`location` 只接受精确值 `home` 或 `desktop`，并且不能与非空 `path` 同时提交。`desktop` 由设备客户端通过操作系统能力解析，浏览器和 Agent 不得拼接桌面目录。响应会原样返回 `location`；缺少该字段表示设备端没有确认语义位置，调用方必须停止，不能回退到猜测路径。
 
 ## 10. Agent 安全和可靠性清单
 

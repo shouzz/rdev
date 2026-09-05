@@ -38,9 +38,9 @@ if ($env:RDEV_MIRRORS) {
 }
 $script:Repo = 'icepie/rdev'
 $script:DefaultControlBase = 'https://r.feidu.fit'
-$script:LocalClientRevision = 'feidu-20260905-sftp-order1'
+$script:LocalClientRevision = 'feidu-20260905-d068a5a'
 $script:LocalWindowsAMD64Asset = 'rdev-client-windows-amd64.exe'
-$script:LocalWindowsAMD64SHA256 = '6bbedb96a4742a3f4cdb85557c610b4e55c5b3ca7b8bd67d96b2c307bdf3728b'
+$script:LocalWindowsAMD64SHA256 = 'c9bc3a25a8d1ebb416b9eab4b07f707b3d2e1d6f7947727928fd8e41bd37ca9c'
 
 function Convert-RDevMirrorUrl([string]$Mirror, [string]$Url) {
     return "https://$Mirror/$Url"

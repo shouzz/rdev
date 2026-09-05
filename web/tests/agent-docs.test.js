@@ -221,9 +221,14 @@ describe("AI Agent artifact bridge", () => {
     expect(instructions).not.toContain("https://r.feidu.fit/api/clients");
   });
 
-  test("Windows launchers prefer the verified SCP-capable client", async () => {
-    const expectedHash =
-      "6bbedb96a4742a3f4cdb85557c610b4e55c5b3ca7b8bd67d96b2c307bdf3728b";
+  test("launchers prefer the verified managed clients", async () => {
+    const expectedRevision = "feidu-20260905-d068a5a";
+    const expectedWindowsHash =
+      "c9bc3a25a8d1ebb416b9eab4b07f707b3d2e1d6f7947727928fd8e41bd37ca9c";
+    const expectedLinuxAMD64Hash =
+      "7677e787606ee090846c01e5d960a5fad2ab028f40ac78c5eb0092591f1ba0f4";
+    const expectedLinuxARM64Hash =
+      "a49d3d5209748435dc59864dedafff6501fe916185ccd8f802b918ac9f507dda";
     const powershell = await readFile(
       resolve(root, "internal/server/static/run.ps1"),
       "utf8",
@@ -235,10 +240,11 @@ describe("AI Agent artifact bridge", () => {
 
     for (const launcher of [powershell, shell]) {
       expect(launcher).toContain("/local-release?asset=");
-      expect(launcher).toContain("feidu-20260905-sftp-order1");
-      expect(launcher).toContain(expectedHash);
+      expect(launcher).toContain(expectedRevision);
+      expect(launcher).toContain(expectedWindowsHash);
     }
-    expect(shell).toContain("feidu-20260905-sftp-order1");
+    expect(shell).toContain(expectedLinuxAMD64Hash);
+    expect(shell).toContain(expectedLinuxARM64Hash);
     expect(shell).toContain("client_supports_managed_enrollment");
     expect(shell).toContain("Trying managed RDev client");
   });
