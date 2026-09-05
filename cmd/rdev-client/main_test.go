@@ -18,6 +18,7 @@ func TestEnrollmentHTTPBase(t *testing.T) {
 		{input: "wss://rdev.example.com/ws", want: "https://rdev.example.com"},
 		{input: "http://127.0.0.1:8080", want: "http://127.0.0.1:8080"},
 		{input: "ws://127.0.0.1:8080/ws", want: "http://127.0.0.1:8080"},
+		{input: "tcp://rdev.example.com:8081,https://rdev.example.com", want: "https://rdev.example.com"},
 	}
 	for _, test := range tests {
 		got, err := enrollmentHTTPBase(test.input)
@@ -27,6 +28,41 @@ func TestEnrollmentHTTPBase(t *testing.T) {
 	}
 	if _, err := enrollmentHTTPBase("tcp://rdev.example.com:8081"); err == nil {
 		t.Fatal("TCP-only enrollment URL was accepted")
+	}
+}
+
+func TestManagedConnectionServerListPrefersExplicitDataTransport(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested string
+		assigned  string
+		want      string
+	}{
+		{
+			name:      "tcp with control endpoint",
+			requested: "tcp://rdev.example.com:8081,https://rdev.example.com",
+			assigned:  "wss://rdev.example.com",
+			want:      "tcp://rdev.example.com:8081,wss://rdev.example.com",
+		},
+		{
+			name:      "kcp and tcp keep order",
+			requested: "kcp://rdev.example.com:8082,tcp://rdev.example.com:8081,https://rdev.example.com",
+			assigned:  "wss://rdev.example.com",
+			want:      "kcp://rdev.example.com:8082,tcp://rdev.example.com:8081,wss://rdev.example.com",
+		},
+		{
+			name:      "web only uses assigned endpoint",
+			requested: "https://control.example.com",
+			assigned:  "wss://rdev.example.com",
+			want:      "wss://rdev.example.com",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := managedConnectionServerList(test.requested, test.assigned); got != test.want {
+				t.Fatalf("managedConnectionServerList(%q, %q) = %q; want %q", test.requested, test.assigned, got, test.want)
+			}
+		})
 	}
 }
 

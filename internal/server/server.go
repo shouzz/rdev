@@ -769,13 +769,6 @@ func (h *wsHandler) handleRegister(socket *gws.Conn, msg *protocol.Message) {
 		return
 	}
 	instanceID := strings.TrimSpace(msg.InstanceID)
-	if managed {
-		if err := h.srv.rebindManagedAccessTickets(clientID, instanceID, passwordFingerprint(msg.Password)); err != nil {
-			_ = socket.WriteMessage(gws.OpcodeText, []byte(`{"type":"register_error","error":"managed device access ticket restore failed"}`))
-			_ = socket.WriteClose(1011, []byte("managed device access ticket restore failed"))
-			return
-		}
-	}
 	client := &ClientConn{
 		ID:              clientID,
 		RequestedID:     clientID,
@@ -795,7 +788,12 @@ func (h *wsHandler) handleRegister(socket *gws.Conn, msg *protocol.Message) {
 	}
 
 	socket.Session().Store("clientID", clientID)
-	old, assignedID, duplicate, authorizationCurrent := h.srv.registerClientIfAuthorizationCurrent(client, msg.DeviceSecret)
+	old, assignedID, duplicate, authorizationCurrent, registerErr := h.srv.registerClientIfAuthorizationCurrent(client, msg.DeviceSecret)
+	if registerErr != nil {
+		_ = socket.WriteMessage(gws.OpcodeText, []byte(`{"type":"register_error","error":"managed device access ticket restore failed"}`))
+		_ = socket.WriteClose(1011, []byte("managed device access ticket restore failed"))
+		return
+	}
 	if !authorizationCurrent {
 		_ = socket.WriteMessage(gws.OpcodeText, []byte(`{"type":"register_error","error":"device authorization changed"}`))
 		_ = socket.WriteClose(1008, []byte("device authorization changed"))
@@ -928,7 +926,7 @@ func (s *Server) registerClient(client *ClientConn) (*ClientConn, string, bool) 
 	return nil, assignedID, true
 }
 
-func (s *Server) registerClientIfAuthorizationCurrent(client *ClientConn, deviceSecret string) (*ClientConn, string, bool, bool) {
+func (s *Server) registerClientIfAuthorizationCurrent(client *ClientConn, deviceSecret string) (*ClientConn, string, bool, bool, error) {
 	s.enrollmentMu.Lock()
 	defer s.enrollmentMu.Unlock()
 	requestedID := strings.TrimSpace(client.RequestedID)
@@ -937,19 +935,27 @@ func (s *Server) registerClientIfAuthorizationCurrent(client *ClientConn, device
 	}
 	device, managed := s.managedDevices[requestedID]
 	if managed && (!device.RevokedAt.IsZero() || !client.Managed) {
-		return nil, "", false, false
+		return nil, "", false, false, nil
 	}
 	if !managed && client.Managed {
-		return nil, "", false, false
+		return nil, "", false, false, nil
 	}
 	if managed && bcrypt.CompareHashAndPassword([]byte(device.SecretHash), []byte(deviceSecret)) != nil {
-		return nil, "", false, false
+		return nil, "", false, false, nil
 	}
 	if managed {
 		client.OwnerSubject = device.OwnerSubject
+		if err := s.rebindManagedAccessTicketsLocked(
+			requestedID,
+			client.InstanceID,
+			passwordFingerprint(client.Password),
+			s.accessTicketCurrentTime(),
+		); err != nil {
+			return nil, "", false, true, err
+		}
 	}
 	old, assignedID, duplicate := s.registerClient(client)
-	return old, assignedID, duplicate, true
+	return old, assignedID, duplicate, true, nil
 }
 
 func (s *Server) nextAvailableClientID(base string) string {
@@ -1146,14 +1152,6 @@ func (s *Server) registerStreamClient(transport DeviceTransport, msg *protocol.M
 		return "", false
 	}
 	instanceID := strings.TrimSpace(msg.InstanceID)
-	if managed {
-		if err := s.rebindManagedAccessTickets(clientID, instanceID, passwordFingerprint(msg.Password)); err != nil {
-			data, _ := protocol.Encode(&protocol.Message{Type: protocol.MsgRegisterError, Error: "managed device access ticket restore failed"})
-			_ = transport.WriteJSON(data)
-			_ = transport.Close("managed device access ticket restore failed")
-			return "", false
-		}
-	}
 	client := &ClientConn{
 		ID:              clientID,
 		RequestedID:     clientID,
@@ -1170,7 +1168,13 @@ func (s *Server) registerStreamClient(transport DeviceTransport, msg *protocol.M
 		Sessions:        make(map[string]*ProxySession),
 		Forwards:        make(map[string]*ProxyForward),
 	}
-	old, assignedID, duplicate, authorizationCurrent := s.registerClientIfAuthorizationCurrent(client, msg.DeviceSecret)
+	old, assignedID, duplicate, authorizationCurrent, registerErr := s.registerClientIfAuthorizationCurrent(client, msg.DeviceSecret)
+	if registerErr != nil {
+		data, _ := protocol.Encode(&protocol.Message{Type: protocol.MsgRegisterError, Error: "managed device access ticket restore failed"})
+		_ = transport.WriteJSON(data)
+		_ = transport.Close("managed device access ticket restore failed")
+		return "", false
+	}
 	if !authorizationCurrent {
 		data, _ := protocol.Encode(&protocol.Message{Type: protocol.MsgRegisterError, Error: "device authorization changed"})
 		_ = transport.WriteJSON(data)

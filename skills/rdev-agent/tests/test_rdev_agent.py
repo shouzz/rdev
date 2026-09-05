@@ -36,12 +36,13 @@ class Handler(BaseHTTPRequestHandler):
     session_id = "11111111-1111-4111-8111-111111111111"
     device_id = "DEVICE-EXACT"
     requests = []
+    response_code = 0
 
     def log_message(self, *_):
         return
 
     def respond(self, data):
-        payload = envelope(data)
+        payload = json.dumps({"code": self.response_code, "message": "test response", "data": data}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -137,6 +138,7 @@ class RDevAgentTest(unittest.TestCase):
     def setUp(self):
         Handler.requests = []
         Handler.renewal_response_token = Handler.missing_token
+        Handler.response_code = 0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -221,6 +223,28 @@ class RDevAgentTest(unittest.TestCase):
         with patcher, self.assertRaisesRegex(rdev_agent.AgentError, "cannot read RDev agent session: UnicodeDecodeError"):
             rdev_agent.read_state(self.state)
 
+    def test_business_error_reports_only_integer_api_code(self):
+        Handler.response_code = 503
+        with self.assertRaisesRegex(rdev_agent.AgentError, r"^service returned API code 503$"):
+            rdev_agent.request_json(
+                self.base,
+                "POST",
+                f"/agent/v1/sessions/{Handler.session_id}/heartbeat",
+                {"size_bytes": 0, "observed_bytes_per_second": 0},
+                Handler.renewal,
+            )
+
+    def test_boolean_api_code_is_rejected_as_an_invalid_envelope(self):
+        Handler.response_code = False
+        with self.assertRaisesRegex(rdev_agent.AgentError, r"^service returned an invalid API envelope$"):
+            rdev_agent.request_json(
+                self.base,
+                "POST",
+                f"/agent/v1/sessions/{Handler.session_id}/heartbeat",
+                {"size_bytes": 0, "observed_bytes_per_second": 0},
+                Handler.renewal,
+            )
+
     def test_start_rejects_mismatched_device_without_writing_state(self):
         deadline = (rdev_agent.dt.datetime.now(rdev_agent.dt.timezone.utc) + rdev_agent.dt.timedelta(minutes=5)).isoformat()
         code, _, errors = self.run_main(["start", "--device", "OTHER", "--claim-expires-at", deadline, "--api-base", self.base, "--rdev-base", self.base], "fdhc_" + "z" * 43 + "\n")
@@ -277,6 +301,69 @@ class RDevAgentTest(unittest.TestCase):
                 rdev_agent.run_maintained_subprocess(self.state, ["controlled"], {})
         self.assertTrue(process.terminated)
         self.assertFalse(process.killed)
+
+    def test_scp_forces_legacy_protocol_before_connection_options(self):
+        state = {"rdev_ticket": Handler.ticket, "ssh_port": 18112}
+        temporary = mock.Mock()
+        environment = {"SSH_ASKPASS_REQUIRE": "force"}
+        args = mock.Mock(state=self.state)
+        with (
+            mock.patch.object(rdev_agent, "maintained_state", return_value=(state, {})),
+            mock.patch.object(rdev_agent.shutil, "which", return_value="scp.exe"),
+            mock.patch.object(rdev_agent, "askpass_environment", return_value=(temporary, environment)),
+            mock.patch.object(rdev_agent, "run_maintained_subprocess", return_value=0) as run,
+        ):
+            code = rdev_agent.run_open_ssh(args, "scp", ["local.bin", "DEVICE-EXACT@example.test:remote.bin"])
+
+        self.assertEqual(code, 0)
+        run.assert_called_once_with(
+            self.state,
+            [
+                "scp.exe", "-P", "18112",
+                "-o", "PasswordAuthentication=yes",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "NumberOfPasswordPrompts=1",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "local.bin", "DEVICE-EXACT@example.test:remote.bin",
+            ],
+            environment,
+        )
+        temporary.cleanup.assert_called_once_with()
+
+    def test_ssh_places_forwarding_options_before_the_device_target(self):
+        args = rdev_agent.build_parser().parse_args([
+            "--state", str(self.state), "ssh",
+            "--local-forward", "127.0.0.1:19080:127.0.0.1:19081",
+            "--remote-forward", "127.0.0.1:19082:127.0.0.1:19083",
+            "--no-command",
+        ])
+        state = {"device_id": Handler.device_id, "rdev_base": "https://r.feidu.fit"}
+        with (
+            mock.patch.object(rdev_agent, "locked_state", return_value=state),
+            mock.patch.object(rdev_agent, "run_open_ssh", return_value=0) as run,
+        ):
+            code = rdev_agent.command_ssh(args)
+
+        self.assertEqual(code, 0)
+        run.assert_called_once_with(
+            args,
+            "ssh",
+            [
+                "-o", "ExitOnForwardFailure=yes",
+                "-L", "127.0.0.1:19080:127.0.0.1:19081",
+                "-R", "127.0.0.1:19082:127.0.0.1:19083",
+                "-N", "DEVICE-EXACT@r.feidu.fit",
+            ],
+        )
+
+    def test_ssh_rejects_no_command_with_remote_command(self):
+        args = rdev_agent.build_parser().parse_args([
+            "--state", str(self.state), "ssh", "--no-command", "--", "hostname",
+        ])
+        state = {"device_id": Handler.device_id, "rdev_base": "https://r.feidu.fit"}
+        with mock.patch.object(rdev_agent, "locked_state", return_value=state):
+            with self.assertRaisesRegex(rdev_agent.AgentError, "cannot be combined"):
+                rdev_agent.command_ssh(args)
 
     def test_wait_for_cancelled_transfer_returns_nonzero(self):
         transfer_id = "33333333-3333-4333-8333-333333333333"

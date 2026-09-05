@@ -215,17 +215,18 @@ Environment variables:
 		if err != nil {
 			log.Fatalf("read device enrollment: %v", err)
 		}
-		result, err := redeemEnrollment(serverURL, enrollmentCode, clientID, replaceExisting)
+		requestedServerURL := serverURL
+		result, err := redeemEnrollment(requestedServerURL, enrollmentCode, clientID, replaceExisting)
 		if err != nil {
 			log.Fatalf("redeem device enrollment: %v", err)
 		}
 		clientID = result.DeviceID
 		deviceSecret = result.DeviceSecret
-		serverURL = result.ServerURL
+		serverURL = managedConnectionServerList(requestedServerURL, result.ServerURL)
 		if identityFile != "" {
 			identity := clientIdentity{
 				Schema:       clientIdentitySchema,
-				ServerURL:    result.ServerURL,
+				ServerURL:    serverURL,
 				ClientID:     result.DeviceID,
 				DeviceID:     result.DeviceID,
 				DeviceSecret: result.DeviceSecret,
@@ -424,25 +425,50 @@ func saveClientIdentity(path string, identity clientIdentity) error {
 }
 
 func enrollmentHTTPBase(serverList string) (string, error) {
-	first := strings.TrimSpace(strings.Split(serverList, ",")[0])
-	parsed, err := url.Parse(first)
-	if err != nil {
-		return "", err
+	for _, value := range strings.Split(serverList, ",") {
+		endpoint := strings.TrimSpace(value)
+		if endpoint == "" {
+			continue
+		}
+		parsed, err := url.Parse(endpoint)
+		if err != nil {
+			return "", err
+		}
+		switch parsed.Scheme {
+		case "https", "http":
+		case "wss":
+			parsed.Scheme = "https"
+		case "ws":
+			parsed.Scheme = "http"
+		default:
+			continue
+		}
+		if parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
+			return "", fmt.Errorf("enrollment server URL is invalid")
+		}
+		parsed.Path = ""
+		return strings.TrimRight(parsed.String(), "/"), nil
 	}
-	switch parsed.Scheme {
-	case "https", "http":
-	case "wss":
-		parsed.Scheme = "https"
-	case "ws":
-		parsed.Scheme = "http"
-	default:
-		return "", fmt.Errorf("enrollment requires an HTTP(S) or WebSocket server URL")
+	return "", fmt.Errorf("enrollment requires an HTTP(S) or WebSocket server URL")
+}
+
+func managedConnectionServerList(requestedServerList, assignedServerURL string) string {
+	dataEndpoints := make([]string, 0)
+	for _, value := range strings.Split(requestedServerList, ",") {
+		endpoint := strings.TrimSpace(value)
+		if endpoint == "" {
+			continue
+		}
+		if !strings.Contains(endpoint, "://") || strings.HasPrefix(endpoint, "tcp://") ||
+			strings.HasPrefix(endpoint, "kcp://") || strings.HasPrefix(endpoint, "udp://") {
+			dataEndpoints = append(dataEndpoints, endpoint)
+		}
 	}
-	if parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
-		return "", fmt.Errorf("enrollment server URL is invalid")
+	if len(dataEndpoints) == 0 {
+		return assignedServerURL
 	}
-	parsed.Path = ""
-	return strings.TrimRight(parsed.String(), "/"), nil
+	dataEndpoints = append(dataEndpoints, assignedServerURL)
+	return strings.Join(dataEndpoints, ",")
 }
 
 func parseBoolDefault(value string, fallback bool) bool {

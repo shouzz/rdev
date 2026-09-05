@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,6 +40,7 @@ var (
 	cloudTransferAPIHTTPClient      = newCloudTransferHTTPClient(false, 30*time.Second)
 	cloudTransferUploadHTTPClient   = newCloudTransferHTTPClient(false, 0)
 	cloudTransferDownloadHTTPClient = newCloudTransferHTTPClient(true, 0)
+	errUnsafeCloudDownloadRedirect  = errors.New("unsafe cloud download redirect")
 )
 
 type cloudTransferRun struct {
@@ -52,10 +54,51 @@ type cloudTransferRun struct {
 	requestIDs   map[string]struct{}
 }
 
+type cloudTransferStageError struct {
+	stage string
+	err   error
+}
+
+func (e *cloudTransferStageError) Error() string { return "cloud transfer " + e.stage + " failed" }
+func (e *cloudTransferStageError) Unwrap() error { return e.err }
+
+func cloudTransferFailure(stage string, err error) error {
+	return &cloudTransferStageError{stage: stage, err: err}
+}
+
+func cloudTransferFailureStage(err error) string {
+	var staged *cloudTransferStageError
+	if errors.As(err, &staged) && staged.stage != "" {
+		return staged.stage
+	}
+	return "unknown"
+}
+
+type cloudTransferCategoryError struct {
+	category string
+	err      error
+}
+
+func (e *cloudTransferCategoryError) Error() string { return "cloud transfer " + e.category + " error" }
+func (e *cloudTransferCategoryError) Unwrap() error { return e.err }
+
+func cloudTransferCategory(category string, err error) error {
+	return &cloudTransferCategoryError{category: category, err: err}
+}
+
+func cloudTransferFailureCategory(err error) string {
+	var categorized *cloudTransferCategoryError
+	if errors.As(err, &categorized) && categorized.category != "" {
+		return categorized.category
+	}
+	return "unknown"
+}
+
 type cloudTransferEnvelope[T any] struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 	Data    T      `json:"data"`
+	TraceID string `json:"traceId,omitempty"`
 }
 
 type cloudTransferPlan struct {
@@ -72,22 +115,41 @@ type cloudTransferPlan struct {
 type cloudUploadPart struct {
 	PartNumber int    `json:"part_number"`
 	Status     string `json:"status,omitempty"`
+	HTTPStatus int    `json:"http_status,omitempty"`
+	UpdatedAt  uint64 `json:"updated_at_ms,omitempty"`
 	UploadURL  string `json:"upload_url,omitempty"`
 }
 
 type cloudUploadSession struct {
-	SessionID   string            `json:"session_id"`
-	OperationID string            `json:"operation_id"`
-	Status      string            `json:"status"`
-	FileName    string            `json:"file_name"`
-	SizeBytes   uint64            `json:"size_bytes"`
-	ModifiedAt  uint64            `json:"modified_at_ms"`
-	ProofStart  uint64            `json:"proof_start"`
-	ProofEnd    uint64            `json:"proof_end"`
-	PartSize    uint64            `json:"part_size"`
-	PartCount   uint              `json:"part_count"`
-	RapidUpload bool              `json:"rapid_upload"`
-	Parts       []cloudUploadPart `json:"parts"`
+	SessionID          string            `json:"session_id"`
+	OperationID        string            `json:"operation_id"`
+	Status             string            `json:"status"`
+	UserID             uint64            `json:"user_id"`
+	DeveloperTokenID   string            `json:"developer_token_id,omitempty"`
+	ParentContentID    string            `json:"parent_content_id"`
+	FileName           string            `json:"file_name"`
+	SizeBytes          uint64            `json:"size_bytes"`
+	ModifiedAt         uint64            `json:"modified_at_ms"`
+	ContentType        string            `json:"content_type"`
+	ProjectID          string            `json:"project_id"`
+	AssetKind          string            `json:"asset_kind"`
+	AssetTitle         string            `json:"asset_title"`
+	AssetDescription   string            `json:"asset_description"`
+	CapturedAt         uint64            `json:"captured_at_ms"`
+	ProofStart         uint64            `json:"proof_start"`
+	ProofEnd           uint64            `json:"proof_end"`
+	PartSize           uint64            `json:"part_size"`
+	PartCount          uint              `json:"part_count"`
+	RapidUpload        bool              `json:"rapid_upload"`
+	ResultContentID    string            `json:"result_content_id"`
+	LifecycleAction    string            `json:"lifecycle_action"`
+	LifecycleLifetime  uint64            `json:"lifecycle_lifetime_seconds"`
+	LifecycleExpiresAt uint64            `json:"lifecycle_expires_at_ms"`
+	ExpiresAt          uint64            `json:"expires_at_ms"`
+	CreatedAt          uint64            `json:"created_at_ms"`
+	UpdatedAt          uint64            `json:"updated_at_ms"`
+	CompletedAt        uint64            `json:"completed_at_ms"`
+	Parts              []cloudUploadPart `json:"parts"`
 }
 
 type cloudUploadSessionResponse struct {
@@ -172,6 +234,7 @@ func (c *Client) runCloudTransfer(run *cloudTransferRun, bootstrapURL, token str
 	})
 	state := "completed"
 	if err != nil {
+		log.Printf("cloud transfer failed: stage=%s category=%s", cloudTransferFailureStage(err), cloudTransferFailureCategory(err))
 		state = "failed"
 	}
 	_ = c.finishCloudTransfer(run, state)
@@ -183,7 +246,7 @@ func executeCloudTransfer(ctx context.Context, bootstrapURL, token, transferID s
 
 func executeCloudTransferWithAccepted(ctx context.Context, bootstrapURL, token, transferID string, accepted func() error) error {
 	if !validCloudTransferID(transferID) || !validCloudTransferBootstrapURL(bootstrapURL) || !validCloudTransferCredential(token) {
-		return errors.New("invalid cloud transfer dispatch")
+		return cloudTransferFailure("dispatch_validation", errors.New("invalid cloud transfer dispatch"))
 	}
 	acceptanceContext := ctx
 	cancelAcceptance := func() {}
@@ -193,29 +256,33 @@ func executeCloudTransferWithAccepted(ctx context.Context, bootstrapURL, token, 
 	defer cancelAcceptance()
 	var plan cloudTransferPlan
 	if err := cloudTransferAPI(acceptanceContext, http.MethodGet, bootstrapURL, token, nil, &plan); err != nil {
-		return err
+		return cloudTransferFailure("plan_fetch", err)
 	}
 	if plan.Schema != cloudTransferSchema || plan.TransferID != transferID || plan.SizeBytes < 0 {
-		return errors.New("cloud transfer plan is inconsistent")
+		return cloudTransferFailure("plan_validation", errors.New("cloud transfer plan is inconsistent"))
 	}
 	reporter := &cloudTransferReporter{bootstrapURL: bootstrapURL, token: token}
 	if err := reporter.report(acceptanceContext, "running", 0, "", true); err != nil {
-		return err
+		return cloudTransferFailure("initial_progress", err)
 	}
 	if accepted != nil {
 		if err := accepted(); err != nil {
-			return err
+			return cloudTransferFailure("acknowledgement", err)
 		}
 	}
 	cancelAcceptance()
 	var err error
 	switch plan.Direction {
 	case cloudTransferDownload:
-		err = executeCloudDownload(ctx, plan, bootstrapURL, token, reporter)
+		if err = executeCloudDownload(ctx, plan, bootstrapURL, token, reporter); err != nil {
+			err = cloudTransferFailure("download", err)
+		}
 	case cloudTransferUpload:
-		err = executeCloudUpload(ctx, plan, bootstrapURL, token, reporter)
+		if err = executeCloudUpload(ctx, plan, bootstrapURL, token, reporter); err != nil {
+			err = cloudTransferFailure("upload", err)
+		}
 	default:
-		err = errors.New("cloud transfer direction is invalid")
+		err = cloudTransferFailure("plan_validation", errors.New("cloud transfer direction is invalid"))
 	}
 	if err != nil {
 		_ = reporter.report(ctx, "failed", reporter.lastBytes, "", true)
@@ -288,16 +355,16 @@ func (c *Client) sendCloudTransferResult(requestID, transferID string, generatio
 
 func executeCloudDownload(ctx context.Context, plan cloudTransferPlan, bootstrapURL, token string, reporter *cloudTransferReporter) error {
 	if plan.DestinationParentPath == "" || !validCloudTransferFileName(plan.FileName) || !validSHA1(plan.SHA1) {
-		return errors.New("cloud download plan is incomplete")
+		return cloudTransferCategory("plan_invalid", errors.New("cloud download plan is incomplete"))
 	}
 	destinationPath := filepath.Join(plan.DestinationParentPath, plan.FileName)
 	partPath := destinationPath + ".rdev-cloud.part"
 	if err := os.MkdirAll(filepath.Dir(destinationPath), 0755); err != nil {
-		return fmt.Errorf("create destination directory: %w", err)
+		return cloudTransferCategory("destination_directory", err)
 	}
 	offset, err := resumableCloudPartOffset(partPath, plan.SizeBytes)
 	if err != nil {
-		return err
+		return cloudTransferCategory("resume_state", err)
 	}
 	if offset == plan.SizeBytes {
 		digest, publishErr := publishCloudDownload(partPath, destinationPath, plan.SHA1)
@@ -308,7 +375,7 @@ func executeCloudDownload(ctx context.Context, plan cloudTransferPlan, bootstrap
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, cloudTransferSubresource(bootstrapURL, "content"), nil)
 	if err != nil {
-		return err
+		return cloudTransferCategory("content_request", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 	if offset > 0 {
@@ -316,15 +383,25 @@ func executeCloudDownload(ctx context.Context, plan cloudTransferPlan, bootstrap
 	}
 	response, err := cloudTransferDownloadClient().Do(request)
 	if err != nil {
-		return fmt.Errorf("download cloud content: %w", err)
+		category := "content_network"
+		if errors.Is(err, errUnsafeCloudDownloadRedirect) {
+			category = "content_redirect"
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			category = "content_timeout"
+		}
+		return cloudTransferCategory(category, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("download cloud content returned HTTP %d", response.StatusCode)
+		category := "content_http_" + strconv.Itoa(response.StatusCode)
+		if response.Request != nil && response.Request.URL.String() != request.URL.String() {
+			category = "content_redirect_http_" + strconv.Itoa(response.StatusCode)
+		}
+		return cloudTransferCategory(category, errors.New("cloud content returned a non-success status"))
 	}
 	if response.StatusCode == http.StatusPartialContent {
 		if err = validateCloudContentRange(response.Header.Get("Content-Range"), offset, plan.SizeBytes); err != nil {
-			return err
+			return cloudTransferCategory("content_range", err)
 		}
 	}
 	if offset > 0 && response.StatusCode == http.StatusOK {
@@ -336,7 +413,7 @@ func executeCloudDownload(ctx context.Context, plan cloudTransferPlan, bootstrap
 	}
 	output, err := os.OpenFile(partPath, flags, 0600)
 	if err != nil {
-		return fmt.Errorf("open cloud download part: %w", err)
+		return cloudTransferCategory("destination_open", err)
 	}
 	closed := false
 	defer func() {
@@ -627,28 +704,32 @@ func cloudTransferAPI(ctx context.Context, method, endpoint, token string, input
 	}
 	response, err := cloudTransferAPIClient().Do(request)
 	if err != nil {
-		return fmt.Errorf("cloud transfer API request failed: %w", err)
+		category := "network"
+		if errors.Is(err, context.DeadlineExceeded) {
+			category = "timeout"
+		}
+		return cloudTransferCategory(category, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("cloud transfer API returned HTTP %d", response.StatusCode)
+		return cloudTransferCategory("http_"+strconv.Itoa(response.StatusCode), errors.New("cloud transfer API returned a non-success status"))
 	}
 	limited := io.LimitReader(response.Body, cloudTransferAPIBodyLimit+1)
 	payload, err := io.ReadAll(limited)
 	if err != nil {
-		return err
+		return cloudTransferCategory("response_read", err)
 	}
 	if len(payload) > cloudTransferAPIBodyLimit {
-		return errors.New("cloud transfer API response is too large")
+		return cloudTransferCategory("response_too_large", errors.New("cloud transfer API response is too large"))
 	}
 	envelope := cloudTransferEnvelope[json.RawMessage]{}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err = decoder.Decode(&envelope); err != nil {
-		return errors.New("cloud transfer API response is invalid")
+		return cloudTransferCategory("response_envelope", errors.New("cloud transfer API response is invalid"))
 	}
 	if err = requireCloudJSONEnd(decoder); err != nil || envelope.Code != 0 {
-		return errors.New("cloud transfer API rejected the request")
+		return cloudTransferCategory("api_rejected", errors.New("cloud transfer API rejected the request"))
 	}
 	if output == nil {
 		return nil
@@ -659,9 +740,12 @@ func cloudTransferAPI(ctx context.Context, method, endpoint, token string, input
 	decoder = json.NewDecoder(bytes.NewReader(envelope.Data))
 	decoder.DisallowUnknownFields()
 	if err = decoder.Decode(output); err != nil {
-		return errors.New("cloud transfer API data is invalid")
+		return cloudTransferCategory("response_data", errors.New("cloud transfer API data is invalid"))
 	}
-	return requireCloudJSONEnd(decoder)
+	if err = requireCloudJSONEnd(decoder); err != nil {
+		return cloudTransferCategory("response_data", err)
+	}
+	return nil
 }
 
 func cloudTransferAPIClient() *http.Client {
@@ -691,9 +775,10 @@ func newCloudTransferHTTPClient(followRedirects bool, timeout time.Duration) *ht
 			return http.ErrUseLastResponse
 		}
 		if len(via) >= 5 || !validCloudTransferDataURL(request.URL.String()) {
-			return errors.New("unsafe cloud download redirect")
+			return errUnsafeCloudDownloadRedirect
 		}
 		request.Header.Del("Authorization")
+		request.Header.Del("Referer")
 		return nil
 	}}
 	return client

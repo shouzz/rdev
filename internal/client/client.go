@@ -85,46 +85,45 @@ func newCoalescingWriterWithInterval(client *Client, sessionID string, typ byte,
 }
 
 func (w *coalescingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	if len(p) >= 4096 {
-		// Large write: send immediately
-		w.flush() // drain any pending buffer
+		// Keep the pending prefix and the large frame in the same ordering
+		// critical section. A timer flush must not send the prefix afterward.
+		w.flushLocked()
 		w.client.sendBinary(w.typ, w.sessionID, p)
 		return len(p), nil
 	}
 
-	w.mu.Lock()
 	w.buf.Write(p)
 	if w.buf.Len() >= 4096 {
-		data := make([]byte, w.buf.Len())
-		copy(data, w.buf.Bytes())
-		w.buf.Reset()
 		if w.timer != nil {
 			w.timer.Stop()
 			w.timer = nil
 		}
-		w.mu.Unlock()
-		w.client.sendBinary(w.typ, w.sessionID, data)
+		w.flushLocked()
 	} else if w.timer == nil {
 		w.timer = time.AfterFunc(w.interval, w.flush)
-		w.mu.Unlock()
-	} else {
-		w.mu.Unlock()
 	}
 	return len(p), nil
 }
 
 func (w *coalescingWriter) flush() {
 	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.flushLocked()
+}
+
+func (w *coalescingWriter) flushLocked() {
 	if w.buf.Len() == 0 {
 		w.timer = nil
-		w.mu.Unlock()
 		return
 	}
 	data := make([]byte, w.buf.Len())
 	copy(data, w.buf.Bytes())
 	w.buf.Reset()
 	w.timer = nil
-	w.mu.Unlock()
 	w.client.sendBinary(w.typ, w.sessionID, data)
 }
 
@@ -1563,25 +1562,31 @@ func (c *Client) handleNewSession(msg *protocol.Message) {
 	log.Printf("new session: id=%s subsystem=%q command=%q pty=%v",
 		sessionID, msg.Subsystem, msg.Command, msg.Pty)
 
-	var sess *clientSession
-	var err error
-
-	switch msg.Subsystem {
-	case "sftp":
-		sess, err = c.startSFTPSession(sessionID)
-	default:
-		sess, err = c.startShellExecSession(msg)
-	}
+	_, err := c.startAndRegisterSession(sessionID, func() (*clientSession, error) {
+		switch msg.Subsystem {
+		case "sftp":
+			return c.startSFTPSession(sessionID)
+		default:
+			return c.startShellExecSession(msg)
+		}
+	})
 
 	if err != nil {
 		log.Printf("session %s start failed: %v", sessionID, err)
 		c.sendClose(sessionID)
 		return
 	}
+}
 
+func (c *Client) startAndRegisterSession(sessionID string, start func() (*clientSession, error)) (*clientSession, error) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	sess, err := start()
+	if err != nil {
+		return nil, err
+	}
 	c.sessions[sessionID] = sess
-	c.mu.Unlock()
+	return sess, nil
 }
 
 func (c *Client) startShellExecSession(msg *protocol.Message) (*clientSession, error) {
@@ -1811,14 +1816,18 @@ func (c *Client) startSFTPSession(sessionID string) (*clientSession, error) {
 		server, err := sftp.NewServer(rwc)
 		if err != nil {
 			log.Printf("session %s: sftp init error: %v", sessionID, err)
+			c.sendExitCode(sessionID, 1)
 			c.sendClose(sessionID)
 			return
 		}
 		defer server.Close()
 
+		exitCode := 0
 		if err := server.Serve(); err != nil && err != io.EOF {
 			log.Printf("session %s: sftp error: %v", sessionID, err)
+			exitCode = 1
 		}
+		c.sendExitCode(sessionID, exitCode)
 		c.sendClose(sessionID)
 	}()
 

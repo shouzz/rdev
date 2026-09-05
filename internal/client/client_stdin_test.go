@@ -1,6 +1,7 @@
 package client
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,6 +12,98 @@ import (
 
 	"rdev/internal/protocol"
 )
+
+type sessionMessageTransport struct {
+	messages chan *protocol.Message
+}
+
+func (t *sessionMessageTransport) WriteJSON(data []byte) error {
+	message, err := protocol.Decode(data)
+	if err != nil {
+		return err
+	}
+	t.messages <- message
+	return nil
+}
+func (*sessionMessageTransport) WriteBinary([]byte) error { return nil }
+func (*sessionMessageTransport) WritePing([]byte) error   { return nil }
+func (*sessionMessageTransport) Close(string) error       { return nil }
+
+func TestSFTPSessionReportsSuccessfulExitOnEOF(t *testing.T) {
+	transport := &sessionMessageTransport{messages: make(chan *protocol.Message, 2)}
+	client := NewClient("", "test", "", "")
+	client.transport = transport
+	session, err := client.startSFTPSession("sftp-clean-eof")
+	if err != nil {
+		t.Fatalf("startSFTPSession: %v", err)
+	}
+	if err := session.sftpInput.Close(); err != nil {
+		t.Fatalf("close SFTP input: %v", err)
+	}
+
+	var messages []*protocol.Message
+	for len(messages) < 2 {
+		select {
+		case message := <-transport.messages:
+			messages = append(messages, message)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("received %d SFTP completion messages, want 2", len(messages))
+		}
+	}
+	if messages[0].Type != protocol.MsgExitCode || messages[0].ExitCode != 0 {
+		t.Fatalf("first completion message = %#v, want successful exit code", messages[0])
+	}
+	if messages[1].Type != protocol.MsgClose {
+		t.Fatalf("second completion message = %#v, want close", messages[1])
+	}
+}
+
+func TestStartAndRegisterSessionDoesNotDropEarlyInput(t *testing.T) {
+	client := NewClient("", "test", "", "")
+	sessionID := "early-input"
+	payload := []byte("scp header\x00")
+	reader, writer := io.Pipe()
+	defer reader.Close()
+
+	received := make(chan []byte, 1)
+	go func() {
+		data := make([]byte, len(payload))
+		if _, err := io.ReadFull(reader, data); err == nil {
+			received <- data
+		}
+	}()
+
+	inputStarted := make(chan struct{})
+	inputFinished := make(chan struct{})
+	session := &clientSession{id: sessionID, stdinPipe: writer, done: make(chan struct{})}
+	_, err := client.startAndRegisterSession(sessionID, func() (*clientSession, error) {
+		go func() {
+			close(inputStarted)
+			client.handleBinData(sessionID, payload)
+			close(inputFinished)
+		}()
+		<-inputStarted
+		return session, nil
+	})
+	if err != nil {
+		t.Fatalf("startAndRegisterSession: %v", err)
+	}
+
+	select {
+	case <-inputFinished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("early input remained blocked after session registration")
+	}
+	select {
+	case data := <-received:
+		if string(data) != string(payload) {
+			t.Fatalf("received payload = %q, want %q", data, payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("early input was dropped before session registration")
+	}
+	session.close()
+}
 
 func TestIsSCPExecCommand(t *testing.T) {
 	tests := []struct {

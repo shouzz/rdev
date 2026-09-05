@@ -101,7 +101,7 @@ curl -fsS https://r.feidu.fit/api/config
    ssh -p <sshPort> '<deviceId>@r.feidu.fit' 'sha256sum /tmp/artifact.bin'
    ```
 
-   Windows Go 客户端的 SCP 原始字节通道当前只在 `go/v0.2.121-feidu.1` 上完成真实链路实测。交接响应不包含客户端版本，因此默认使用 SFTP。只有从独立可信来源取得精确版本且它等于 `go/v0.2.121-feidu.1` 时才使用 SCP；不能根据相似版本号推断已包含修复。网页 `run.ps1` 和 `run.sh` 会优先下载这个修复版 Windows amd64 客户端，并校验 SHA-256 `d85e262d4b39b065ba0f7cef5bd4f79fba435cd5956080c6f3f1dca908d61d3b`。
+   Windows Go 客户端的普通 `scp` 命令当前在 `go/v0.2.121-feidu.7` 上按 OpenSSH 默认 SFTP 协议完成真实链路实测。不要添加 `-O` 强制旧 SCP 协议；交接响应不包含客户端版本时仍默认使用 SFTP。网页 `run.ps1` 和 `run.sh` 会优先下载这个修复版 Windows amd64 客户端，并校验 SHA-256 `153d4b37e3ab81bc6507314dde09b70557d7785401365caaf07992977b853117`。
 
 4. 比较本地和设备端哈希，再执行部署命令。此处是通用 Agent 手工路径；登录网页中大于 `104857600` 字节的文件使用第 8 节的自动云中转。
 
@@ -160,6 +160,8 @@ python3 tools/feidu-drive.py resume-upload '<session_id>' ./staging/ota.img
 
 `fdtx_` 明文只存在于飞度到 RDev 再到精确设备的一次下发和设备进程内存。飞度 MySQL 只保存完整令牌的 SHA-256；RDev 不保存令牌；设备不能把 `Authorization` 转发给 302 目标，也不能把签名下载或上传 URL 落盘或写日志。
 
+设备跟随云盘 302 时同时移除 `Authorization` 与 `Referer`，使原生客户端符合服务端 `Referrer-Policy: no-referrer`，并避免把受保护入口地址带到对象存储。
+
 ## 9. RDev 小文件通道的精确消息（浏览器/自研 Agent）
 
 浏览器文件页连接 `wss://<rdev-host>/files`，先发送 JSON `{"op":"auth","deviceId":"<id>","password":"<设备密码>"}`。成功后可使用：
@@ -177,7 +179,7 @@ python3 tools/feidu-drive.py resume-upload '<session_id>' ./staging/ota.img
 - 每个任务使用 `rdev-agent.py start` 兑换一次性交接，再由工具调用 heartbeat 和 RDev `/api/config`。
 - 后续操作先运行 `rdev-agent.py status`；达到 `renewal_due_at_ms` 或安全余量不足时由工具自动续签并原子保存更新后的到期字段，`rdvat_`、`fdpat_` 和 `fdrn_` 在委托期内都保持不变。
 - 不调用 RDev `/api/clients`；设备 ID只取 `data.credentials.device_id`。
-- 默认使用 SFTP。Windows SCP 只在独立证据确认设备版本精确等于 `go/v0.2.121-feidu.1` 时使用。
+- 默认使用 SFTP。Windows 上的 `scp` 不得添加 `-O`；设备版本必须由独立可信来源确认精确等于 `go/v0.2.121-feidu.7`。
 - 只使用真实 `content_id`、交接响应的设备 ID和 `/api/config` 返回的 `sshPort`。
 - 下载和上传都采用临时文件、大小校验、哈希校验和原子替换。
 - 传输失败时只重试当前阶段；不要重新创建云盘对象或并发上传同一会话。

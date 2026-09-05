@@ -23,10 +23,15 @@ RDEV_PERSIST=0
 RDEV_IDENTITY_FILE=""
 RDEV_ENROLLMENT_CODE="${RDEV_ENROLLMENT_CODE:-}"
 RDEV_REPO="icepie/rdev"
-LOCAL_CLIENT_REVISION="feidu-20260903-scp3"
-LOCAL_MANAGED_CLIENT_REVISION="feidu-20260904-managed1"
+DEFAULT_CONTROL_BASE="https://r.feidu.fit"
+LOCAL_CLIENT_REVISION="feidu-20260905-sftp-order1"
+LOCAL_MANAGED_CLIENT_REVISION="feidu-20260905-sftp-order1"
 LOCAL_WINDOWS_AMD64_ASSET="rdev-client-windows-amd64.exe"
-LOCAL_WINDOWS_AMD64_SHA256="d85e262d4b39b065ba0f7cef5bd4f79fba435cd5956080c6f3f1dca908d61d3b"
+LOCAL_WINDOWS_AMD64_SHA256="6bbedb96a4742a3f4cdb85557c610b4e55c5b3ca7b8bd67d96b2c307bdf3728b"
+LOCAL_LINUX_AMD64_ASSET="rdev-client-linux-amd64"
+LOCAL_LINUX_AMD64_SHA256="eb7a0fc25e3173a30d32fc89a82f3ae8f0ce14916b96a8847653f6564d096592"
+LOCAL_LINUX_ARM64_ASSET="rdev-client-linux-arm64"
+LOCAL_LINUX_ARM64_SHA256="a4d4f7beeb58057af15312530584dd09022aba4b5305c41aad846e38cca79aa8"
 
 # CN GitHub mirrors (tried first, fallback to direct)
 # Override with: RDEV_MIRRORS="mirror1 mirror2" sh run.sh ...
@@ -205,7 +210,7 @@ server_http_base() {
         wss://*) base="https://${endpoint#wss://}" ;;
         ws://*)  base="http://${endpoint#ws://}" ;;
         http://*|https://*) base="$endpoint" ;;
-        tcp://*|kcp://*|udp://*) return 1 ;;
+        tcp://*|kcp://*|udp://*) echo "$DEFAULT_CONTROL_BASE"; return 0 ;;
         *) return 1 ;;
     esac
     proto="${base%%://*}"
@@ -240,6 +245,19 @@ local_release_url() {
     echo "$base/local-release?asset=$1"
 }
 
+managed_server_list() {
+    old_ifs=$IFS
+    IFS=','
+    for endpoint in $RDEV_SERVER; do
+        endpoint=$(printf '%s' "$endpoint" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        case "$endpoint" in
+            wss://*|ws://*|http://*|https://*) IFS=$old_ifs; echo "$RDEV_SERVER"; return 0 ;;
+        esac
+    done
+    IFS=$old_ifs
+    echo "$RDEV_SERVER,$DEFAULT_CONTROL_BASE"
+}
+
 client_supports_managed_enrollment() {
     managed_client_path="$1"
     [ -s "$managed_client_path" ] || return 1
@@ -261,6 +279,30 @@ sha256_file() {
     else
         return 1
     fi
+}
+
+managed_client_expected_sha256() {
+    case "$1" in
+        "$LOCAL_WINDOWS_AMD64_ASSET") echo "$LOCAL_WINDOWS_AMD64_SHA256" ;;
+        "$LOCAL_LINUX_AMD64_ASSET") echo "$LOCAL_LINUX_AMD64_SHA256" ;;
+        "$LOCAL_LINUX_ARM64_ASSET") echo "$LOCAL_LINUX_ARM64_SHA256" ;;
+        *) echo "" ;;
+    esac
+}
+
+download_is_acceptable() {
+    download_path="$1"
+    download_asset="$2"
+    [ -s "$download_path" ] || return 1
+    if [ "$RDEV_CLIENT" != "go" ] || [ "$RDEV_ENROLL" != "1" ]; then
+        return 0
+    fi
+    expected_hash="$(managed_client_expected_sha256 "$download_asset")"
+    if [ -n "$expected_hash" ]; then
+        actual_hash="$(sha256_file "$download_path" 2>/dev/null || true)"
+        [ "$actual_hash" = "$expected_hash" ] || return 1
+    fi
+    client_supports_managed_enrollment "$download_path"
 }
 
 json_tag_value() {
@@ -349,7 +391,7 @@ download_with_fallback() {
         local_url="$(local_release_url "$asset" 2>/dev/null || true)"
         if [ -n "$local_url" ]; then
             echo "  Trying managed RDev client..." >&2
-            if dl "$local_url" "$out" && client_supports_managed_enrollment "$out"; then
+            if dl "$local_url" "$out" && download_is_acceptable "$out" "$asset"; then
                 ok=1
                 echo "  ok via managed RDev client" >&2
             fi
@@ -375,14 +417,14 @@ download_with_fallback() {
     direct_url="$(release_direct_url "$asset" 2>/dev/null || true)"
     if [ "$ok" = "0" ] && [ -n "$direct_url" ]; then
         echo "  Selecting fastest release source..." >&2
-        if dl "$direct_url" "$out" && [ -s "$out" ]; then ok=1; echo "  ok via measured release source" >&2; fi
+        if dl "$direct_url" "$out" && download_is_acceptable "$out" "$asset"; then ok=1; echo "  ok via measured release source" >&2; fi
         [ "$ok" = "1" ] || rm -f "$out" 2>/dev/null
     fi
     for m in $MIRRORS; do
         [ "$ok" = "1" ] && break
         [ -z "$m" ] && continue
         echo "  Trying ${m}..." >&2
-        if dl "$(mirror_url "$m" "$url")" "$out" 2>/dev/null && [ -s "$out" ]; then
+        if dl "$(mirror_url "$m" "$url")" "$out" 2>/dev/null && download_is_acceptable "$out" "$asset"; then
             ok=1
             echo "  ok via ${m}" >&2
             break
@@ -391,17 +433,17 @@ download_with_fallback() {
     done
     if [ "$ok" = "0" ]; then
         echo "  Trying github.com..." >&2
-        if dl "$url" "$out" && [ -s "$out" ]; then ok=1; echo "  ok via github.com" >&2; fi
+        if dl "$url" "$out" && download_is_acceptable "$out" "$asset"; then ok=1; echo "  ok via github.com" >&2; fi
     fi
     if [ "$ok" = "0" ]; then
         proxy_url="$(release_proxy_url "$asset" 2>/dev/null || true)"
         if [ -n "$proxy_url" ]; then
             echo "  Trying RDev server proxy (last resort)..." >&2
-            if dl "$proxy_url" "$out" && [ -s "$out" ]; then ok=1; echo "  ok via RDev server proxy" >&2; fi
+            if dl "$proxy_url" "$out" && download_is_acceptable "$out" "$asset"; then ok=1; echo "  ok via RDev server proxy" >&2; fi
             [ "$ok" = "1" ] || rm -f "$out" 2>/dev/null
         fi
     fi
-    if [ "$ok" = "1" ] && [ "$RDEV_CLIENT" = "go" ] && [ "$RDEV_ENROLL" = "1" ] && ! client_supports_managed_enrollment "$out"; then
+    if [ "$ok" = "1" ] && ! download_is_acceptable "$out" "$asset"; then
         echo "  Downloaded client does not support managed enrollment." >&2
         rm -f "$out" 2>/dev/null
         ok=0
@@ -573,7 +615,7 @@ else
     [ "$RDEV_ENROLL" = "1" ] && CACHE_KEY="${CACHE_KEY}-${LOCAL_MANAGED_CLIENT_REVISION}"
     CACHE_DIR="$CACHE_BASE/$CACHE_KEY"
     CACHE_BIN="$CACHE_DIR/$BINARY"
-    if cache_complete "$CACHE_BIN" "$CACHE_DIR" && { [ "$RDEV_ENROLL" != "1" ] || client_supports_managed_enrollment "$CACHE_BIN"; }; then
+    if cache_complete "$CACHE_BIN" "$CACHE_DIR" && download_is_acceptable "$CACHE_BIN" "$BINARY"; then
         RUN_BIN="$CACHE_BIN"
         echo "  Using cached rdev-client (${RESOLVED_TAG}, ${OS}/${ARCH})." >&2
     else
@@ -601,6 +643,11 @@ else
 fi
 
 # ── Build args & run ───────────────────────────────────────
+RDEV_CLIENT_SERVER="$RDEV_SERVER"
+if [ "$RDEV_ENROLL" = "1" ]; then
+    RDEV_CLIENT_SERVER="$(managed_server_list)"
+fi
+
 if [ "$RDEV_CLIENT" = "rs" ] && [ -z "$RDEV_ID" ]; then
     RDEV_ID="$(hostname 2>/dev/null || uname -n 2>/dev/null || echo rdev-client-gpu)"
 fi
@@ -616,12 +663,12 @@ if [ "$OS" = "android" ] && [ -z "$RDEV_SHELL" ]; then
 fi
 
 if [ "$RDEV_CLIENT" = "rs" ]; then
-    set -- -s "$RDEV_SERVER"
+    set -- -s "$RDEV_CLIENT_SERVER"
     [ -n "$RDEV_ID" ] && set -- "$@" -i "$RDEV_ID"
     [ -n "$RDEV_PASSWORD" ] && set -- "$@" -p "$RDEV_PASSWORD"
     [ -n "$RDEV_SHELL" ] && set -- "$@" --shell "$RDEV_SHELL"
 else
-    set -- -s "$RDEV_SERVER"
+    set -- -s "$RDEV_CLIENT_SERVER"
     [ -n "$RDEV_ID" ] && set -- "$@" -i "$RDEV_ID"
     [ -n "$RDEV_PASSWORD" ] && set -- "$@" -p "$RDEV_PASSWORD"
     [ -n "$RDEV_SHELL" ] && set -- "$@" -S "$RDEV_SHELL"
@@ -679,7 +726,7 @@ if [ "$RDEV_PERSIST" = "1" ]; then
     trap 'rm -f "$UNIT_TMP" 2>/dev/null' EXIT HUP INT TERM
     run_as_root mkdir -p "$INSTALL_DIR" "$(dirname "$IDENTITY_PATH")"
     run_as_root install -m 0755 "$RUN_BIN" "$INSTALLED_BIN"
-    set -- -s "$RDEV_SERVER"
+    set -- -s "$RDEV_CLIENT_SERVER"
     [ -n "$RDEV_ID" ] && set -- "$@" -i "$RDEV_ID"
     set -- "$@" --enroll-stdin --enroll-only --replace-existing --identity-file "$IDENTITY_PATH"
     printf '%s\n' "$ENROLLMENT_CODE" | run_as_root "$INSTALLED_BIN" "$@"

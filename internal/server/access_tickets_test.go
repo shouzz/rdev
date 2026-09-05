@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lxzan/gws"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestControlAuthUsesOnlyControlTokenHeader(t *testing.T) {
@@ -590,6 +591,35 @@ func TestManagedReconnectRebindsTicketOnlyWhenPreviousInstanceIsOffline(t *testi
 	}
 	if !s.authorizeDeviceCredential(replacement, ticketValue) {
 		t.Fatal("ticket did not follow an authenticated managed-device reconnect")
+	}
+}
+
+func TestAuthenticatedManagedRegistrationRebindsTicketWhilePreviousInstanceIsOnline(t *testing.T) {
+	s := NewServer()
+	secretHash, err := bcrypt.GenerateFromPassword([]byte("device-secret"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.managedDevices["device"] = managedDevice{
+		ID: "device", OwnerSubject: "feidu-user:42", SecretHash: string(secretHash), CredentialVersion: 1,
+	}
+	oldClient := &ClientConn{ID: "device", RequestedID: "device", InstanceID: "instance-one", Managed: true}
+	s.clients[oldClient.ID] = oldClient
+	ticketValue := issueAccessTicket(t, s, oldClient.ID, 600)
+
+	newClient := &ClientConn{ID: "device", RequestedID: "device", InstanceID: "instance-two", Managed: true}
+	old, assignedID, duplicate, authorizationCurrent, registerErr := s.registerClientIfAuthorizationCurrent(newClient, "device-secret")
+	if registerErr != nil {
+		t.Fatalf("managed registration: %v", registerErr)
+	}
+	if !authorizationCurrent || old != oldClient || assignedID != "device" || duplicate {
+		t.Fatalf("managed registration = (%#v, %q, %v, %v), want old client, device, false, true", old, assignedID, duplicate, authorizationCurrent)
+	}
+	if !s.accessTicketValid(newClient, ticketValue) {
+		t.Fatal("ticket did not follow an authenticated managed-device replacement")
+	}
+	if s.accessTicketValid(oldClient, ticketValue) {
+		t.Fatal("ticket remained bound to the replaced managed-device instance")
 	}
 }
 

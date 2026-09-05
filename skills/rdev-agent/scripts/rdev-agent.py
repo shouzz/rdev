@@ -141,7 +141,14 @@ def request_json(base_url: str, method: str, path: str, payload=None, token: str
         raise AgentError(f"service returned HTTP {error.code}") from None
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
         raise AgentError(f"service request failed: {type(error).__name__}") from None
-    if not isinstance(envelope, dict) or envelope.get("code") != 0 or not isinstance(envelope.get("data"), dict):
+    if not isinstance(envelope, dict):
+        raise AgentError("service returned an invalid API envelope")
+    code = envelope.get("code")
+    if not isinstance(code, int) or isinstance(code, bool):
+        raise AgentError("service returned an invalid API envelope")
+    if code != 0:
+        raise AgentError(f"service returned API code {code}")
+    if not isinstance(envelope.get("data"), dict):
         raise AgentError("service returned an invalid API envelope")
     return envelope["data"]
 
@@ -524,7 +531,7 @@ def run_open_ssh(args, program: str, extra: list[str]) -> int:
     if not executable:
         raise AgentError(f"{program} is not installed")
     temporary, environment = askpass_environment(state_data["rdev_ticket"])
-    common = ["-P" if program == "scp" else "-p", str(state_data["ssh_port"])]
+    common = (["-P"] if program == "scp" else ["-p"]) + [str(state_data["ssh_port"])]
     common += ["-o", "PasswordAuthentication=yes", "-o", "PubkeyAuthentication=no", "-o", "NumberOfPasswordPrompts=1", "-o", "StrictHostKeyChecking=accept-new"]
     try:
         return run_maintained_subprocess(args.state, [executable, *common, *extra], environment)
@@ -538,7 +545,18 @@ def command_ssh(args) -> int:
     command = args.remote_command
     if command and command[0] == "--":
         command = command[1:]
-    return run_open_ssh(args, "ssh", [target, *command])
+    if args.no_command and command:
+        raise AgentError("--no-command cannot be combined with a remote command")
+    forwarding = []
+    for value in args.local_forward:
+        forwarding += ["-L", value]
+    for value in args.remote_forward:
+        forwarding += ["-R", value]
+    if forwarding:
+        forwarding = ["-o", "ExitOnForwardFailure=yes", *forwarding]
+    if args.no_command:
+        forwarding.append("-N")
+    return run_open_ssh(args, "ssh", [*forwarding, target, *command])
 
 
 def command_scp_to(args) -> int:
@@ -693,6 +711,9 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--observed-bytes-per-second", type=int, default=0)
     commands.add_parser("revoke")
     ssh = commands.add_parser("ssh")
+    ssh.add_argument("-L", "--local-forward", action="append", default=[])
+    ssh.add_argument("-R", "--remote-forward", action="append", default=[])
+    ssh.add_argument("-N", "--no-command", action="store_true")
     ssh.add_argument("remote_command", nargs=argparse.REMAINDER)
     scp_to = commands.add_parser("scp-to")
     scp_to.add_argument("local_path")

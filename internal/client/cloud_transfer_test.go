@@ -23,6 +23,34 @@ import (
 	"rdev/internal/protocol"
 )
 
+func TestCloudTransferStageErrorDoesNotExposeUnderlyingDetails(t *testing.T) {
+	underlying := fmt.Errorf("request https://pan.feidu.fit/device/v1/rdev-transfers/example?token=secret failed")
+	err := cloudTransferFailure("plan_fetch", underlying)
+	if got := err.Error(); got != "cloud transfer plan_fetch failed" {
+		t.Fatalf("safe error = %q", got)
+	}
+	if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "https://") {
+		t.Fatalf("safe error exposed an underlying URL or credential: %q", err.Error())
+	}
+	if got := cloudTransferFailureStage(err); got != "plan_fetch" {
+		t.Fatalf("failure stage = %q", got)
+	}
+}
+
+func TestCloudTransferCategoryErrorDoesNotExposeUnderlyingDetails(t *testing.T) {
+	underlying := fmt.Errorf("request https://pan.feidu.fit/device/v1/rdev-transfers/example?token=secret failed")
+	err := cloudTransferFailure("plan_fetch", cloudTransferCategory("network", underlying))
+	if got := err.Error(); got != "cloud transfer plan_fetch failed" {
+		t.Fatalf("safe error = %q", got)
+	}
+	if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "https://") {
+		t.Fatalf("safe error exposed an underlying URL or credential: %q", err.Error())
+	}
+	if got := cloudTransferFailureCategory(err); got != "network" {
+		t.Fatalf("failure category = %q", got)
+	}
+}
+
 const cloudTransferTestID = "12345678-1234-1234-1234-1234567890ab"
 
 type cloudTransferMessageTransport struct {
@@ -215,6 +243,9 @@ func TestCloudDownloadResumesAndStripsAuthorizationOnRedirect(t *testing.T) {
 	artifact := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "" {
 			t.Fatalf("redirected download carried Authorization: %q", got)
+		}
+		if got := r.Header.Get("Referer"); got != "" {
+			t.Fatalf("redirected download carried Referer: %q", got)
 		}
 		if got := r.Header.Get("Range"); got != "bytes=8192-" {
 			t.Fatalf("download Range = %q", got)
@@ -465,7 +496,9 @@ func TestValidateCloudContentRange(t *testing.T) {
 func writeCloudTransferEnvelope(t *testing.T, w http.ResponseWriter, data any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]any{"code": 0, "message": "ok", "data": data}); err != nil {
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		"code": 0, "message": "ok", "data": data, "traceId": "rdev-cloud-transfer-test-trace",
+	}); err != nil {
 		t.Fatal(err)
 	}
 }

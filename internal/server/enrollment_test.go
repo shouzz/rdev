@@ -157,7 +157,7 @@ func TestPersistentReEnrollmentReplacesSameOwnerDevice(t *testing.T) {
 		t.Fatal("replacement managed-device secret was rejected")
 	}
 	staleLegacy := &ClientConn{ID: replaced.DeviceID, RequestedID: replaced.DeviceID}
-	if _, _, _, registered := s.registerClientIfAuthorizationCurrent(staleLegacy, ""); registered {
+	if _, _, _, registered, err := s.registerClientIfAuthorizationCurrent(staleLegacy, ""); err != nil || registered {
 		t.Fatal("stale unmanaged authorization registered over a managed device")
 	}
 	s.mu.RLock()
@@ -355,7 +355,7 @@ func TestFinalManagedRegistrationRejectsSecretReplacedAfterInitialAuthorization(
 		t.Fatalf("replacement status = %d, body = %q", response.Code, response.Body.String())
 	}
 	stale := &ClientConn{ID: first.DeviceID, RequestedID: first.DeviceID, Managed: true}
-	if _, _, _, registered := s.registerClientIfAuthorizationCurrent(stale, first.DeviceSecret); registered {
+	if _, _, _, registered, err := s.registerClientIfAuthorizationCurrent(stale, first.DeviceSecret); err != nil || registered {
 		t.Fatal("old device secret completed registration after replacement")
 	}
 	if client := s.clientByID(first.DeviceID); client != nil {
@@ -377,7 +377,7 @@ func TestFinalUnmanagedRegistrationRejectsDeviceCreatedAndRevokedAfterInitialAut
 	}
 	s.enrollmentMu.Unlock()
 	stale := &ClientConn{ID: deviceID, RequestedID: deviceID}
-	if _, _, _, registered := s.registerClientIfAuthorizationCurrent(stale, ""); registered {
+	if _, _, _, registered, err := s.registerClientIfAuthorizationCurrent(stale, ""); err != nil || registered {
 		t.Fatal("stale unmanaged authorization registered over a revoked managed device")
 	}
 	if client := s.clientByID(deviceID); client != nil {

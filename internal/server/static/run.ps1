@@ -37,9 +37,10 @@ if ($env:RDEV_MIRRORS) {
     if ($customMirrors.Count -gt 0) { $script:Mirrors = $customMirrors }
 }
 $script:Repo = 'icepie/rdev'
-$script:LocalClientRevision = 'feidu-20260903-scp3'
+$script:DefaultControlBase = 'https://r.feidu.fit'
+$script:LocalClientRevision = 'feidu-20260905-sftp-order1'
 $script:LocalWindowsAMD64Asset = 'rdev-client-windows-amd64.exe'
-$script:LocalWindowsAMD64SHA256 = 'd85e262d4b39b065ba0f7cef5bd4f79fba435cd5956080c6f3f1dca908d61d3b'
+$script:LocalWindowsAMD64SHA256 = '6bbedb96a4742a3f4cdb85557c610b4e55c5b3ca7b8bd67d96b2c307bdf3728b'
 
 function Convert-RDevMirrorUrl([string]$Mirror, [string]$Url) {
     return "https://$Mirror/$Url"
@@ -60,6 +61,9 @@ function Get-RDevServerHttpBase([string]$Server) {
     if ($FirstAny -like 'wss://*') { $Base = 'https://' + $FirstAny.Substring(6) }
     elseif ($FirstAny -like 'ws://*') { $Base = 'http://' + $FirstAny.Substring(5) }
     elseif ($FirstAny -like 'http://*' -or $FirstAny -like 'https://*') { $Base = $FirstAny }
+    elseif ($FirstAny -like 'tcp://*' -or $FirstAny -like 'kcp://*' -or $FirstAny -like 'udp://*') {
+        return $script:DefaultControlBase
+    }
     else { return '' }
     if ($Base -match '^(https?://[^/?#]+)') { return $Matches[1] }
     return ''
@@ -83,6 +87,16 @@ function Get-RDevLocalReleaseUrl([string]$Server, [string]$Asset) {
     $Base = Get-RDevServerHttpBase $Server
     if (-not $Base) { return '' }
     return "$Base/local-release?asset=$([Uri]::EscapeDataString($Asset))"
+}
+
+function Add-RDevManagedControlEndpoint([string]$Server) {
+    foreach ($Part in ($Server -split ',')) {
+        $Endpoint = $Part.Trim()
+        if ($Endpoint -like 'wss://*' -or $Endpoint -like 'ws://*' -or $Endpoint -like 'http://*' -or $Endpoint -like 'https://*') {
+            return $Server
+        }
+    }
+    return "$Server,$script:DefaultControlBase"
 }
 
 function Convert-RDevSafeName([string]$Value) {
@@ -250,31 +264,69 @@ function Get-RDevSHA256([string]$Path) {
     }
 }
 
+$script:RDevManagedEnrollmentProbeError = ''
+
 function Test-RDevManagedEnrollmentSupport([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-    $HelpBase = Join-Path $env:TEMP ("rdev-managed-help-" + [Guid]::NewGuid().ToString('N'))
-    $StdoutPath = "$HelpBase.stdout"
-    $StderrPath = "$HelpBase.stderr"
+    $script:RDevManagedEnrollmentProbeError = ''
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $script:RDevManagedEnrollmentProbeError = 'the downloaded client file is missing'
+        return $false
+    }
     $Process = $null
     try {
-        $Process = Start-Process -FilePath $Path -ArgumentList @('--help') -PassThru -WindowStyle Hidden -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath
-        if (-not $Process.WaitForExit(5000)) {
-            try { $Process.Kill() } catch {}
+        $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $StartInfo.FileName = $Path
+        $StartInfo.Arguments = '--help'
+        $StartInfo.UseShellExecute = $false
+        $StartInfo.CreateNoWindow = $true
+        $StartInfo.RedirectStandardOutput = $true
+        $StartInfo.RedirectStandardError = $true
+        $Process = New-Object System.Diagnostics.Process
+        $Process.StartInfo = $StartInfo
+        if (-not $Process.Start()) {
+            $script:RDevManagedEnrollmentProbeError = 'the downloaded client process did not start'
             return $false
         }
+        if (-not $Process.WaitForExit(5000)) {
+            try { $Process.Kill() } catch {}
+            $script:RDevManagedEnrollmentProbeError = 'the downloaded client timed out while reporting its capabilities'
+            return $false
+        }
+        $Help = $Process.StandardOutput.ReadToEnd() + "`n" + $Process.StandardError.ReadToEnd()
         $Process.WaitForExit()
-        if ($Process.ExitCode -ne 0) { return $false }
-        $Help = ''
-        if (Test-Path -LiteralPath $StdoutPath -PathType Leaf) { $Help += [IO.File]::ReadAllText($StdoutPath) }
-        if (Test-Path -LiteralPath $StderrPath -PathType Leaf) { $Help += "`n" + [IO.File]::ReadAllText($StderrPath) }
-        return $Help.Contains('--enroll-stdin') -and $Help.Contains('--identity-file') -and $Help.Contains('--replace-existing')
+        if ($Process.ExitCode -ne 0) {
+            $script:RDevManagedEnrollmentProbeError = "the downloaded client capability check exited with code $($Process.ExitCode)"
+            return $false
+        }
+        $Missing = @()
+        foreach ($RequiredOption in @('--enroll-stdin', '--identity-file', '--replace-existing')) {
+            if (-not $Help.Contains($RequiredOption)) { $Missing += $RequiredOption }
+        }
+        if ($Missing.Count -gt 0) {
+            $script:RDevManagedEnrollmentProbeError = 'the downloaded client is missing required option(s): ' + ($Missing -join ', ')
+            return $false
+        }
+        return $true
     } catch {
+        $script:RDevManagedEnrollmentProbeError = 'the downloaded client could not be started: ' + $_.Exception.Message
         return $false
     } finally {
         if ($Process) { $Process.Dispose() }
-        Remove-Item -LiteralPath $StdoutPath -Force -EA SilentlyContinue
-        Remove-Item -LiteralPath $StderrPath -Force -EA SilentlyContinue
     }
+}
+
+function Test-RDevVerifiedManagedEnrollmentClient([string]$Path, [string]$Asset) {
+    if ($Asset -ne $script:LocalWindowsAMD64Asset) { return $false }
+    return (Get-RDevSHA256 $Path) -eq $script:LocalWindowsAMD64SHA256
+}
+
+function Test-RDevDownloadedPackage([string]$Path, [string]$PackageKind, [string]$Asset, [bool]$ManagedEnrollment) {
+    if (-not (Test-RDevPackage $Path $PackageKind)) { return $false }
+    if (-not $ManagedEnrollment) { return $true }
+    if ($Asset -eq $script:LocalWindowsAMD64Asset) {
+        return (Test-RDevVerifiedManagedEnrollmentClient $Path $Asset)
+    }
+    return (Test-RDevManagedEnrollmentSupport $Path)
 }
 
 function Install-WinPTYIfRequired([string]$Arch, [string]$Mirror) {
@@ -399,6 +451,7 @@ function global:RDev {
     $Server = $Server.Trim()
     if (-not $Server) { Write-Error "Server is required"; return }
     $ManagedEnrollment = [bool]($Enroll -or $Persist)
+    $ClientServer = if ($ManagedEnrollment) { Add-RDevManagedControlEndpoint $Server } else { $Server }
 
     $Elevate = $false
     if (-not $Enroll -and -not $Persist -and -not (Test-RDevAdministrator)) {
@@ -493,8 +546,13 @@ function global:RDev {
     $CacheDir = Join-Path $CacheBase $CacheKey
     $CacheRunPath = Join-Path $CacheDir $CacheRunName
     $CacheReady = Test-RDevCache $CacheRunPath $CacheDir
-    if ($CacheReady -and $ManagedEnrollment -and -not (Test-RDevManagedEnrollmentSupport $CacheRunPath)) {
-        $CacheReady = $false
+    if ($CacheReady -and $ManagedEnrollment) {
+        $CacheSupportsManagedEnrollment = if ($Asset -eq $script:LocalWindowsAMD64Asset) {
+            Test-RDevVerifiedManagedEnrollmentClient $CacheRunPath $Asset
+        } else {
+            Test-RDevManagedEnrollmentSupport $CacheRunPath
+        }
+        if (-not $CacheSupportsManagedEnrollment) { $CacheReady = $false }
     }
     if ($CacheReady) {
         $RunPath = $CacheRunPath
@@ -525,7 +583,7 @@ function global:RDev {
     if ($ReleaseUrl -and -not $OK) {
         Write-Host "  Selecting fastest release source..." -ForegroundColor DarkGray
         if (Dl $ReleaseUrl $OutPath) {
-            if (Test-RDevPackage $OutPath $PackageKind) { $OK = $true; Write-Host "  OK via measured release source" -ForegroundColor Green }
+            if (Test-RDevDownloadedPackage $OutPath $PackageKind $Asset $ManagedEnrollment) { $OK = $true; Write-Host "  OK via measured release source" -ForegroundColor Green }
         }
         if (-not $OK) { Remove-Item $OutPath -Force -EA SilentlyContinue }
     }
@@ -534,14 +592,14 @@ function global:RDev {
         foreach ($M in $script:Mirrors) {
             Write-Host "  Trying $M..." -ForegroundColor DarkGray
             if (Dl (Convert-RDevMirrorUrl $M $GH_URL) $OutPath) {
-                if (Test-RDevPackage $OutPath $PackageKind) { $OK = $true; Write-Host "  OK via $M" -ForegroundColor Green; break }
+                if (Test-RDevDownloadedPackage $OutPath $PackageKind $Asset $ManagedEnrollment) { $OK = $true; Write-Host "  OK via $M" -ForegroundColor Green; break }
             }
             Remove-Item $OutPath -Force -EA SilentlyContinue
         }
     } elseif ($Mirror -ne 'none' -and $Mirror -ne '' -and -not $OK) {
         Write-Host "  Trying $Mirror..." -ForegroundColor DarkGray
         if (Dl (Convert-RDevMirrorUrl $Mirror $GH_URL) $OutPath) {
-            if (Test-RDevPackage $OutPath $PackageKind) { $OK = $true; Write-Host "  OK via $Mirror" -ForegroundColor Green }
+            if (Test-RDevDownloadedPackage $OutPath $PackageKind $Asset $ManagedEnrollment) { $OK = $true; Write-Host "  OK via $Mirror" -ForegroundColor Green }
         }
         if (-not $OK) { Remove-Item $OutPath -Force -EA SilentlyContinue }
     }
@@ -549,7 +607,7 @@ function global:RDev {
     if (-not $OK) {
         Write-Host "  Trying github.com..." -ForegroundColor DarkGray
         if (Dl $GH_URL $OutPath) {
-            if (Test-RDevPackage $OutPath $PackageKind) { $OK = $true; Write-Host "  OK via github.com" -ForegroundColor Green }
+            if (Test-RDevDownloadedPackage $OutPath $PackageKind $Asset $ManagedEnrollment) { $OK = $true; Write-Host "  OK via github.com" -ForegroundColor Green }
         }
     }
 
@@ -560,7 +618,7 @@ function global:RDev {
         if ($ProxyUrl) {
             Write-Host "  Trying RDev server proxy (last resort)..." -ForegroundColor DarkGray
             if (Dl $ProxyUrl $OutPath) {
-                if (Test-RDevPackage $OutPath $PackageKind) { $OK = $true; Write-Host "  OK via RDev server proxy" -ForegroundColor Green }
+                if (Test-RDevDownloadedPackage $OutPath $PackageKind $Asset $ManagedEnrollment) { $OK = $true; Write-Host "  OK via RDev server proxy" -ForegroundColor Green }
             }
             if (-not $OK) { Remove-Item $OutPath -Force -EA SilentlyContinue }
         }
@@ -583,8 +641,15 @@ function global:RDev {
 
     if ($ManagedEnrollment) {
         if ($Client -ne 'go') { Write-Error 'Managed enrollment requires the compatible Go client.'; return }
-        if (-not (Test-RDevManagedEnrollmentSupport $RunPath)) {
-            Write-Error 'Downloaded client does not support managed enrollment.'
+        $SupportsManagedEnrollment = if ($Asset -eq $script:LocalWindowsAMD64Asset) {
+            Test-RDevVerifiedManagedEnrollmentClient $RunPath $Asset
+        } else {
+            Test-RDevManagedEnrollmentSupport $RunPath
+        }
+        if (-not $SupportsManagedEnrollment) {
+            $Reason = $script:RDevManagedEnrollmentProbeError
+            if (-not $Reason) { $Reason = 'the downloaded client did not pass capability validation' }
+            Write-Error "Managed enrollment is unavailable because $Reason."
             return
         }
         $EnrollmentCode = $env:RDEV_ENROLLMENT_CODE
@@ -594,7 +659,7 @@ function global:RDev {
     $WinPTYDir = Install-WinPTYIfRequired $Arch $Mirror
 
     # ── Run ──────────────────────────────────────────────────
-    $A = @("-s", $Server)
+    $A = @("-s", $ClientServer)
     if ($Id)       { $A += @("-i", $Id) }
     if ($Password)  { $A += @("-p", $Password) }
     if ($Shell)     { if ($Client -eq 'rs') { $A += @("--shell", $Shell) } else { $A += @("-S", $Shell) } }
@@ -620,7 +685,7 @@ function global:RDev {
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
         Copy-Item -LiteralPath $RunPath -Destination $InstalledPath -Force
         if (-not $EnrollmentCode) { $EnrollmentCode = Read-Host '  One-time enrollment code' }
-        $EnrollArgs = @('-s', $Server)
+        $EnrollArgs = @('-s', $ClientServer)
         if ($Id) { $EnrollArgs += @('-i', $Id) }
         $EnrollArgs += @('--enroll-stdin', '--enroll-only', '--replace-existing', '--identity-file', $IdentityFile)
         $EnrollmentCode | & $InstalledPath @EnrollArgs

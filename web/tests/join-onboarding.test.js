@@ -75,6 +75,46 @@ describe("RDev browser onboarding", () => {
     expect(finalCapabilityGate).toBeGreaterThan(releaseFallback);
   });
 
+  test("advanced-only endpoints retain the branded HTTPS control plane", async () => {
+    const powershell = await readFile(
+      resolve(root, "internal/server/static/run.ps1"),
+      "utf8",
+    );
+    const shell = await readFile(
+      resolve(root, "internal/server/static/run.sh"),
+      "utf8",
+    );
+
+    expect(powershell).toContain(
+      "$script:DefaultControlBase = 'https://r.feidu.fit'",
+    );
+    expect(powershell).toContain("return $script:DefaultControlBase");
+    expect(powershell).toContain("function Add-RDevManagedControlEndpoint");
+    expect(powershell).toContain('$ClientServer = if ($ManagedEnrollment)');
+    expect(shell).toContain('DEFAULT_CONTROL_BASE="https://r.feidu.fit"');
+    expect(shell).toContain('echo "$DEFAULT_CONTROL_BASE"; return 0');
+    expect(shell).toContain("managed_server_list()");
+    expect(shell).toContain('RDEV_CLIENT_SERVER="$(managed_server_list)"');
+  });
+
+  test("managed downloads validate every source before acceptance", async () => {
+    const powershell = await readFile(
+      resolve(root, "internal/server/static/run.ps1"),
+      "utf8",
+    );
+    const shell = await readFile(
+      resolve(root, "internal/server/static/run.sh"),
+      "utf8",
+    );
+
+    expect(powershell).toContain("function Test-RDevDownloadedPackage");
+    expect(powershell).toContain(
+      "Test-RDevDownloadedPackage $OutPath $PackageKind $Asset $ManagedEnrollment",
+    );
+    expect(shell).toContain("download_is_acceptable()");
+    expect(shell).toContain('managed_client_expected_sha256()');
+  });
+
   test("Windows enrollment rejects a changed local SHA before trying public sources", async () => {
     const powershell = await readFile(
       resolve(root, "internal/server/static/run.ps1"),
@@ -105,23 +145,30 @@ describe("RDev browser onboarding", () => {
       "function Test-RDevManagedEnrollmentSupport",
     );
     const enrollFlag = powershell.indexOf(
-      "$Help.Contains('--enroll-stdin')",
+      "'--enroll-stdin'",
       supportFunction,
     );
     const identityFlag = powershell.indexOf(
-      "$Help.Contains('--identity-file')",
+      "'--identity-file'",
       supportFunction,
     );
     const replaceFlag = powershell.indexOf(
-      "$Help.Contains('--replace-existing')",
+      "'--replace-existing'",
       supportFunction,
     );
-    const finalCapabilityGate = powershell.indexOf(
-      "if (-not (Test-RDevManagedEnrollmentSupport $RunPath))",
+    const releaseFallback = powershell.indexOf(
+      "$ReleaseUrl = Get-RDevReleaseUrl $Server $Asset $Tag",
+    );
+    const verifiedCapabilityGate = powershell.indexOf(
+      "Test-RDevVerifiedManagedEnrollmentClient $RunPath $Asset",
+    );
+    const finalCapabilityProbe = powershell.indexOf(
+      "Test-RDevManagedEnrollmentSupport $RunPath",
+      verifiedCapabilityGate,
     );
     const failure = powershell.indexOf(
-      "Write-Error 'Downloaded client does not support managed enrollment.'",
-      finalCapabilityGate,
+      'Write-Error "Managed enrollment is unavailable because $Reason."',
+      finalCapabilityProbe,
     );
     const consumeInvitation = powershell.indexOf(
       "$EnrollmentCode = $env:RDEV_ENROLLMENT_CODE",
@@ -133,9 +180,66 @@ describe("RDev browser onboarding", () => {
     expect(enrollFlag).toBeGreaterThan(supportFunction);
     expect(identityFlag).toBeGreaterThan(enrollFlag);
     expect(replaceFlag).toBeGreaterThan(identityFlag);
-    expect(failure).toBeGreaterThan(finalCapabilityGate);
+    expect(verifiedCapabilityGate).toBeGreaterThan(releaseFallback);
+    expect(finalCapabilityProbe).toBeGreaterThan(verifiedCapabilityGate);
+    expect(failure).toBeGreaterThan(finalCapabilityProbe);
     expect(consumeInvitation).toBeGreaterThan(failure);
     expect(createStartupDirectory).toBeGreaterThan(consumeInvitation);
+  });
+
+  test("Windows trusts the exact published client hash without executing a capability probe", async () => {
+    const powershell = await readFile(
+      resolve(root, "internal/server/static/run.ps1"),
+      "utf8",
+    );
+    const verifier = powershell.indexOf(
+      "function Test-RDevVerifiedManagedEnrollmentClient",
+    );
+    const assetGate = powershell.indexOf(
+      "$Asset -ne $script:LocalWindowsAMD64Asset",
+      verifier,
+    );
+    const hashGate = powershell.indexOf(
+      "(Get-RDevSHA256 $Path) -eq $script:LocalWindowsAMD64SHA256",
+      assetGate,
+    );
+    const finalGate = powershell.lastIndexOf(
+      "Test-RDevVerifiedManagedEnrollmentClient $RunPath $Asset",
+    );
+    const fallbackProbe = powershell.indexOf(
+      "Test-RDevManagedEnrollmentSupport $RunPath",
+      finalGate,
+    );
+
+    expect(verifier).toBeGreaterThan(-1);
+    expect(assetGate).toBeGreaterThan(verifier);
+    expect(hashGate).toBeGreaterThan(assetGate);
+    expect(finalGate).toBeGreaterThan(hashGate);
+    expect(fallbackProbe).toBeGreaterThan(finalGate);
+  });
+
+  test("Windows capability probing reports distinct execution failures", async () => {
+    const powershell = await readFile(
+      resolve(root, "internal/server/static/run.ps1"),
+      "utf8",
+    );
+
+    expect(powershell).toContain("the downloaded client file is missing");
+    expect(powershell).toContain(
+      "the downloaded client process did not start",
+    );
+    expect(powershell).toContain(
+      "the downloaded client timed out while reporting its capabilities",
+    );
+    expect(powershell).toContain(
+      "the downloaded client capability check exited with code",
+    );
+    expect(powershell).toContain(
+      "the downloaded client is missing required option(s):",
+    );
+    expect(powershell).toContain(
+      "the downloaded client could not be started:",
+    );
   });
 
   test("valid invitation renders an executable command without a second prompt", async () => {

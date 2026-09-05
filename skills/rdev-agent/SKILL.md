@@ -47,6 +47,15 @@ A successful renewal returns the updated session under `data.session`. Keep the 
 
 Use the official `rdev-agent.py ssh`, `scp-to`, `scp-from`, and `drive` commands for long-running child processes. They maintain heartbeat and renewal in the background without restarting a healthy child process. A maintenance failure stops the child and returns nonzero; do not hide that result or start an unmanaged replacement command.
 
+For an unattended port forward, put every forwarding rule in an explicit Agent option before `--no-command`:
+
+```bash
+python3 rdev-agent.py ssh --local-forward '127.0.0.1:8080:127.0.0.1:80' --no-command
+python3 rdev-agent.py ssh --remote-forward '127.0.0.1:3000:127.0.0.1:3000' --no-command
+```
+
+Repeat either forwarding option to open more than one rule. The Agent sets OpenSSH `ExitOnForwardFailure=yes`; a zero exit code therefore never means that a requested listener silently failed to bind. Do not place raw `-L`, `-R`, or `-N` after the device target through the remote-command argument.
+
 ## Choose The Data Plane
 
 Use `data.session.selected_transport` from heartbeat or renewal, or `data.credentials.agent_session.selected_transport` from redemption:

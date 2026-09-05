@@ -705,6 +705,12 @@ func (s *Server) rebindManagedAccessTickets(deviceID, instanceID, fingerprint st
 	now := s.accessTicketCurrentTime()
 	s.enrollmentMu.Lock()
 	defer s.enrollmentMu.Unlock()
+	return s.rebindManagedAccessTicketsLocked(deviceID, instanceID, fingerprint, now)
+}
+
+// rebindManagedAccessTicketsLocked requires enrollmentMu to be held. Registration
+// uses it only after the managed-device secret has been checked under that lock.
+func (s *Server) rebindManagedAccessTicketsLocked(deviceID, instanceID, fingerprint string, now time.Time) error {
 	device, managed := s.managedDevices[deviceID]
 	if !managed || !device.RevokedAt.IsZero() {
 		return nil
