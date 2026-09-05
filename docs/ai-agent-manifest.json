@@ -62,6 +62,7 @@
     "file_websocket": {
       "url": "wss://r.feidu.fit/files",
       "auth_message": {"op": "auth", "deviceId": "<device id>", "password": "<runtime secret>"},
+      "semantic_locations": ["home", "desktop"],
       "binary_frame": "[type:1][task_id_length:1][task_id][offset:uint64_be][payload]",
       "types": {"upload_chunk": "0x20", "upload_ack": "0x21", "download_chunk": "0x22", "transfer_end": "0x23", "cancel": "0x24"}
     },

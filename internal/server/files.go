@@ -17,6 +17,7 @@ type fileMsg struct {
 	RequestID  string               `json:"requestId,omitempty"`
 	TaskID     string               `json:"taskId,omitempty"`
 	Path       string               `json:"path,omitempty"`
+	Location   string               `json:"location,omitempty"`
 	From       string               `json:"from,omitempty"`
 	To         string               `json:"to,omitempty"`
 	ParentPath string               `json:"parentPath,omitempty"`
@@ -214,7 +215,7 @@ func (h *filesWSHandler) handleList(socket *fileSocket, msg fileMsg) {
 	if msg.Limit <= 0 {
 		msg.Limit = 200
 	}
-	if err := client.Send(&protocol.Message{Type: protocol.MsgFileListRequest, RequestID: msg.RequestID, Path: msg.Path, Offset: msg.Offset, Size: int64(msg.Limit)}); err != nil {
+	if err := client.Send(&protocol.Message{Type: protocol.MsgFileListRequest, RequestID: msg.RequestID, Path: msg.Path, Location: msg.Location, Offset: msg.Offset, Size: int64(msg.Limit)}); err != nil {
 		h.srv.removeFileRequest(msg.RequestID)
 		socket.writeText(fileMsg{Op: "error", DeviceID: msg.DeviceID, RequestID: msg.RequestID, Message: "failed to reach device"})
 	}
@@ -363,6 +364,7 @@ func (s *Server) handleFileManagerMessage(msg *protocol.Message) {
 				Op:        "list_result",
 				RequestID: msg.RequestID,
 				Path:      msg.Path,
+				Location:  msg.Location,
 				Parent:    msg.ParentPath,
 				Home:      msg.HomePath,
 				Offset:    msg.Offset,

@@ -1101,10 +1101,14 @@ func fileParent(path string) string {
 }
 
 func (c *Client) handleFileListRequest(msg *protocol.Message) {
-	path := defaultFilePath(msg.Path)
+	path, err := resolveFileLocation(msg.Path, msg.Location)
+	if err != nil {
+		c.send(&protocol.Message{Type: protocol.MsgFileListResult, RequestID: msg.RequestID, Location: msg.Location, Error: err.Error()})
+		return
+	}
 	entries, truncated, err := listFileEntries(path, 2000)
 	if err != nil {
-		c.send(&protocol.Message{Type: protocol.MsgFileListResult, RequestID: msg.RequestID, Path: path, Error: err.Error()})
+		c.send(&protocol.Message{Type: protocol.MsgFileListResult, RequestID: msg.RequestID, Path: path, Location: msg.Location, Error: err.Error()})
 		return
 	}
 	home, _ := os.UserHomeDir()
@@ -1112,6 +1116,7 @@ func (c *Client) handleFileListRequest(msg *protocol.Message) {
 		Type:        protocol.MsgFileListResult,
 		RequestID:   msg.RequestID,
 		Path:        filepath.Clean(path),
+		Location:    msg.Location,
 		ParentPath:  fileParent(path),
 		HomePath:    home,
 		FileEntries: entries,

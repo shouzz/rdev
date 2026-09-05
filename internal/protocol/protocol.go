@@ -155,6 +155,7 @@ type Message struct {
 	RequestID   string      `json:"requestId,omitempty"`
 	TaskID      string      `json:"taskId,omitempty"`
 	Path        string      `json:"path,omitempty"`
+	Location    string      `json:"location,omitempty"`
 	ParentPath  string      `json:"parentPath,omitempty"`
 	Name        string      `json:"name,omitempty"`
 	Size        int64       `json:"size,omitempty"`
