@@ -1311,6 +1311,22 @@ func (c *Client) handleManagedUploadStart(msg *protocol.Message) {
 		}
 		offset = 0
 	}
+	if msg.SHA256 != "" && msg.Size >= 0 && offset == msg.Size {
+		actualSHA256, hashErr := fileHandleSHA256(f)
+		if hashErr != nil {
+			f.Close()
+			c.sendFileTransferError(taskID, target, hashErr.Error())
+			return
+		}
+		if actualSHA256 != msg.SHA256 {
+			if err := f.Truncate(0); err != nil {
+				f.Close()
+				c.sendFileTransferError(taskID, target, err.Error())
+				return
+			}
+			offset = 0
+		}
+	}
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		f.Close()
 		c.sendFileTransferError(taskID, target, err.Error())

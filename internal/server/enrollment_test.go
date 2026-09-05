@@ -629,8 +629,10 @@ func TestManagedDeviceRotateRevokeAndRestart(t *testing.T) {
 	s.mu.Lock()
 	s.clients[redeemed.DeviceID] = &ClientConn{
 		ID: redeemed.DeviceID, RequestedID: redeemed.DeviceID, InstanceID: "connected-instance", Transport: transport,
+		OwnerSubject: "feidu-user:9", Sessions: make(map[string]*ProxySession), Forwards: make(map[string]*ProxyForward),
 	}
 	s.mu.Unlock()
+	_, _, beforeRotateSequence := s.deviceEventsAfter(0)
 	ticketValue := "rdvat_temporary-access-ticket"
 	ticketHash := sha256.Sum256([]byte(ticketValue))
 	s.accessTicketMu.Lock()
@@ -669,6 +671,10 @@ func TestManagedDeviceRotateRevokeAndRestart(t *testing.T) {
 	if _, connected := s.GetClient(redeemed.DeviceID); connected {
 		t.Fatal("rotated device remained in the online registry")
 	}
+	rotateEvents, reset, _ := s.deviceEventsAfter(beforeRotateSequence)
+	if reset || len(rotateEvents) != 1 || rotateEvents[0].Type != "device.offline" || rotateEvents[0].DeviceID != redeemed.DeviceID || rotateEvents[0].OwnerSubject != "feidu-user:9" {
+		t.Fatalf("rotation device events = %#v, reset = %v", rotateEvents, reset)
+	}
 	oldClient := &ClientConn{ID: redeemed.DeviceID, InstanceID: "connected-instance"}
 	if s.accessTicketValid(oldClient, ticketValue) {
 		t.Fatal("access ticket remained usable after secret rotation")
@@ -690,6 +696,12 @@ func TestManagedDeviceRotateRevokeAndRestart(t *testing.T) {
 	if allowed, managed := reloaded.authorizeManagedRegistration(redeemed.DeviceID, rotated.DeviceSecret); !managed || !allowed {
 		t.Fatal("reloaded registry rejected rotated device secret")
 	}
+	reloaded.mu.Lock()
+	reloaded.clients[redeemed.DeviceID] = &ClientConn{
+		ID: redeemed.DeviceID, RequestedID: redeemed.DeviceID, InstanceID: "reconnected-instance",
+		OwnerSubject: "feidu-user:9", Sessions: make(map[string]*ProxySession), Forwards: make(map[string]*ProxyForward),
+	}
+	reloaded.mu.Unlock()
 
 	now = now.Add(time.Minute)
 	revokeRequest := httptest.NewRequest(http.MethodDelete, "/api/control/devices/managed-workstation", nil)
@@ -701,6 +713,10 @@ func TestManagedDeviceRotateRevokeAndRestart(t *testing.T) {
 	}
 	if allowed, managed := reloaded.authorizeManagedRegistration(redeemed.DeviceID, rotated.DeviceSecret); !managed || allowed {
 		t.Fatal("revoked device secret remained valid")
+	}
+	revokeEvents, reset, _ := reloaded.deviceEventsAfter(0)
+	if reset || len(revokeEvents) != 1 || revokeEvents[0].Type != "device.offline" || revokeEvents[0].DeviceID != redeemed.DeviceID || revokeEvents[0].OwnerSubject != "feidu-user:9" {
+		t.Fatalf("revocation device events = %#v, reset = %v", revokeEvents, reset)
 	}
 
 	restarted := NewServer()

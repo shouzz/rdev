@@ -11,6 +11,8 @@ import (
 	"rdev/internal/protocol"
 )
 
+const fileTaskCompletionTimeout = 30 * time.Second
+
 type fileMsg struct {
 	Op         string               `json:"op"`
 	DeviceID   string               `json:"deviceId,omitempty"`
@@ -51,8 +53,9 @@ type fileSocket struct {
 }
 
 type fileTaskRoute struct {
-	socket   *fileSocket
-	deviceID string
+	socket          *fileSocket
+	deviceID        string
+	completionTimer *time.Timer
 }
 
 type filesWSHandler struct {
@@ -101,6 +104,9 @@ func (h *filesWSHandler) OnClose(socket *gws.Conn, err error) {
 			if client, ok := h.srv.GetClient(route.deviceID); ok {
 				client.Send(&protocol.Message{Type: protocol.MsgFileTransferCancel, TaskID: id})
 				client.SendBinaryOffset(protocol.BinFileTransferCancel, id, 0, nil)
+			}
+			if route.completionTimer != nil {
+				route.completionTimer.Stop()
 			}
 			delete(h.srv.fileTasks, id)
 		}
@@ -332,6 +338,9 @@ func (h *filesWSHandler) handleBinary(socket *fileSocket, raw []byte) {
 
 func (s *Server) registerFileTask(taskID string, socket *fileSocket, deviceID string) {
 	s.fileMu.Lock()
+	if previous := s.fileTasks[taskID]; previous != nil && previous.completionTimer != nil {
+		previous.completionTimer.Stop()
+	}
 	s.fileTasks[taskID] = &fileTaskRoute{socket: socket, deviceID: deviceID}
 	s.fileMu.Unlock()
 }
@@ -344,8 +353,30 @@ func (s *Server) getFileTask(taskID string) *fileTaskRoute {
 
 func (s *Server) removeFileTask(taskID string) {
 	s.fileMu.Lock()
+	if route := s.fileTasks[taskID]; route != nil && route.completionTimer != nil {
+		route.completionTimer.Stop()
+	}
 	delete(s.fileTasks, taskID)
 	s.fileMu.Unlock()
+}
+
+func (s *Server) scheduleFileTaskCompletionCleanup(taskID string, route *fileTaskRoute) {
+	s.scheduleFileTaskCompletionCleanupAfter(taskID, route, fileTaskCompletionTimeout)
+}
+
+func (s *Server) scheduleFileTaskCompletionCleanupAfter(taskID string, route *fileTaskRoute, wait time.Duration) {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	if s.fileTasks[taskID] != route || route.completionTimer != nil {
+		return
+	}
+	route.completionTimer = time.AfterFunc(wait, func() {
+		s.fileMu.Lock()
+		if s.fileTasks[taskID] == route {
+			delete(s.fileTasks, taskID)
+		}
+		s.fileMu.Unlock()
+	})
 }
 
 func (s *Server) removeFileRequest(requestID string) {
@@ -436,6 +467,9 @@ func (s *Server) handleFileManagerBinary(raw []byte) bool {
 			return true
 		}
 		route.socket.writeBinary(raw)
+		if fileBinaryFrameAwaitsTextCompletion(typ) {
+			s.scheduleFileTaskCompletionCleanup(taskID, route)
+		}
 		if fileBinaryFrameClosesRoute(typ) {
 			s.removeFileTask(taskID)
 		}
@@ -443,6 +477,10 @@ func (s *Server) handleFileManagerBinary(raw []byte) bool {
 	default:
 		return false
 	}
+}
+
+func fileBinaryFrameAwaitsTextCompletion(typ byte) bool {
+	return typ == protocol.BinFileTransferEnd
 }
 
 func fileBinaryFrameClosesRoute(typ byte) bool {

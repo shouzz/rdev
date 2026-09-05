@@ -171,7 +171,7 @@ func TestManagedUploadPublishesOnlyAfterSHA256Matches(t *testing.T) {
 	}
 }
 
-func TestManagedUploadRetainsPartialFileOnSHA256Mismatch(t *testing.T) {
+func TestManagedUploadResetsPartialFileOnSHA256Mismatch(t *testing.T) {
 	client, transport := newFileOpTestClient()
 	payload := []byte("corrupted transfer")
 	target := filepath.Join(t.TempDir(), "payload.bin")
@@ -191,6 +191,36 @@ func TestManagedUploadRetainsPartialFileOnSHA256Mismatch(t *testing.T) {
 	if stored, err := os.ReadFile(target + ".rdevpart"); err != nil || len(stored) != 0 {
 		t.Fatalf("reset partial file = %q, err = %v", stored, err)
 	}
+}
+
+func TestManagedUploadRejectsEqualLengthCorruptPartialBeforeResume(t *testing.T) {
+	client, transport := newFileOpTestClient()
+	target := filepath.Join(t.TempDir(), "payload.bin")
+	wanted := []byte("verified payload")
+	corrupt := []byte("damaged payload!")
+	if len(corrupt) != len(wanted) {
+		t.Fatal("test payload lengths differ")
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(wanted))
+	if err := os.WriteFile(target+".rdevpart", corrupt, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target+".rdevpart.meta", managedUploadMetadata(int64(len(wanted)), digest), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	client.handleManagedUploadStart(&protocol.Message{
+		TaskID: "upload-corrupt-resume", Path: target, Size: int64(len(wanted)), SHA256: digest,
+	})
+	ready := waitFileOpResult(t, transport)
+	if ready.Type != protocol.MsgFileUploadReady || ready.Offset != 0 {
+		t.Fatalf("upload ready = %#v, want offset 0", ready)
+	}
+	stored, err := os.ReadFile(target + ".rdevpart")
+	if err != nil || len(stored) != 0 {
+		t.Fatalf("corrupt partial was not reset: %q, err = %v", stored, err)
+	}
+	client.handleManagedTransferCancel("upload-corrupt-resume")
 }
 
 func TestManagedUploadRestartsAfterSHA256Mismatch(t *testing.T) {
