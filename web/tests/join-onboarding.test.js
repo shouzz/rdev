@@ -115,6 +115,21 @@ describe("RDev browser onboarding", () => {
     expect(shell).toContain('managed_client_expected_sha256()');
   });
 
+  test("Windows downloads release handles and isolate temporary files per invocation", async () => {
+    const powershell = await readFile(
+      resolve(root, "internal/server/static/run.ps1"),
+      "utf8",
+    );
+
+    expect(powershell).toContain("if ($w) { $w.Dispose() }");
+    expect(powershell).toContain(
+      "$DownloadNonce = [Guid]::NewGuid().ToString('N')",
+    );
+    expect(powershell).toContain(
+      '"rdev-client-$SafeTag-windows-$Arch-$DownloadNonce.exe"',
+    );
+  });
+
   test("Windows enrollment rejects a changed local SHA before trying public sources", async () => {
     const powershell = await readFile(
       resolve(root, "internal/server/static/run.ps1"),

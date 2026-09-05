@@ -517,6 +517,7 @@ function global:RDev {
 
     # ── Download helper ──────────────────────────────────────
     function Dl([string]$Url, [string]$Out) {
+        $w = $null
         try {
             $w = New-Object Net.WebClient
             $w.Headers.Add('User-Agent', 'rdev-runner')
@@ -526,11 +527,14 @@ function global:RDev {
             Write-Host "  Download error: $($_.Exception.Message)" -ForegroundColor DarkGray
             try { if ($_.Exception.InnerException) { Write-Host "  Inner error: $($_.Exception.InnerException.Message)" -ForegroundColor DarkGray } } catch {}
             return $false
+        } finally {
+            if ($w) { $w.Dispose() }
         }
     }
 
     # ── Download (RDev server proxy → mirror → github) ───────
-    if ($PackageKind -eq 'zip') { $OutPath = Join-Path $env:TEMP "rdev-client-gpu-$SafeTag-windows-$Arch.zip" } else { $OutPath = Join-Path $env:TEMP "rdev-client-$SafeTag-windows-$Arch.exe" }
+    $DownloadNonce = [Guid]::NewGuid().ToString('N')
+    if ($PackageKind -eq 'zip') { $OutPath = Join-Path $env:TEMP "rdev-client-gpu-$SafeTag-windows-$Arch-$DownloadNonce.zip" } else { $OutPath = Join-Path $env:TEMP "rdev-client-$SafeTag-windows-$Arch-$DownloadNonce.exe" }
     $OK = $false
 
     if ($Client -eq 'rs') {
