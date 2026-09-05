@@ -24,6 +24,7 @@ type fileMsg struct {
 	Name       string               `json:"name,omitempty"`
 	Size       int64                `json:"size,omitempty"`
 	Offset     int64                `json:"offset,omitempty"`
+	SHA256     string               `json:"sha256,omitempty"`
 	Limit      int                  `json:"limit,omitempty"`
 	Total      int                  `json:"total,omitempty"`
 	ModTime    string               `json:"modTime,omitempty"`
@@ -237,6 +238,7 @@ func (h *filesWSHandler) handleUploadStart(socket *fileSocket, msg fileMsg) {
 		ParentPath: msg.ParentPath,
 		Name:       msg.Name,
 		Size:       msg.Size,
+		SHA256:     msg.SHA256,
 		ModTime:    msg.ModTime,
 	})
 	if err != nil {
@@ -392,11 +394,11 @@ func (s *Server) handleFileManagerMessage(msg *protocol.Message) {
 		s.forwardFileOpResult(msg, "copy_result")
 	case protocol.MsgFileDownloadStart:
 		if route := s.getFileTask(msg.TaskID); route != nil {
-			route.socket.writeText(fileMsg{Op: "download_start", TaskID: msg.TaskID, Path: msg.Path, Name: msg.Name, Size: msg.Size, Offset: msg.Offset, ModTime: msg.ModTime})
+			route.socket.writeText(fileMsg{Op: "download_start", TaskID: msg.TaskID, Path: msg.Path, Name: msg.Name, Size: msg.Size, Offset: msg.Offset, SHA256: msg.SHA256, ModTime: msg.ModTime})
 		}
 	case protocol.MsgFileTransferEnd:
 		if route := s.getFileTask(msg.TaskID); route != nil {
-			route.socket.writeText(fileMsg{Op: "transfer_end", TaskID: msg.TaskID, Path: msg.Path, Size: msg.Size, Offset: msg.Offset, Success: msg.Success})
+			route.socket.writeText(fileMsg{Op: "transfer_end", TaskID: msg.TaskID, Path: msg.Path, Size: msg.Size, Offset: msg.Offset, SHA256: msg.SHA256, Success: msg.Success})
 			s.removeFileTask(msg.TaskID)
 		}
 	case protocol.MsgFileTransferError:
@@ -434,13 +436,19 @@ func (s *Server) handleFileManagerBinary(raw []byte) bool {
 			return true
 		}
 		route.socket.writeBinary(raw)
-		if typ == protocol.BinFileTransferEnd || typ == protocol.BinFileTransferCancel {
+		if fileBinaryFrameClosesRoute(typ) {
 			s.removeFileTask(taskID)
 		}
 		return true
 	default:
 		return false
 	}
+}
+
+func fileBinaryFrameClosesRoute(typ byte) bool {
+	// A download end frame is followed by a text completion carrying the
+	// verified SHA-256. Keep the route until that completion is forwarded.
+	return typ == protocol.BinFileTransferCancel
 }
 
 // HandleFilesWS handles browser file manager WebSocket connections.

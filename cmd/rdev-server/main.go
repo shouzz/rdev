@@ -332,6 +332,7 @@ Examples:
 	mux.HandleFunc("/api/control/enrollments/", srv.HandleEnrollmentLifecycleAPI)
 	mux.HandleFunc("/api/control/devices/", srv.HandleManagedDeviceLifecycleAPI)
 	mux.HandleFunc("/api/control/cloud-transfers", srv.HandleCloudTransferDispatchAPI)
+	mux.HandleFunc("/api/control/device-events", srv.HandleDeviceEventsAPI)
 	mux.HandleFunc("/api/enrollments/redeem", srv.HandleEnrollmentRedeemAPI)
 	mux.HandleFunc("/join", srv.StaticPageHandler("join.html"))
 	mux.HandleFunc("/api/upload", srv.HandleFileUpload)

@@ -1,7 +1,11 @@
 package client
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -140,5 +144,110 @@ func TestSafeJoinFileRejectsNamesThatEscapeTheParent(t *testing.T) {
 	joined, err := safeJoinFile(parent, "firmware.bin")
 	if err != nil || joined != filepath.Join(parent, "firmware.bin") {
 		t.Fatalf("safe name result = %q, err = %v", joined, err)
+	}
+}
+
+func TestManagedUploadPublishesOnlyAfterSHA256Matches(t *testing.T) {
+	client, transport := newFileOpTestClient()
+	payload := []byte("verified RDev transfer")
+	digest := fmt.Sprintf("%x", sha256.Sum256(payload))
+	target := filepath.Join(t.TempDir(), "payload.bin")
+	client.handleManagedUploadStart(&protocol.Message{
+		TaskID: "upload-ok", Path: target, Size: int64(len(payload)), SHA256: digest,
+	})
+	ready := waitFileOpResult(t, transport)
+	if ready.Type != protocol.MsgFileUploadReady || ready.Offset != 0 {
+		t.Fatalf("upload ready = %#v", ready)
+	}
+	client.handleManagedUploadChunk("upload-ok", 0, payload)
+	client.handleManagedUploadEnd(&protocol.Message{TaskID: "upload-ok", Path: target})
+	completed := waitFileOpResult(t, transport)
+	if completed.Type != protocol.MsgFileTransferEnd || !completed.Success || completed.SHA256 != digest {
+		t.Fatalf("upload completion = %#v", completed)
+	}
+	stored, err := os.ReadFile(target)
+	if err != nil || string(stored) != string(payload) {
+		t.Fatalf("published file = %q, err = %v", stored, err)
+	}
+}
+
+func TestManagedUploadRetainsPartialFileOnSHA256Mismatch(t *testing.T) {
+	client, transport := newFileOpTestClient()
+	payload := []byte("corrupted transfer")
+	target := filepath.Join(t.TempDir(), "payload.bin")
+	client.handleManagedUploadStart(&protocol.Message{
+		TaskID: "upload-mismatch", Path: target, Size: int64(len(payload)), SHA256: fmt.Sprintf("%064x", 1),
+	})
+	_ = waitFileOpResult(t, transport)
+	client.handleManagedUploadChunk("upload-mismatch", 0, payload)
+	client.handleManagedUploadEnd(&protocol.Message{TaskID: "upload-mismatch", Path: target})
+	failed := waitFileOpResult(t, transport)
+	if failed.Type != protocol.MsgFileTransferError || failed.Success || failed.Error != "SHA-256 mismatch" {
+		t.Fatalf("upload failure = %#v", failed)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("mismatched upload was published: %v", err)
+	}
+	if stored, err := os.ReadFile(target + ".rdevpart"); err != nil || len(stored) != 0 {
+		t.Fatalf("reset partial file = %q, err = %v", stored, err)
+	}
+}
+
+func TestManagedUploadRestartsAfterSHA256Mismatch(t *testing.T) {
+	client, transport := newFileOpTestClient()
+	target := filepath.Join(t.TempDir(), "payload.bin")
+	wanted := []byte("verified payload")
+	digest := fmt.Sprintf("%x", sha256.Sum256(wanted))
+
+	client.handleManagedUploadStart(&protocol.Message{TaskID: "upload-retry", Path: target, Size: int64(len(wanted)), SHA256: digest})
+	_ = waitFileOpResult(t, transport)
+	client.handleManagedUploadChunk("upload-retry", 0, []byte("damaged payload!"))
+	client.handleManagedUploadEnd(&protocol.Message{TaskID: "upload-retry", Path: target})
+	if failed := waitFileOpResult(t, transport); failed.Type != protocol.MsgFileTransferError || failed.Error != "SHA-256 mismatch" {
+		t.Fatalf("first completion = %#v", failed)
+	}
+
+	client.handleManagedUploadStart(&protocol.Message{TaskID: "upload-retry", Path: target, Size: int64(len(wanted)), SHA256: digest})
+	if ready := waitFileOpResult(t, transport); ready.Type != protocol.MsgFileUploadReady || ready.Offset != 0 {
+		t.Fatalf("retry ready = %#v", ready)
+	}
+	client.handleManagedUploadChunk("upload-retry", 0, wanted)
+	client.handleManagedUploadEnd(&protocol.Message{TaskID: "upload-retry", Path: target})
+	if completed := waitFileOpResult(t, transport); completed.Type != protocol.MsgFileTransferEnd || !completed.Success || completed.SHA256 != digest {
+		t.Fatalf("retry completion = %#v", completed)
+	}
+	if stored, err := os.ReadFile(target); err != nil || !bytes.Equal(stored, wanted) {
+		t.Fatalf("published retry = %q, err = %v", stored, err)
+	}
+}
+
+func TestFileHandleSHA256RestoresOpenedFilePosition(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "payload.bin")
+	payload := []byte("opened file")
+	if err := os.WriteFile(path, payload, 0644); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err = file.Seek(3, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := fileHandleSHA256(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("%x", sha256.Sum256(payload))
+	if digest != want {
+		t.Fatalf("opened file digest = %q, want %q", digest, want)
+	}
+	remainder, err := io.ReadAll(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(remainder, payload[3:]) {
+		t.Fatalf("opened file position was not restored: %q", remainder)
 	}
 }

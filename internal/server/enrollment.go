@@ -422,6 +422,9 @@ func (s *Server) HandleEnrollmentRedeemAPI(w http.ResponseWriter, r *http.Reques
 	}
 	s.enrollmentMu.Unlock()
 	if replacing {
+		for _, connected := range replacedConnections {
+			s.publishDeviceEvent("device.offline", connected.client, connected.id, "", "")
+		}
 		s.invalidateAccessTicketConnectionsForDevice(input.DeviceID)
 		for _, connected := range replacedConnections {
 			closeClientResources(s, connected.client)
@@ -430,6 +433,7 @@ func (s *Server) HandleEnrollmentRedeemAPI(w http.ResponseWriter, r *http.Reques
 			}
 		}
 	}
+	s.publishDeviceEvent("enrollment.consumed", nil, assignedID, invite.ID, invite.Subject)
 
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
@@ -643,6 +647,7 @@ func (s *Server) disconnectManagedDevice(deviceID, reason string) {
 		return
 	}
 	for _, connectedClient := range connected {
+		s.publishDeviceEvent("device.offline", connectedClient.client, deviceID, "", "")
 		closeClientResources(s, connectedClient.client)
 		if connectedClient.client.Transport != nil {
 			_ = connectedClient.client.Transport.Close(reason)

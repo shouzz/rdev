@@ -160,6 +160,7 @@ type Message struct {
 	Name        string      `json:"name,omitempty"`
 	Size        int64       `json:"size,omitempty"`
 	Offset      int64       `json:"offset,omitempty"`
+	SHA256      string      `json:"sha256,omitempty"`
 	ModTime     string      `json:"modTime,omitempty"`
 	IsDir       bool        `json:"isDir,omitempty"`
 	Truncated   bool        `json:"truncated,omitempty"`

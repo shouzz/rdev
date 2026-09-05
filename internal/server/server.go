@@ -563,6 +563,12 @@ type Server struct {
 	cloudTransferMu        sync.Mutex
 	cloudTransferPending   map[string]*cloudTransferDispatchPending
 	cloudTransferAckWait   time.Duration
+	deviceEventMu          sync.Mutex
+	deviceEventServerID    string
+	deviceEventSequence    uint64
+	deviceEvents           []deviceEvent
+	deviceEventWatchers    map[uint64]chan struct{}
+	deviceEventWatcherID   uint64
 	enrollmentMu           sync.Mutex
 	enrollments            map[[32]byte]enrollmentInvite
 	managedDevices         map[string]managedDevice
@@ -606,6 +612,8 @@ func NewServer() *Server {
 		accessTickets:        make(map[[32]byte]accessTicket),
 		cloudTransferPending: make(map[string]*cloudTransferDispatchPending),
 		cloudTransferAckWait: cloudTransferAckTimeout,
+		deviceEventServerID:  newDeviceEventServerID(),
+		deviceEventWatchers:  make(map[uint64]chan struct{}),
 		accessTicketNow:      time.Now,
 		enrollments:          make(map[[32]byte]enrollmentInvite),
 		managedDevices:       make(map[string]managedDevice),
@@ -706,6 +714,7 @@ func (h *wsHandler) OnClose(socket *gws.Conn, err error) {
 	client, ok := h.srv.unregisterClient(id, socket)
 	if ok {
 		closeClientResources(h.srv, client)
+		h.srv.publishDeviceEvent("device.offline", client, id, "", "")
 		log.Printf("client unregistered: %s", id)
 	}
 }
@@ -811,6 +820,11 @@ func (h *wsHandler) handleRegister(socket *gws.Conn, msg *protocol.Message) {
 		log.Printf("client duplicate ID assigned: requested=%s assigned=%s", clientID, assignedID)
 	} else {
 		log.Printf("client registered: %s", assignedID)
+	}
+	if old != nil {
+		h.srv.publishDeviceEvent("device.updated", client, "", "", "")
+	} else {
+		h.srv.publishDeviceEvent("device.online", client, "", "", "")
 	}
 	client.Send(&protocol.Message{
 		Type:       protocol.MsgRegister,
@@ -1080,6 +1094,7 @@ func (s *Server) handleStreamDeviceConn(conn net.Conn, label string) {
 		if registered {
 			if client, ok := s.unregisterClientTransport(clientID, transport); ok {
 				closeClientResources(s, client)
+				s.publishDeviceEvent("device.offline", client, clientID, "", "")
 				log.Printf("client unregistered: %s", clientID)
 			}
 		}
@@ -1191,6 +1206,11 @@ func (s *Server) registerStreamClient(transport DeviceTransport, msg *protocol.M
 		log.Printf("client duplicate ID assigned via %s: requested=%s assigned=%s", label, clientID, assignedID)
 	} else {
 		log.Printf("client registered via %s: %s", label, assignedID)
+	}
+	if old != nil {
+		s.publishDeviceEvent("device.updated", client, "", "", "")
+	} else {
+		s.publishDeviceEvent("device.online", client, "", "", "")
 	}
 	_ = client.Send(&protocol.Message{Type: protocol.MsgRegister, ClientID: assignedID, InstanceID: instanceID, SSHPort: s.SSHPort, HTTPHost: s.HTTPHost})
 	s.sendClientLogConfig(client)
@@ -1523,57 +1543,8 @@ func (s *Server) HandleAPI(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAuth(w, r) {
 		return
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	type clientInfo struct {
-		ID              string                        `json:"id"`
-		RequestedID     string                        `json:"requestedId,omitempty"`
-		InstanceID      string                        `json:"instanceId,omitempty"`
-		Version         string                        `json:"version,omitempty"`
-		ConnectedAt     string                        `json:"connectedAt"`
-		Sessions        int                           `json:"sessions"`
-		Forwards        int                           `json:"forwards"`
-		HasPassword     bool                          `json:"hasPassword"`
-		Desktop         *protocol.DesktopCapabilities `json:"desktop,omitempty"`
-		GPUDesktop      bool                          `json:"gpuDesktop,omitempty"`
-		LogSupported    bool                          `json:"logSupported,omitempty"`
-		CloudTransferV1 bool                          `json:"cloudTransferV1,omitempty"`
-		OwnerSubject    string                        `json:"ownerSubject,omitempty"`
-	}
-
-	clients := make([]clientInfo, 0, len(s.clients))
-	for _, c := range s.clients {
-		c.mu.Lock()
-		n := len(c.Sessions)
-		f := len(c.Forwards)
-		c.mu.Unlock()
-		clients = append(clients, clientInfo{
-			ID:              c.ID,
-			RequestedID:     c.RequestedID,
-			InstanceID:      c.InstanceID,
-			Version:         c.Version,
-			ConnectedAt:     c.ConnectedAt.Format(time.RFC3339),
-			Sessions:        n,
-			Forwards:        f,
-			HasPassword:     c.Password != "",
-			Desktop:         publicDesktopCapabilities(c.Desktop),
-			GPUDesktop:      s.clientGPUDesktopAvailable(c),
-			LogSupported:    c.LogSupported,
-			CloudTransferV1: c.CloudTransferV1,
-			OwnerSubject:    c.OwnerSubject,
-		})
-	}
-
-	sort.Slice(clients, func(i, j int) bool {
-		if clients[i].ID != clients[j].ID {
-			return clients[i].ID < clients[j].ID
-		}
-		return clients[i].ConnectedAt < clients[j].ConnectedAt
-	})
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(clients)
+	json.NewEncoder(w).Encode(s.snapshotDevices())
 }
 
 func releaseDownloadDirectURL(asset, tag string) string {

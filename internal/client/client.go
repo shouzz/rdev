@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -206,9 +207,11 @@ type fileStream struct {
 type managedUpload struct {
 	path      string
 	partPath  string
+	metaPath  string
 	file      *os.File
 	size      int64
 	offset    int64
+	sha256    string
 	startedAt time.Time
 }
 
@@ -1252,11 +1255,16 @@ func (c *Client) handleManagedUploadStart(msg *protocol.Message) {
 			return
 		}
 	}
+	if msg.SHA256 != "" && !validFileSHA256(msg.SHA256) {
+		c.sendFileTransferError(taskID, target, "invalid SHA-256")
+		return
+	}
 	if target == "" {
 		c.sendFileTransferError(taskID, "", "missing target path")
 		return
 	}
 	partPath := target + ".rdevpart"
+	metaPath := partPath + ".meta"
 	if err := os.MkdirAll(filepath.Dir(partPath), 0755); err != nil {
 		c.sendFileTransferError(taskID, target, fmt.Sprintf("mkdir error: %v", err))
 		return
@@ -1273,6 +1281,28 @@ func (c *Client) handleManagedUploadStart(msg *protocol.Message) {
 		return
 	}
 	offset := st.Size()
+	if msg.SHA256 != "" {
+		metadata := managedUploadMetadata(msg.Size, msg.SHA256)
+		storedMetadata, readErr := os.ReadFile(metaPath)
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			f.Close()
+			c.sendFileTransferError(taskID, target, readErr.Error())
+			return
+		}
+		if !bytes.Equal(storedMetadata, metadata) && offset > 0 {
+			if err := f.Truncate(0); err != nil {
+				f.Close()
+				c.sendFileTransferError(taskID, target, err.Error())
+				return
+			}
+			offset = 0
+		}
+		if err := os.WriteFile(metaPath, metadata, 0600); err != nil {
+			f.Close()
+			c.sendFileTransferError(taskID, target, err.Error())
+			return
+		}
+	}
 	if msg.Size >= 0 && offset > msg.Size {
 		if err := f.Truncate(0); err != nil {
 			f.Close()
@@ -1290,7 +1320,7 @@ func (c *Client) handleManagedUploadStart(msg *protocol.Message) {
 	if old := c.uploads[taskID]; old != nil {
 		old.file.Close()
 	}
-	c.uploads[taskID] = &managedUpload{path: target, partPath: partPath, file: f, size: msg.Size, offset: offset, startedAt: time.Now()}
+	c.uploads[taskID] = &managedUpload{path: target, partPath: partPath, metaPath: metaPath, file: f, size: msg.Size, offset: offset, sha256: msg.SHA256, startedAt: time.Now()}
 	c.mu.Unlock()
 	c.send(&protocol.Message{Type: protocol.MsgFileUploadReady, TaskID: taskID, Path: target, Offset: offset, Size: msg.Size})
 }
@@ -1339,11 +1369,26 @@ func (c *Client) handleManagedUploadEnd(msg *protocol.Message) {
 		c.sendFileTransferError(taskID, up.path, fmt.Sprintf("size mismatch: wrote %d of %d", up.offset, up.size))
 		return
 	}
+	actualSHA256, err := fileSHA256(up.partPath)
+	if err != nil {
+		c.sendFileTransferError(taskID, up.path, err.Error())
+		return
+	}
+	if up.sha256 != "" && actualSHA256 != up.sha256 {
+		if err := os.Truncate(up.partPath, 0); err != nil {
+			c.sendFileTransferError(taskID, up.path, fmt.Sprintf("SHA-256 mismatch; reset failed: %v", err))
+			return
+		}
+		_ = os.Remove(up.metaPath)
+		c.sendFileTransferError(taskID, up.path, "SHA-256 mismatch")
+		return
+	}
 	if err := os.Rename(up.partPath, up.path); err != nil {
 		c.sendFileTransferError(taskID, up.path, err.Error())
 		return
 	}
-	c.send(&protocol.Message{Type: protocol.MsgFileTransferEnd, TaskID: taskID, Path: up.path, Size: up.offset, Success: true})
+	_ = os.Remove(up.metaPath)
+	c.send(&protocol.Message{Type: protocol.MsgFileTransferEnd, TaskID: taskID, Path: up.path, Size: up.offset, SHA256: actualSHA256, Success: true})
 }
 
 func (c *Client) handleManagedDownloadStart(msg *protocol.Message) {
@@ -1365,6 +1410,11 @@ func (c *Client) handleManagedDownloadStart(msg *protocol.Message) {
 	}
 	if st.IsDir() {
 		c.sendFileTransferError(taskID, path, "cannot download directory")
+		return
+	}
+	fileHash, err := fileHandleSHA256(f)
+	if err != nil {
+		c.sendFileTransferError(taskID, path, err.Error())
 		return
 	}
 	offset := msg.Offset
@@ -1389,7 +1439,7 @@ func (c *Client) handleManagedDownloadStart(msg *protocol.Message) {
 		}
 		c.mu.Unlock()
 	}()
-	c.send(&protocol.Message{Type: protocol.MsgFileDownloadStart, TaskID: taskID, Path: path, Name: filepath.Base(path), Size: st.Size(), Offset: offset, ModTime: st.ModTime().Format(time.RFC3339)})
+	c.send(&protocol.Message{Type: protocol.MsgFileDownloadStart, TaskID: taskID, Path: path, Name: filepath.Base(path), Size: st.Size(), Offset: offset, SHA256: fileHash, ModTime: st.ModTime().Format(time.RFC3339)})
 	buf := make([]byte, 512*1024)
 	cur := offset
 	for {
@@ -1412,7 +1462,7 @@ func (c *Client) handleManagedDownloadStart(msg *protocol.Message) {
 		}
 		if readErr == io.EOF {
 			c.sendBinaryOffset(protocol.BinFileTransferEnd, taskID, cur, nil)
-			c.send(&protocol.Message{Type: protocol.MsgFileTransferEnd, TaskID: taskID, Path: path, Size: st.Size(), Offset: cur, Success: true})
+			c.send(&protocol.Message{Type: protocol.MsgFileTransferEnd, TaskID: taskID, Path: path, Size: st.Size(), Offset: cur, SHA256: fileHash, Success: true})
 			return
 		}
 		if readErr != nil {
@@ -1420,6 +1470,49 @@ func (c *Client) handleManagedDownloadStart(msg *protocol.Message) {
 			return
 		}
 	}
+}
+
+func validFileSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, character := range value {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func fileSHA256(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	return fileHandleSHA256(file)
+}
+
+func fileHandleSHA256(file *os.File) (string, error) {
+	position, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return "", err
+	}
+	if _, err = file.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	if _, err = io.CopyBuffer(hash, file, make([]byte, 1024*1024)); err != nil {
+		return "", err
+	}
+	if _, err = file.Seek(position, io.SeekStart); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func managedUploadMetadata(size int64, digest string) []byte {
+	return []byte(strconv.FormatInt(size, 10) + "\n" + digest + "\n")
 }
 
 func (c *Client) handleManagedTransferCancel(taskID string) {
