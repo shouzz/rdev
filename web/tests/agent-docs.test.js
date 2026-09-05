@@ -59,7 +59,7 @@ describe("AI Agent artifact bridge", () => {
       "archive",
     ]);
     expect(repository.rdev.verified_windows_scp.client_version).toBe(
-      "go/v0.2.121-feidu.7",
+      "go/v0.2.121-feidu.14",
     );
     expect(
       repository.rdev.verified_windows_scp.fallback_for_other_versions,
@@ -135,7 +135,7 @@ describe("AI Agent artifact bridge", () => {
     expect(repositoryGuide).toContain("`FEIDU_DRIVE_TOKEN`");
     expect(repositoryGuide).toContain("`/api/config`");
     expect(repositoryGuide).toContain("`operation_id`");
-    expect(repositoryGuide).toContain("`go/v0.2.121-feidu.7`");
+    expect(repositoryGuide).toContain("`go/v0.2.121-feidu.14`");
     expect(repositoryGuide).toContain("`data.credentials.device_id`");
     expect(repositoryGuide).not.toContain(
       "curl -fsS https://r.feidu.fit/api/clients",
