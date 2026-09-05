@@ -74,6 +74,10 @@ type ClientConn struct {
 	RequestedID     string
 	InstanceID      string
 	Version         string
+	Platform        string
+	Architecture    string
+	TransportName   string
+	RemoteIP        string
 	Conn            *gws.Conn
 	Transport       DeviceTransport
 	ConnectedAt     time.Time
@@ -85,8 +89,11 @@ type ClientConn struct {
 	Desktop         *protocol.DesktopCapabilities
 	LogSupported    bool
 	CloudTransferV1 bool
+	Network         *deviceNetworkInfo
 	writeMu         sync.Mutex
 	mu              sync.Mutex
+	telemetryMu     sync.Mutex
+	telemetry       deviceTelemetry
 }
 
 type DeviceTransport interface {
@@ -121,7 +128,7 @@ func (t *wsDeviceTransport) Close(reason string) error {
 	return t.conn.WriteClose(1000, []byte(reason))
 }
 
-func (t *wsDeviceTransport) RemoteAddr() string { return "" }
+func (t *wsDeviceTransport) RemoteAddr() string { return t.conn.RemoteAddr().String() }
 
 type streamDeviceTransport struct {
 	conn net.Conn
@@ -160,7 +167,22 @@ func (c *ClientConn) Send(msg *protocol.Message) error {
 	if c.Transport == nil {
 		return net.ErrClosed
 	}
-	return c.Transport.WriteJSON(data)
+	err = c.Transport.WriteJSON(data)
+	if err == nil {
+		c.recordDeviceDownload(uint64(len(data)))
+	}
+	return err
+}
+
+func (c *ClientConn) writeDeviceBinary(frame []byte) error {
+	if c.Transport == nil {
+		return net.ErrClosed
+	}
+	err := c.Transport.WriteBinary(frame)
+	if err == nil {
+		c.recordDeviceDownload(uint64(len(frame)))
+	}
+	return err
 }
 
 // SendBinary sends a binary data frame to the client
@@ -168,10 +190,7 @@ func (c *ClientConn) SendBinary(typ byte, id string, data []byte) error {
 	frame := protocol.EncodeBinFrame(typ, id, data)
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if c.Transport == nil {
-		return net.ErrClosed
-	}
-	return c.Transport.WriteBinary(frame)
+	return c.writeDeviceBinary(frame)
 }
 
 // SendFilePut sends a file to the client device (binary frame)
@@ -179,50 +198,35 @@ func (c *ClientConn) SendFilePut(id, path string, mode int32, fileData []byte) e
 	frame := protocol.EncodeBinFilePut(id, path, mode, fileData)
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if c.Transport == nil {
-		return net.ErrClosed
-	}
-	return c.Transport.WriteBinary(frame)
+	return c.writeDeviceBinary(frame)
 }
 
 func (c *ClientConn) SendFileStart(id, path string, mode int32) error {
 	frame := protocol.EncodeBinFileStart(id, path, mode)
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if c.Transport == nil {
-		return net.ErrClosed
-	}
-	return c.Transport.WriteBinary(frame)
+	return c.writeDeviceBinary(frame)
 }
 
 func (c *ClientConn) SendFileChunk(id string, data []byte) error {
 	frame := protocol.EncodeBinFrame(protocol.BinFileChunk, id, data)
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if c.Transport == nil {
-		return net.ErrClosed
-	}
-	return c.Transport.WriteBinary(frame)
+	return c.writeDeviceBinary(frame)
 }
 
 func (c *ClientConn) SendFileEnd(id string) error {
 	frame := protocol.EncodeBinFrame(protocol.BinFileEnd, id, nil)
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if c.Transport == nil {
-		return net.ErrClosed
-	}
-	return c.Transport.WriteBinary(frame)
+	return c.writeDeviceBinary(frame)
 }
 
 func (c *ClientConn) SendBinaryOffset(typ byte, id string, offset int64, data []byte) error {
 	frame := protocol.EncodeBinFrameOffset(typ, id, offset, data)
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if c.Transport == nil {
-		return net.ErrClosed
-	}
-	return c.Transport.WriteBinary(frame)
+	return c.writeDeviceBinary(frame)
 }
 
 func (c *ClientConn) SendPing() error {
@@ -569,6 +573,7 @@ type Server struct {
 	deviceEvents           []deviceEvent
 	deviceEventWatchers    map[uint64]chan struct{}
 	deviceEventWatcherID   uint64
+	deviceNetworkResolver  *deviceNetworkResolver
 	enrollmentMu           sync.Mutex
 	enrollments            map[[32]byte]enrollmentInvite
 	managedDevices         map[string]managedDevice
@@ -598,30 +603,31 @@ type Server struct {
 // NewServer creates a new Server
 func NewServer() *Server {
 	s := &Server{
-		clients:              make(map[string]*ClientConn),
-		sessions:             make(map[string]*ProxySession),
-		forwards:             make(map[string]*ProxyForward),
-		revForwards:          make(map[string]*ReverseForward),
-		fileResults:          make(map[string]chan *protocol.Message),
-		fileRequests:         make(map[string]*fileSocket),
-		fileTasks:            make(map[string]*fileTaskRoute),
-		desktops:             make(map[string]*desktopRoute),
-		vncSettings:          make(map[string]protocol.Message),
-		vncStreams:           make(map[string]*vncDesktopStream),
-		gpuDesktopTunnels:    make(map[string]*gpuDesktopTunnel),
-		accessTickets:        make(map[[32]byte]accessTicket),
-		cloudTransferPending: make(map[string]*cloudTransferDispatchPending),
-		cloudTransferAckWait: cloudTransferAckTimeout,
-		deviceEventServerID:  newDeviceEventServerID(),
-		deviceEventWatchers:  make(map[uint64]chan struct{}),
-		accessTicketNow:      time.Now,
-		enrollments:          make(map[[32]byte]enrollmentInvite),
-		managedDevices:       make(map[string]managedDevice),
-		enrollmentNow:        time.Now,
-		MaxSessions:          256,
-		MaxForwards:          1024,
-		BatchConcurrency:     runtime.GOMAXPROCS(0) * 8,
-		ClientLogs:           NewClientLogManager("", 0, 0),
+		clients:               make(map[string]*ClientConn),
+		sessions:              make(map[string]*ProxySession),
+		forwards:              make(map[string]*ProxyForward),
+		revForwards:           make(map[string]*ReverseForward),
+		fileResults:           make(map[string]chan *protocol.Message),
+		fileRequests:          make(map[string]*fileSocket),
+		fileTasks:             make(map[string]*fileTaskRoute),
+		desktops:              make(map[string]*desktopRoute),
+		vncSettings:           make(map[string]protocol.Message),
+		vncStreams:            make(map[string]*vncDesktopStream),
+		gpuDesktopTunnels:     make(map[string]*gpuDesktopTunnel),
+		accessTickets:         make(map[[32]byte]accessTicket),
+		cloudTransferPending:  make(map[string]*cloudTransferDispatchPending),
+		cloudTransferAckWait:  cloudTransferAckTimeout,
+		deviceEventServerID:   newDeviceEventServerID(),
+		deviceEventWatchers:   make(map[uint64]chan struct{}),
+		deviceNetworkResolver: newDeviceNetworkResolver(),
+		accessTicketNow:       time.Now,
+		enrollments:           make(map[[32]byte]enrollmentInvite),
+		managedDevices:        make(map[string]managedDevice),
+		enrollmentNow:         time.Now,
+		MaxSessions:           256,
+		MaxForwards:           1024,
+		BatchConcurrency:      runtime.GOMAXPROCS(0) * 8,
+		ClientLogs:            NewClientLogManager("", 0, 0),
 	}
 	s.upgrader = gws.NewUpgrader(&wsHandler{srv: s}, &gws.ServerOption{
 		ReadMaxPayloadSize: 16 * 1024 * 1024,
@@ -697,11 +703,19 @@ func (h *wsHandler) OnPing(socket *gws.Conn, payload []byte) {
 	if client == nil || client.Conn != socket {
 		return
 	}
+	client.markDeviceSeen(time.Now())
 	_ = socket.WritePong(payload)
 }
 
 func (h *wsHandler) OnPong(socket *gws.Conn, payload []byte) {
 	_ = socket.SetDeadline(time.Now().Add(wsReadWait))
+	clientID, _ := socket.Session().Load("clientID")
+	if clientID == nil {
+		return
+	}
+	if client := h.srv.clientByID(clientID.(string)); client != nil && client.Conn == socket {
+		client.markDeviceSeen(time.Now())
+	}
 }
 
 func (h *wsHandler) OnClose(socket *gws.Conn, err error) {
@@ -756,6 +770,7 @@ func (h *wsHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 	if !ok || client.Conn != socket {
 		return
 	}
+	client.recordDeviceUpload(uint64(len(message.Bytes())), time.Now())
 
 	h.srv.handleClientMessage(client, msg)
 }
@@ -778,11 +793,18 @@ func (h *wsHandler) handleRegister(socket *gws.Conn, msg *protocol.Message) {
 		return
 	}
 	instanceID := strings.TrimSpace(msg.InstanceID)
+	platform, architecture := validateRegistrationRuntime(msg.Platform, msg.Architecture)
+	remoteIPValue, _ := socket.Session().Load("remoteIP")
+	remoteIP, _ := remoteIPValue.(string)
 	client := &ClientConn{
 		ID:              clientID,
 		RequestedID:     clientID,
 		InstanceID:      instanceID,
 		Version:         msg.ClientVersion,
+		Platform:        platform,
+		Architecture:    architecture,
+		TransportName:   "wss",
+		RemoteIP:        remoteIP,
 		Conn:            socket,
 		Transport:       &wsDeviceTransport{conn: socket},
 		ConnectedAt:     time.Now(),
@@ -795,6 +817,8 @@ func (h *wsHandler) handleRegister(socket *gws.Conn, msg *protocol.Message) {
 		Sessions:        make(map[string]*ProxySession),
 		Forwards:        make(map[string]*ProxyForward),
 	}
+	client.initializeDeviceTelemetry(time.Now())
+	h.srv.prepareClientNetwork(client)
 
 	socket.Session().Store("clientID", clientID)
 	old, assignedID, duplicate, authorizationCurrent, registerErr := h.srv.registerClientIfAuthorizationCurrent(client, msg.DeviceSecret)
@@ -835,6 +859,8 @@ func (h *wsHandler) handleRegister(socket *gws.Conn, msg *protocol.Message) {
 	})
 	h.srv.sendClientLogConfig(client)
 	go h.srv.clientPingLoop(client)
+	go h.srv.clientTelemetryLoop(client)
+	h.srv.resolvePreparedClientNetwork(client)
 }
 
 func cloneDesktopCapabilities(caps *protocol.DesktopCapabilities) *protocol.DesktopCapabilities {
@@ -1023,6 +1049,18 @@ func (s *Server) clientPingLoop(client *ClientConn) {
 	}
 }
 
+func (s *Server) clientTelemetryLoop(client *ClientConn) {
+	ticker := time.NewTicker(deviceTelemetryInterval)
+	defer ticker.Stop()
+	for now := range ticker.C {
+		if current := s.clientByID(client.ID); current != client {
+			return
+		}
+		client.sampleDeviceTelemetry(now)
+		s.publishDeviceEvent("device.telemetry", client, "", "", "")
+	}
+}
+
 func sendBytes(ch chan []byte, data []byte, label string) {
 	select {
 	case ch <- data:
@@ -1044,6 +1082,7 @@ func (h *wsHandler) handleBinaryMessage(socket *gws.Conn, raw []byte) {
 	if !ok || client.Conn != socket {
 		return
 	}
+	client.recordDeviceUpload(uint64(len(raw)), time.Now())
 	h.srv.handleClientBinary(client, raw)
 }
 
@@ -1134,6 +1173,7 @@ func (s *Server) handleStreamDeviceConn(conn net.Conn, label string) {
 			if client == nil || client.Transport != transport {
 				return
 			}
+			client.recordDeviceUpload(uint64(len(frame.Payload)), time.Now())
 			s.handleClientMessage(client, msg)
 		case tframe.KindBinary:
 			if !registered {
@@ -1143,10 +1183,21 @@ func (s *Server) handleStreamDeviceConn(conn net.Conn, label string) {
 			if client == nil || client.Transport != transport {
 				return
 			}
+			client.recordDeviceUpload(uint64(len(frame.Payload)), time.Now())
 			s.handleClientBinary(client, frame.Payload)
 		case tframe.KindPing:
+			if registered {
+				if client := s.clientByID(clientID); client != nil && client.Transport == transport {
+					client.markDeviceSeen(time.Now())
+				}
+			}
 			_ = transport.write(tframe.KindPong, frame.Payload)
 		case tframe.KindPong:
+			if registered {
+				if client := s.clientByID(clientID); client != nil && client.Transport == transport {
+					client.markDeviceSeen(time.Now())
+				}
+			}
 		case tframe.KindClose:
 			return
 		}
@@ -1167,11 +1218,16 @@ func (s *Server) registerStreamClient(transport DeviceTransport, msg *protocol.M
 		return "", false
 	}
 	instanceID := strings.TrimSpace(msg.InstanceID)
+	platform, architecture := validateRegistrationRuntime(msg.Platform, msg.Architecture)
 	client := &ClientConn{
 		ID:              clientID,
 		RequestedID:     clientID,
 		InstanceID:      instanceID,
 		Version:         msg.ClientVersion,
+		Platform:        platform,
+		Architecture:    architecture,
+		TransportName:   label,
+		RemoteIP:        remoteIPFromAddress(transport.RemoteAddr()),
 		Transport:       transport,
 		ConnectedAt:     time.Now(),
 		Password:        msg.Password,
@@ -1183,6 +1239,8 @@ func (s *Server) registerStreamClient(transport DeviceTransport, msg *protocol.M
 		Sessions:        make(map[string]*ProxySession),
 		Forwards:        make(map[string]*ProxyForward),
 	}
+	client.initializeDeviceTelemetry(time.Now())
+	s.prepareClientNetwork(client)
 	old, assignedID, duplicate, authorizationCurrent, registerErr := s.registerClientIfAuthorizationCurrent(client, msg.DeviceSecret)
 	if registerErr != nil {
 		data, _ := protocol.Encode(&protocol.Message{Type: protocol.MsgRegisterError, Error: "managed device access ticket restore failed"})
@@ -1215,6 +1273,8 @@ func (s *Server) registerStreamClient(transport DeviceTransport, msg *protocol.M
 	_ = client.Send(&protocol.Message{Type: protocol.MsgRegister, ClientID: assignedID, InstanceID: instanceID, SSHPort: s.SSHPort, HTTPHost: s.HTTPHost})
 	s.sendClientLogConfig(client)
 	go s.clientPingLoop(client)
+	go s.clientTelemetryLoop(client)
+	s.resolvePreparedClientNetwork(client)
 	return assignedID, true
 }
 
@@ -1252,11 +1312,13 @@ func (s *Server) handleClientBinary(client *ClientConn, raw []byte) {
 
 // HandleWS handles a WebSocket connection from a client device
 func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
+	remoteIP := observedWebSocketRemoteIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"))
 	socket, err := s.upgrader.Upgrade(w, r)
 	if err != nil {
 		log.Printf("ws upgrade error: %v", err)
 		return
 	}
+	socket.Session().Store("remoteIP", remoteIP)
 	socket.ReadLoop()
 }
 

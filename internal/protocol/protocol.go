@@ -112,6 +112,8 @@ type Message struct {
 	ClientID      string      `json:"clientId,omitempty"`
 	SessionID     string      `json:"sessionId,omitempty"`
 	ClientVersion string      `json:"clientVersion,omitempty"`
+	Platform      string      `json:"platform,omitempty"`
+	Architecture  string      `json:"architecture,omitempty"`
 
 	// Client registration identity. InstanceID is a stable per-process token used
 	// to distinguish duplicate IDs from reconnects of the same running client.

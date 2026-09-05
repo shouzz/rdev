@@ -1062,7 +1062,8 @@ func (c *Client) handleMessage(msg *protocol.Message) {
 func (c *Client) registrationMessage() *protocol.Message {
 	return &protocol.Message{
 		Type: protocol.MsgRegister, ClientID: c.requestedID, InstanceID: c.instanceID,
-		ClientVersion: c.version, Password: c.password, DeviceSecret: c.deviceSecret,
+		ClientVersion: c.version, Platform: runtime.GOOS, Architecture: runtime.GOARCH,
+		Password: c.password, DeviceSecret: c.deviceSecret,
 		DesktopCapabilities: desktopCapabilities(), LogSupported: true, CloudTransferV1: true,
 	}
 }

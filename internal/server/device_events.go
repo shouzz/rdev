@@ -20,19 +20,31 @@ const (
 )
 
 type deviceInfo struct {
-	ID              string                        `json:"id"`
-	RequestedID     string                        `json:"requestedId,omitempty"`
-	InstanceID      string                        `json:"instanceId,omitempty"`
-	Version         string                        `json:"version,omitempty"`
-	ConnectedAt     string                        `json:"connectedAt"`
-	Sessions        int                           `json:"sessions"`
-	Forwards        int                           `json:"forwards"`
-	HasPassword     bool                          `json:"hasPassword"`
-	Desktop         *protocol.DesktopCapabilities `json:"desktop,omitempty"`
-	GPUDesktop      bool                          `json:"gpuDesktop,omitempty"`
-	LogSupported    bool                          `json:"logSupported,omitempty"`
-	CloudTransferV1 bool                          `json:"cloudTransferV1,omitempty"`
-	OwnerSubject    string                        `json:"ownerSubject,omitempty"`
+	ID                               string                        `json:"id"`
+	RequestedID                      string                        `json:"requestedId,omitempty"`
+	InstanceID                       string                        `json:"instanceId,omitempty"`
+	Version                          string                        `json:"version,omitempty"`
+	Platform                         string                        `json:"platform,omitempty"`
+	Architecture                     string                        `json:"architecture,omitempty"`
+	Transport                        string                        `json:"transport,omitempty"`
+	RemoteIP                         string                        `json:"remoteIp,omitempty"`
+	ConnectedAt                      string                        `json:"connectedAt"`
+	LastSeenAt                       string                        `json:"lastSeenAt"`
+	Sessions                         int                           `json:"sessions"`
+	Forwards                         int                           `json:"forwards"`
+	DeviceUploadBytes                uint64                        `json:"deviceUploadBytes"`
+	DeviceDownloadBytes              uint64                        `json:"deviceDownloadBytes"`
+	DeviceUploadBytesPerSecond       uint64                        `json:"deviceUploadBytesPerSecond"`
+	DeviceDownloadBytesPerSecond     uint64                        `json:"deviceDownloadBytesPerSecond"`
+	PeakDeviceUploadBytesPerSecond   uint64                        `json:"peakDeviceUploadBytesPerSecond"`
+	PeakDeviceDownloadBytesPerSecond uint64                        `json:"peakDeviceDownloadBytesPerSecond"`
+	HasPassword                      bool                          `json:"hasPassword"`
+	Desktop                          *protocol.DesktopCapabilities `json:"desktop,omitempty"`
+	GPUDesktop                       bool                          `json:"gpuDesktop,omitempty"`
+	LogSupported                     bool                          `json:"logSupported,omitempty"`
+	CloudTransferV1                  bool                          `json:"cloudTransferV1,omitempty"`
+	OwnerSubject                     string                        `json:"ownerSubject,omitempty"`
+	Network                          *deviceNetworkInfo            `json:"network,omitempty"`
 }
 
 type deviceEvent struct {
@@ -59,21 +71,35 @@ func (s *Server) deviceInfo(client *ClientConn) deviceInfo {
 	client.mu.Lock()
 	sessions := len(client.Sessions)
 	forwards := len(client.Forwards)
+	network := cloneDeviceNetworkInfo(client.Network)
 	client.mu.Unlock()
+	telemetry := client.deviceTelemetrySnapshot()
 	return deviceInfo{
-		ID:              client.ID,
-		RequestedID:     client.RequestedID,
-		InstanceID:      client.InstanceID,
-		Version:         client.Version,
-		ConnectedAt:     client.ConnectedAt.Format(time.RFC3339),
-		Sessions:        sessions,
-		Forwards:        forwards,
-		HasPassword:     client.Password != "",
-		Desktop:         publicDesktopCapabilities(client.Desktop),
-		GPUDesktop:      s.clientGPUDesktopAvailable(client),
-		LogSupported:    client.LogSupported,
-		CloudTransferV1: client.CloudTransferV1,
-		OwnerSubject:    client.OwnerSubject,
+		ID:                               client.ID,
+		RequestedID:                      client.RequestedID,
+		InstanceID:                       client.InstanceID,
+		Version:                          client.Version,
+		Platform:                         client.Platform,
+		Architecture:                     client.Architecture,
+		Transport:                        client.TransportName,
+		RemoteIP:                         client.RemoteIP,
+		ConnectedAt:                      client.ConnectedAt.Format(time.RFC3339),
+		LastSeenAt:                       telemetry.LastSeenAt.UTC().Format(time.RFC3339Nano),
+		Sessions:                         sessions,
+		Forwards:                         forwards,
+		DeviceUploadBytes:                telemetry.DeviceUploadBytes,
+		DeviceDownloadBytes:              telemetry.DeviceDownloadBytes,
+		DeviceUploadBytesPerSecond:       telemetry.DeviceUploadBytesPerSecond,
+		DeviceDownloadBytesPerSecond:     telemetry.DeviceDownloadBytesPerSecond,
+		PeakDeviceUploadBytesPerSecond:   telemetry.PeakDeviceUploadBytesPerSecond,
+		PeakDeviceDownloadBytesPerSecond: telemetry.PeakDeviceDownloadBytesPerSecond,
+		HasPassword:                      client.Password != "",
+		Desktop:                          publicDesktopCapabilities(client.Desktop),
+		GPUDesktop:                       s.clientGPUDesktopAvailable(client),
+		LogSupported:                     client.LogSupported,
+		CloudTransferV1:                  client.CloudTransferV1,
+		OwnerSubject:                     client.OwnerSubject,
+		Network:                          network,
 	}
 }
 
