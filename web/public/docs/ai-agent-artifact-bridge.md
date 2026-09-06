@@ -101,7 +101,7 @@ curl -fsS https://r.feidu.fit/api/config
    ssh -p <sshPort> '<deviceId>@r.feidu.fit' 'sha256sum /tmp/artifact.bin'
    ```
 
-   Windows Go 客户端的普通 `scp` 命令当前在 `go/v0.2.121-feidu.15` 上按 OpenSSH 默认 SFTP 协议完成真实链路实测。不要添加 `-O` 强制旧 SCP 协议；交接响应不包含客户端版本时仍默认使用 SFTP。网页 `run.ps1` 和 `run.sh` 会优先下载这个 Windows amd64 客户端，并校验 SHA-256 `4e24cbfe56afb8a545ea0fae145c5ea4b3ad8adfeaadecfda3501f082604b1dd`。
+   Windows Go 客户端的普通 `scp` 命令当前在 `go/v0.2.121-feidu.16` 上按 OpenSSH 默认 SFTP 协议完成真实链路实测。不要添加 `-O` 强制旧 SCP 协议；交接响应不包含客户端版本时仍默认使用 SFTP。网页 `run.ps1` 和 `run.sh` 会优先下载这个 Windows amd64 客户端，并校验 SHA-256 `9a72a3dfa04696a2b2b67f13a51daa533c8dc4757dd2d92b962576d298185abd`。
 
 4. 比较本地和设备端哈希，再执行部署命令。此处是通用 Agent 手工路径；登录网页中大于 `104857600` 字节的文件使用第 8 节的自动云中转。
 
@@ -182,7 +182,7 @@ python3 tools/feidu-drive.py resume-upload '<session_id>' ./staging/ota.img
 - 每个任务使用 `rdev-agent.py start` 兑换一次性交接，再由工具调用 heartbeat 和 RDev `/api/config`。
 - 后续操作先运行 `rdev-agent.py status`；达到 `renewal_due_at_ms` 或安全余量不足时由工具自动续签并原子保存更新后的到期字段，`rdvat_`、`fdpat_` 和 `fdrn_` 在委托期内都保持不变。
 - 不调用 RDev `/api/clients`；设备 ID只取 `data.credentials.device_id`。
-- 默认使用 SFTP。Windows 上的 `scp` 不得添加 `-O`；设备版本必须由独立可信来源确认精确等于 `go/v0.2.121-feidu.15`。
+- 默认使用 SFTP。Windows 上的 `scp` 不得添加 `-O`；设备版本必须由独立可信来源确认精确等于 `go/v0.2.121-feidu.16`。
 - 只使用真实 `content_id`、交接响应的设备 ID和 `/api/config` 返回的 `sshPort`。
 - 下载和上传都采用临时文件、大小校验、哈希校验和原子替换。
 - 传输失败时只重试当前阶段；不要重新创建云盘对象或并发上传同一会话。

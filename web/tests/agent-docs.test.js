@@ -59,7 +59,7 @@ describe("AI Agent artifact bridge", () => {
       "archive",
     ]);
     expect(repository.rdev.verified_windows_scp.client_version).toBe(
-      "go/v0.2.121-feidu.15",
+      "go/v0.2.121-feidu.16",
     );
     expect(
       repository.rdev.verified_windows_scp.fallback_for_other_versions,
@@ -135,7 +135,7 @@ describe("AI Agent artifact bridge", () => {
     expect(repositoryGuide).toContain("`FEIDU_DRIVE_TOKEN`");
     expect(repositoryGuide).toContain("`/api/config`");
     expect(repositoryGuide).toContain("`operation_id`");
-    expect(repositoryGuide).toContain("`go/v0.2.121-feidu.15`");
+    expect(repositoryGuide).toContain("`go/v0.2.121-feidu.16`");
     expect(repositoryGuide).toContain("`data.credentials.device_id`");
     expect(repositoryGuide).not.toContain(
       "curl -fsS https://r.feidu.fit/api/clients",
@@ -224,11 +224,11 @@ describe("AI Agent artifact bridge", () => {
   test("launchers prefer the verified managed clients", async () => {
     const expectedRevision = "feidu-20260905-7be947e";
     const expectedWindowsHash =
-      "4e24cbfe56afb8a545ea0fae145c5ea4b3ad8adfeaadecfda3501f082604b1dd";
+      "9a72a3dfa04696a2b2b67f13a51daa533c8dc4757dd2d92b962576d298185abd";
     const expectedLinuxAMD64Hash =
-      "ed23f99383f87ff1fb66c4256f4550b8e669688be0898f4d06037eac8c4a6520";
+      "f096771469099050590688ca663b947b5130951d00658f325b997744de2bc212";
     const expectedLinuxARM64Hash =
-      "dd5d27376e7efc0d5b29a8e9fa37c79a4d605cc93056e99d2150c58744126a68";
+      "8041966da8428b4c32d92e62576b7009d09507c999070dfa1af5f35f58fb490b";
     const powershell = await readFile(
       resolve(root, "internal/server/static/run.ps1"),
       "utf8",

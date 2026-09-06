@@ -40,7 +40,7 @@ $script:Repo = 'icepie/rdev'
 $script:DefaultControlBase = 'https://r.feidu.fit'
 $script:LocalClientRevision = 'feidu-20260905-7be947e'
 $script:LocalWindowsAMD64Asset = 'rdev-client-windows-amd64.exe'
-$script:LocalWindowsAMD64SHA256 = '4e24cbfe56afb8a545ea0fae145c5ea4b3ad8adfeaadecfda3501f082604b1dd'
+$script:LocalWindowsAMD64SHA256 = '9a72a3dfa04696a2b2b67f13a51daa533c8dc4757dd2d92b962576d298185abd'
 
 function Convert-RDevMirrorUrl([string]$Mirror, [string]$Url) {
     return "https://$Mirror/$Url"
