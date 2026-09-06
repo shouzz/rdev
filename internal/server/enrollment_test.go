@@ -101,6 +101,8 @@ func TestPersistentReEnrollmentReplacesSameOwnerDevice(t *testing.T) {
 	s := NewServer()
 	s.ControlToken = "control-secret"
 	s.enrollmentNow = func() time.Time { return now }
+	ticketNow := now
+	s.accessTicketNow = func() time.Time { return ticketNow }
 	if err := s.ConfigureEnrollmentStore(registryPath, "https://rdev.example.com"); err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +113,7 @@ func TestPersistentReEnrollmentReplacesSameOwnerDevice(t *testing.T) {
 	transport := &enrollmentTestTransport{closed: make(chan string, 1)}
 	s.mu.Lock()
 	s.clients[first.DeviceID] = &ClientConn{
-		ID: first.DeviceID, RequestedID: first.DeviceID, InstanceID: "old-instance", Transport: transport,
+		ID: first.DeviceID, RequestedID: first.DeviceID, InstanceID: "old-instance", Transport: transport, PeripheralV1: true,
 	}
 	s.mu.Unlock()
 	ticketValue := "rdvat_replacement-test-ticket"
@@ -122,6 +124,17 @@ func TestPersistentReEnrollmentReplacesSameOwnerDevice(t *testing.T) {
 		InstanceID: "old-instance", Subject: "feidu-user:42", ExpiresAt: now.Add(time.Hour),
 	}
 	s.accessTicketMu.Unlock()
+	browserTicket := "rdvat_reenrollment-browser-ticket"
+	browserTicketHash := sha256.Sum256([]byte(browserTicket))
+	s.accessTicketMu.Lock()
+	s.accessTickets[browserTicketHash] = accessTicket{
+		ID: "33333333333333333333333333333333", DeviceID: first.DeviceID,
+		DeviceCredentialVersion: s.managedDevices[first.DeviceID].CredentialVersion,
+		InstanceID:              "old-instance", PasswordFingerprint: passwordFingerprint(""),
+		Subject: "feidu-browser:42", Capabilities: []string{browserCapabilityPeripherals}, ExpiresAt: now.Add(10 * time.Minute),
+	}
+	s.accessTicketMu.Unlock()
+	_, browserCapture := connectTrackedPeripheralBrowserForTest(t, s, first.DeviceID, browserTicket)
 
 	now = now.Add(time.Minute)
 	secondInvite := createEnrollmentForTest(t, s, "feidu-user:42", 600)
@@ -177,6 +190,11 @@ func TestPersistentReEnrollmentReplacesSameOwnerDevice(t *testing.T) {
 		}
 	default:
 		t.Fatal("old managed-device connection was not closed")
+	}
+	select {
+	case <-browserCapture.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-enrollment did not close the active browser WebSocket")
 	}
 
 	reloaded := NewServer()
@@ -620,6 +638,8 @@ func TestManagedDeviceRotateRevokeAndRestart(t *testing.T) {
 	s := NewServer()
 	s.ControlToken = "control-secret"
 	s.enrollmentNow = func() time.Time { return now }
+	ticketNow := now
+	s.accessTicketNow = func() time.Time { return ticketNow }
 	if err := s.ConfigureEnrollmentStore(registryPath, "https://rdev.example.com"); err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +649,7 @@ func TestManagedDeviceRotateRevokeAndRestart(t *testing.T) {
 	s.mu.Lock()
 	s.clients[redeemed.DeviceID] = &ClientConn{
 		ID: redeemed.DeviceID, RequestedID: redeemed.DeviceID, InstanceID: "connected-instance", Transport: transport,
-		OwnerSubject: "feidu-user:9", Sessions: make(map[string]*ProxySession), Forwards: make(map[string]*ProxyForward),
+		OwnerSubject: "feidu-user:9", PeripheralV1: true, Sessions: make(map[string]*ProxySession), Forwards: make(map[string]*ProxyForward),
 	}
 	s.mu.Unlock()
 	_, _, beforeRotateSequence := s.deviceEventsAfter(0)
@@ -638,6 +658,17 @@ func TestManagedDeviceRotateRevokeAndRestart(t *testing.T) {
 	s.accessTicketMu.Lock()
 	s.accessTickets[ticketHash] = accessTicket{DeviceID: redeemed.DeviceID, InstanceID: "connected-instance", ExpiresAt: now.Add(time.Hour)}
 	s.accessTicketMu.Unlock()
+	browserTicket := "rdvat_rotation-browser-ticket"
+	browserTicketHash := sha256.Sum256([]byte(browserTicket))
+	s.accessTicketMu.Lock()
+	s.accessTickets[browserTicketHash] = accessTicket{
+		ID: "44444444444444444444444444444444", DeviceID: redeemed.DeviceID,
+		DeviceCredentialVersion: s.managedDevices[redeemed.DeviceID].CredentialVersion,
+		InstanceID:              "connected-instance", PasswordFingerprint: passwordFingerprint(""),
+		Subject: "feidu-browser:9", Capabilities: []string{browserCapabilityPeripherals}, ExpiresAt: now.Add(10 * time.Minute),
+	}
+	s.accessTicketMu.Unlock()
+	_, browserCapture := connectTrackedPeripheralBrowserForTest(t, s, redeemed.DeviceID, browserTicket)
 
 	now = now.Add(time.Minute)
 	rotateRequest := httptest.NewRequest(http.MethodPost, "/api/control/devices/managed-workstation/rotate-secret", nil)
@@ -670,6 +701,11 @@ func TestManagedDeviceRotateRevokeAndRestart(t *testing.T) {
 	}
 	if _, connected := s.GetClient(redeemed.DeviceID); connected {
 		t.Fatal("rotated device remained in the online registry")
+	}
+	select {
+	case <-browserCapture.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("device secret rotation did not close the active browser WebSocket")
 	}
 	rotateEvents, reset, _ := s.deviceEventsAfter(beforeRotateSequence)
 	if reset || len(rotateEvents) != 1 || rotateEvents[0].Type != "device.offline" || rotateEvents[0].DeviceID != redeemed.DeviceID || rotateEvents[0].OwnerSubject != "feidu-user:9" {

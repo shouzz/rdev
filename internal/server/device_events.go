@@ -43,6 +43,7 @@ type deviceInfo struct {
 	GPUDesktop                       bool                          `json:"gpuDesktop,omitempty"`
 	LogSupported                     bool                          `json:"logSupported,omitempty"`
 	CloudTransferV1                  bool                          `json:"cloudTransferV1,omitempty"`
+	PeripheralV1                     bool                          `json:"peripheralV1,omitempty"`
 	OwnerSubject                     string                        `json:"ownerSubject,omitempty"`
 	Network                          *deviceNetworkInfo            `json:"network,omitempty"`
 }
@@ -98,6 +99,7 @@ func (s *Server) deviceInfo(client *ClientConn) deviceInfo {
 		GPUDesktop:                       s.clientGPUDesktopAvailable(client),
 		LogSupported:                     client.LogSupported,
 		CloudTransferV1:                  client.CloudTransferV1,
+		PeripheralV1:                     client.PeripheralV1,
 		OwnerSubject:                     client.OwnerSubject,
 		Network:                          network,
 	}

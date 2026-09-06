@@ -237,6 +237,7 @@ type Client struct {
 	downloads       map[string]chan struct{}
 	desktopSessions map[string]*desktopSession
 	cloudTransfers  map[string]*cloudTransferRun
+	peripherals     *peripheralManager
 	mu              sync.Mutex
 	done            chan struct{}
 	reconnectReset  chan struct{}
@@ -345,6 +346,7 @@ func NewClient(serverURL, clientID, password, shell string) *Client {
 		registerWait:    defaultRegisterWait,
 		logCollector:    lc,
 	}
+	c.peripherals = newPeripheralManager(c, systemPeripheralDriver{})
 	lc.install(c)
 	return c
 }
@@ -474,6 +476,7 @@ func (h *wsEventHandler) OnClose(socket *gws.Conn, err error) {
 	h.client.registered = false
 	h.client.activeEndpoint = ""
 	h.client.mu.Unlock()
+	h.client.peripherals.closeAll()
 	if attempt != nil {
 		attempt.complete(fmt.Errorf("connection closed before registration: %v", err))
 	}
@@ -550,6 +553,8 @@ func (h *wsEventHandler) handleBinaryMessage(raw []byte) {
 		}
 	case protocol.BinFileTransferCancel:
 		h.client.handleManagedTransferCancel(id)
+	case protocol.BinSerialData:
+		h.client.peripherals.handleWrite(id, payload)
 	}
 }
 
@@ -951,6 +956,7 @@ func (c *Client) closeCurrentTransport(transport clientTransport, conn net.Conn)
 	c.registered = false
 	c.activeEndpoint = ""
 	c.mu.Unlock()
+	c.peripherals.closeAll()
 	conn.Close()
 	if attempt != nil {
 		attempt.complete(fmt.Errorf("connection closed before registration"))
@@ -1056,6 +1062,12 @@ func (c *Client) handleMessage(msg *protocol.Message) {
 		c.handleDesktopClipboard(msg)
 	case protocol.MsgDesktopClose:
 		c.handleDesktopClose(msg.SessionID)
+	case protocol.MsgPeripheralListRequest:
+		go c.peripherals.handleList(msg)
+	case protocol.MsgSerialOpen:
+		go c.peripherals.handleOpen(msg)
+	case protocol.MsgSerialClose:
+		c.peripherals.handleClose(msg)
 	}
 }
 
@@ -1064,7 +1076,7 @@ func (c *Client) registrationMessage() *protocol.Message {
 		Type: protocol.MsgRegister, ClientID: c.requestedID, InstanceID: c.instanceID,
 		ClientVersion: c.version, Platform: runtime.GOOS, Architecture: runtime.GOARCH,
 		Password: c.password, DeviceSecret: c.deviceSecret,
-		DesktopCapabilities: desktopCapabilities(), LogSupported: true, CloudTransferV1: true,
+		DesktopCapabilities: desktopCapabilities(), LogSupported: true, CloudTransferV1: true, PeripheralV1: true,
 	}
 }
 
@@ -2274,6 +2286,7 @@ func (c *Client) cleanup() {
 	}
 	conn := c.conn
 	c.mu.Unlock()
+	c.peripherals.closeAll()
 	if conn != nil {
 		conn.WriteClose(1000, nil)
 	}

@@ -89,6 +89,7 @@ type ClientConn struct {
 	Desktop         *protocol.DesktopCapabilities
 	LogSupported    bool
 	CloudTransferV1 bool
+	PeripheralV1    bool
 	Network         *deviceNetworkInfo
 	writeMu         sync.Mutex
 	mu              sync.Mutex
@@ -540,50 +541,55 @@ func (f *ReverseForward) Result() (uint32, string) {
 
 // Server manages WebSocket clients and SSH proxy
 type Server struct {
-	clients                map[string]*ClientConn
-	mu                     sync.RWMutex
-	sessions               map[string]*ProxySession
-	sessMu                 sync.RWMutex
-	forwards               map[string]*ProxyForward
-	fwdMu                  sync.RWMutex
-	revForwards            map[string]*ReverseForward
-	revMu                  sync.RWMutex
-	fileResults            map[string]chan *protocol.Message
-	fileRequests           map[string]*fileSocket
-	fileTasks              map[string]*fileTaskRoute
-	fileMu                 sync.RWMutex
-	desktops               map[string]*desktopRoute
-	desktopMu              sync.RWMutex
-	vncMu                  sync.RWMutex
-	vncSettings            map[string]protocol.Message
-	vncStreams             map[string]*vncDesktopStream
-	gpuDesktopMu           sync.RWMutex
-	gpuDesktopTunnels      map[string]*gpuDesktopTunnel
-	accessTicketMu         sync.Mutex
-	accessTickets          map[[32]byte]accessTicket
-	accessTicketStorePath  string
-	accessTicketNow        func() time.Time
-	accessTicketRevoked    func(string)
-	cloudTransferMu        sync.Mutex
-	cloudTransferPending   map[string]*cloudTransferDispatchPending
-	cloudTransferAckWait   time.Duration
-	deviceEventMu          sync.Mutex
-	deviceEventServerID    string
-	deviceEventSequence    uint64
-	deviceEvents           []deviceEvent
-	deviceEventWatchers    map[uint64]chan struct{}
-	deviceEventWatcherID   uint64
-	deviceNetworkResolver  *deviceNetworkResolver
-	enrollmentMu           sync.Mutex
-	enrollments            map[[32]byte]enrollmentInvite
-	managedDevices         map[string]managedDevice
-	enrollmentRegistryPath string
-	enrollmentPublicURL    string
-	enrollmentNow          func() time.Time
-	releaseLatestMu        sync.Mutex
-	releaseLatestTag       string
-	releaseLatestAt        time.Time
-	upgrader               *gws.Upgrader
+	clients                  map[string]*ClientConn
+	mu                       sync.RWMutex
+	sessions                 map[string]*ProxySession
+	sessMu                   sync.RWMutex
+	forwards                 map[string]*ProxyForward
+	fwdMu                    sync.RWMutex
+	revForwards              map[string]*ReverseForward
+	revMu                    sync.RWMutex
+	fileResults              map[string]chan *protocol.Message
+	fileRequests             map[string]*fileSocket
+	fileTasks                map[string]*fileTaskRoute
+	fileMu                   sync.RWMutex
+	peripheralRequests       map[string]*peripheralRequestRoute
+	serialRoutes             map[string]*serialRoute
+	peripheralMu             sync.RWMutex
+	desktops                 map[string]*desktopRoute
+	desktopMu                sync.RWMutex
+	vncMu                    sync.RWMutex
+	vncSettings              map[string]protocol.Message
+	vncStreams               map[string]*vncDesktopStream
+	gpuDesktopMu             sync.RWMutex
+	gpuDesktopTunnels        map[string]*gpuDesktopTunnel
+	accessTicketMu           sync.Mutex
+	accessTickets            map[[32]byte]accessTicket
+	accessTicketStorePath    string
+	accessTicketNow          func() time.Time
+	accessTicketRevoked      func(string)
+	browserTicketMu          sync.Mutex
+	browserTicketConnections map[string]map[*gws.Conn]chan struct{}
+	cloudTransferMu          sync.Mutex
+	cloudTransferPending     map[string]*cloudTransferDispatchPending
+	cloudTransferAckWait     time.Duration
+	deviceEventMu            sync.Mutex
+	deviceEventServerID      string
+	deviceEventSequence      uint64
+	deviceEvents             []deviceEvent
+	deviceEventWatchers      map[uint64]chan struct{}
+	deviceEventWatcherID     uint64
+	deviceNetworkResolver    *deviceNetworkResolver
+	enrollmentMu             sync.Mutex
+	enrollments              map[[32]byte]enrollmentInvite
+	managedDevices           map[string]managedDevice
+	enrollmentRegistryPath   string
+	enrollmentPublicURL      string
+	enrollmentNow            func() time.Time
+	releaseLatestMu          sync.Mutex
+	releaseLatestTag         string
+	releaseLatestAt          time.Time
+	upgrader                 *gws.Upgrader
 
 	// Public config (set by main) for API/UI
 	SSHPort          string // e.g. "2222"
@@ -603,31 +609,34 @@ type Server struct {
 // NewServer creates a new Server
 func NewServer() *Server {
 	s := &Server{
-		clients:               make(map[string]*ClientConn),
-		sessions:              make(map[string]*ProxySession),
-		forwards:              make(map[string]*ProxyForward),
-		revForwards:           make(map[string]*ReverseForward),
-		fileResults:           make(map[string]chan *protocol.Message),
-		fileRequests:          make(map[string]*fileSocket),
-		fileTasks:             make(map[string]*fileTaskRoute),
-		desktops:              make(map[string]*desktopRoute),
-		vncSettings:           make(map[string]protocol.Message),
-		vncStreams:            make(map[string]*vncDesktopStream),
-		gpuDesktopTunnels:     make(map[string]*gpuDesktopTunnel),
-		accessTickets:         make(map[[32]byte]accessTicket),
-		cloudTransferPending:  make(map[string]*cloudTransferDispatchPending),
-		cloudTransferAckWait:  cloudTransferAckTimeout,
-		deviceEventServerID:   newDeviceEventServerID(),
-		deviceEventWatchers:   make(map[uint64]chan struct{}),
-		deviceNetworkResolver: newDeviceNetworkResolver(),
-		accessTicketNow:       time.Now,
-		enrollments:           make(map[[32]byte]enrollmentInvite),
-		managedDevices:        make(map[string]managedDevice),
-		enrollmentNow:         time.Now,
-		MaxSessions:           256,
-		MaxForwards:           1024,
-		BatchConcurrency:      runtime.GOMAXPROCS(0) * 8,
-		ClientLogs:            NewClientLogManager("", 0, 0),
+		clients:                  make(map[string]*ClientConn),
+		sessions:                 make(map[string]*ProxySession),
+		forwards:                 make(map[string]*ProxyForward),
+		revForwards:              make(map[string]*ReverseForward),
+		fileResults:              make(map[string]chan *protocol.Message),
+		fileRequests:             make(map[string]*fileSocket),
+		fileTasks:                make(map[string]*fileTaskRoute),
+		peripheralRequests:       make(map[string]*peripheralRequestRoute),
+		serialRoutes:             make(map[string]*serialRoute),
+		desktops:                 make(map[string]*desktopRoute),
+		vncSettings:              make(map[string]protocol.Message),
+		vncStreams:               make(map[string]*vncDesktopStream),
+		gpuDesktopTunnels:        make(map[string]*gpuDesktopTunnel),
+		accessTickets:            make(map[[32]byte]accessTicket),
+		browserTicketConnections: make(map[string]map[*gws.Conn]chan struct{}),
+		cloudTransferPending:     make(map[string]*cloudTransferDispatchPending),
+		cloudTransferAckWait:     cloudTransferAckTimeout,
+		deviceEventServerID:      newDeviceEventServerID(),
+		deviceEventWatchers:      make(map[uint64]chan struct{}),
+		deviceNetworkResolver:    newDeviceNetworkResolver(),
+		accessTicketNow:          time.Now,
+		enrollments:              make(map[[32]byte]enrollmentInvite),
+		managedDevices:           make(map[string]managedDevice),
+		enrollmentNow:            time.Now,
+		MaxSessions:              256,
+		MaxForwards:              1024,
+		BatchConcurrency:         runtime.GOMAXPROCS(0) * 8,
+		ClientLogs:               NewClientLogManager("", 0, 0),
 	}
 	s.upgrader = gws.NewUpgrader(&wsHandler{srv: s}, &gws.ServerOption{
 		ReadMaxPayloadSize: 16 * 1024 * 1024,
@@ -679,6 +688,7 @@ func closeClientResources(s *Server, client *ClientConn) {
 	}
 	s.closeDesktopForClient(client.ID)
 	s.closeGPUDesktopTunnelForClient(client.ID)
+	s.closePeripheralsForClient(client)
 }
 
 func (s *Server) clientByID(id string) *ClientConn {
@@ -814,6 +824,7 @@ func (h *wsHandler) handleRegister(socket *gws.Conn, msg *protocol.Message) {
 		Desktop:         cloneDesktopCapabilities(msg.DesktopCapabilities),
 		LogSupported:    msg.LogSupported,
 		CloudTransferV1: msg.CloudTransferV1,
+		PeripheralV1:    msg.PeripheralV1,
 		Sessions:        make(map[string]*ProxySession),
 		Forwards:        make(map[string]*ProxyForward),
 	}
@@ -1236,6 +1247,7 @@ func (s *Server) registerStreamClient(transport DeviceTransport, msg *protocol.M
 		Desktop:         cloneDesktopCapabilities(msg.DesktopCapabilities),
 		LogSupported:    msg.LogSupported,
 		CloudTransferV1: msg.CloudTransferV1,
+		PeripheralV1:    msg.PeripheralV1,
 		Sessions:        make(map[string]*ProxySession),
 		Forwards:        make(map[string]*ProxyForward),
 	}
@@ -1307,6 +1319,8 @@ func (s *Server) handleClientBinary(client *ClientConn, raw []byte) {
 		}
 	case protocol.BinDesktopFrame:
 		s.handleDesktopFrame(id, data)
+	case protocol.BinSerialData:
+		s.handleSerialData(client, id, data)
 	}
 }
 
@@ -1388,6 +1402,8 @@ func (s *Server) handleClientMessage(client *ClientConn, msg *protocol.Message) 
 		s.handleClientLogBatch(client, msg)
 	case protocol.MsgCloudTransferResult:
 		s.handleCloudTransferResult(client, msg)
+	case protocol.MsgPeripheralListResult, protocol.MsgSerialOpenResult, protocol.MsgSerialCloseResult, protocol.MsgSerialWriteResult, protocol.MsgSerialError:
+		s.handlePeripheralMessage(client, msg)
 	}
 }
 
@@ -1971,6 +1987,7 @@ func (s *Server) HandleTerminalAPI(w http.ResponseWriter, r *http.Request) {
 		GPUDesktop      bool                          `json:"gpuDesktop,omitempty"`
 		LogSupported    bool                          `json:"logSupported,omitempty"`
 		CloudTransferV1 bool                          `json:"cloudTransferV1,omitempty"`
+		PeripheralV1    bool                          `json:"peripheralV1,omitempty"`
 		OwnerSubject    string                        `json:"ownerSubject,omitempty"`
 	}
 
@@ -1986,6 +2003,7 @@ func (s *Server) HandleTerminalAPI(w http.ResponseWriter, r *http.Request) {
 			GPUDesktop:      s.clientGPUDesktopAvailable(c),
 			LogSupported:    c.LogSupported,
 			CloudTransferV1: c.CloudTransferV1,
+			PeripheralV1:    c.PeripheralV1,
 			OwnerSubject:    c.OwnerSubject,
 		})
 	}

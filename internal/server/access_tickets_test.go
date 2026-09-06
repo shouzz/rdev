@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,51 @@ import (
 	"github.com/lxzan/gws"
 	"golang.org/x/crypto/bcrypt"
 )
+
+type browserCloseCapture struct {
+	gws.BuiltinEventHandler
+	closed chan struct{}
+	once   sync.Once
+}
+
+func connectTrackedPeripheralBrowserForTest(t *testing.T, s *Server, deviceID, ticket string) (*gws.Conn, *browserCloseCapture) {
+	t.Helper()
+	httpServer := httptest.NewServer(http.HandlerFunc(s.HandlePeripheralsWS))
+	t.Cleanup(httpServer.Close)
+	capture := &browserCloseCapture{closed: make(chan struct{})}
+	header := make(http.Header)
+	header.Set("Sec-WebSocket-Protocol", browserSocketProtocol+", "+browserTicketProtocol+ticket)
+	socket, _, err := gws.NewClient(capture, &gws.ClientOption{
+		Addr: "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/peripherals?device=" + deviceID, RequestHeader: header,
+	})
+	if err != nil {
+		t.Fatalf("connect browser: %v", err)
+	}
+	t.Cleanup(func() { _ = socket.WriteClose(1000, nil) })
+	go socket.ReadLoop()
+	ticketHash := sha256.Sum256([]byte(ticket))
+	s.accessTicketMu.Lock()
+	ticketID := s.accessTickets[ticketHash].ID
+	s.accessTicketMu.Unlock()
+	deadline := time.After(2 * time.Second)
+	for {
+		s.browserTicketMu.Lock()
+		tracked := len(s.browserTicketConnections[ticketID]) > 0
+		s.browserTicketMu.Unlock()
+		if tracked {
+			return socket, capture
+		}
+		select {
+		case <-deadline:
+			t.Fatal("browser ticket connection was not tracked")
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func (capture *browserCloseCapture) OnClose(*gws.Conn, error) {
+	capture.once.Do(func() { close(capture.closed) })
+}
 
 func TestControlAuthUsesOnlyControlTokenHeader(t *testing.T) {
 	s := NewServer()
@@ -60,7 +106,9 @@ func TestBrowserSocketAuthAcceptsOnlyScopedFeiduTicket(t *testing.T) {
 	s := NewServer()
 	s.ControlToken = "control-secret"
 	s.clients["device-a"] = &ClientConn{ID: "device-a", InstanceID: "one", Password: "secret"}
-	browserTicket := issueAccessTicketWithSubject(t, s, "device-a", "feidu-browser:42", 60)
+	browserTicket := issueScopedAccessTicketWithSubject(t, s, "device-a", "feidu-browser:42", 60, []string{
+		browserCapabilityDesktop, browserCapabilityFiles, browserCapabilityPeripherals, browserCapabilityTerminal,
+	})
 	agentTicket := issueAccessTicketWithSubject(t, s, "device-a", "feidu-agent:42", 60)
 
 	tests := []struct {
@@ -73,6 +121,7 @@ func TestBrowserSocketAuthAcceptsOnlyScopedFeiduTicket(t *testing.T) {
 	}{
 		{name: "terminal", path: "/terminal?device=device-a", method: http.MethodGet, upgrade: true, protocol: browserTicketProtocol + browserTicket, wantStatus: http.StatusOK},
 		{name: "files", path: "/files", method: http.MethodGet, upgrade: true, protocol: "rdev-browser-v1, " + browserTicketProtocol + browserTicket, wantStatus: http.StatusOK},
+		{name: "peripherals", path: "/peripherals?device=device-a", method: http.MethodGet, upgrade: true, protocol: browserTicketProtocol + browserTicket, wantStatus: http.StatusOK},
 		{name: "wrong device", path: "/desktop?device=device-b", method: http.MethodGet, upgrade: true, protocol: browserTicketProtocol + browserTicket, wantStatus: http.StatusUnauthorized},
 		{name: "agent ticket", path: "/terminal?device=device-a", method: http.MethodGet, upgrade: true, protocol: browserTicketProtocol + agentTicket, wantStatus: http.StatusUnauthorized},
 		{name: "control api", path: "/api/clients", method: http.MethodGet, upgrade: true, protocol: browserTicketProtocol + browserTicket, wantStatus: http.StatusUnauthorized},
@@ -99,26 +148,77 @@ func TestBrowserSocketAuthAcceptsOnlyScopedFeiduTicket(t *testing.T) {
 	}
 }
 
+func TestBrowserSocketAuthRequiresExactCapability(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	s.clients["device-a"] = &ClientConn{ID: "device-a", InstanceID: "one", Password: "secret"}
+	peripheralTicket := issueScopedAccessTicketWithSubject(
+		t, s, "device-a", "feidu-browser:42", 60, []string{browserCapabilityPeripherals},
+	)
+	legacyTicket := issueAccessTicketWithSubject(t, s, "device-a", "feidu-browser:42", 60)
+
+	for _, test := range []struct {
+		name   string
+		path   string
+		ticket string
+		want   bool
+	}{
+		{name: "scoped peripheral", path: "/peripherals?device=device-a", ticket: peripheralTicket, want: true},
+		{name: "scoped terminal rejected", path: "/terminal?device=device-a", ticket: peripheralTicket, want: false},
+		{name: "legacy terminal", path: "/terminal?device=device-a", ticket: legacyTicket, want: true},
+		{name: "legacy peripheral rejected", path: "/peripherals?device=device-a", ticket: legacyTicket, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, test.path, nil)
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Upgrade", "websocket")
+			req.Header.Set("Sec-WebSocket-Protocol", browserSocketProtocol+", "+browserTicketProtocol+test.ticket)
+			if got := s.browserSocketAuthOK(req); got != test.want {
+				t.Fatalf("browser socket authorization = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestBrowserTicketCannotAuthenticateSSHCredentialPath(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	client := &ClientConn{ID: "device-a", InstanceID: "one", Password: "secret"}
+	s.clients[client.ID] = client
+	ticket := issueScopedAccessTicketWithSubject(
+		t, s, client.ID, "feidu-browser:42", 60, []string{browserCapabilityTerminal},
+	)
+	if s.authorizeDeviceCredential(client, ticket) {
+		t.Fatal("browser-only ticket authenticated the generic device credential path")
+	}
+	if _, ok := s.authorizeBrowserDeviceCredentialBinding(client, ticket, browserCapabilityTerminal); !ok {
+		t.Fatal("terminal browser ticket was rejected by the terminal credential path")
+	}
+	if _, ok := s.authorizeBrowserDeviceCredentialBinding(client, ticket, browserCapabilityFiles); ok {
+		t.Fatal("terminal browser ticket authenticated the files credential path")
+	}
+}
+
 func TestBrowserAccessTicketRejectsChangedOrRevokedManagedDeviceCredential(t *testing.T) {
 	s := NewServer()
 	s.ControlToken = "control-secret"
 	s.clients["device-a"] = &ClientConn{ID: "device-a", InstanceID: "one", Password: "secret"}
 	ticket := issueAccessTicketWithSubject(t, s, "device-a", "feidu-browser:42", 60)
-	if !s.browserAccessTicketValid(ticket, "device-a") {
+	if !s.browserAccessTicketValid(ticket, "device-a", browserCapabilityTerminal) {
 		t.Fatal("fresh browser access ticket was rejected")
 	}
 
 	device := s.managedDevices["device-a"]
 	device.CredentialVersion++
 	s.managedDevices["device-a"] = device
-	if s.browserAccessTicketValid(ticket, "device-a") {
+	if s.browserAccessTicketValid(ticket, "device-a", browserCapabilityTerminal) {
 		t.Fatal("browser access ticket survived a device credential version change")
 	}
 
 	device.CredentialVersion--
 	device.RevokedAt = time.Now()
 	s.managedDevices["device-a"] = device
-	if s.browserAccessTicketValid(ticket, "device-a") {
+	if s.browserAccessTicketValid(ticket, "device-a", browserCapabilityTerminal) {
 		t.Fatal("browser access ticket remained valid for a revoked managed device")
 	}
 }
@@ -132,6 +232,7 @@ func TestBrowserWebSocketHandlersNegotiateProtocol(t *testing.T) {
 		{name: "terminal", path: "/terminal?device=device", handler: func(s *Server, w http.ResponseWriter, r *http.Request) { s.HandleTerminalWS(w, r) }},
 		{name: "files", path: "/files", handler: func(s *Server, w http.ResponseWriter, r *http.Request) { s.HandleFilesWS(w, r) }},
 		{name: "desktop", path: "/desktop?device=device", handler: func(s *Server, w http.ResponseWriter, r *http.Request) { s.HandleDesktopWS(w, r) }},
+		{name: "peripherals", path: "/peripherals?device=device", handler: func(s *Server, w http.ResponseWriter, r *http.Request) { s.HandlePeripheralsWS(w, r) }},
 	}
 
 	for _, test := range tests {
@@ -139,7 +240,9 @@ func TestBrowserWebSocketHandlersNegotiateProtocol(t *testing.T) {
 			s := NewServer()
 			s.ControlToken = "control-secret"
 			s.clients["device"] = &ClientConn{ID: "device", InstanceID: "one"}
-			ticket := issueAccessTicketWithSubject(t, s, "device", "feidu-browser:42", 60)
+			ticket := issueScopedAccessTicketWithSubject(t, s, "device", "feidu-browser:42", 60, []string{
+				browserCapabilityDesktop, browserCapabilityFiles, browserCapabilityPeripherals, browserCapabilityTerminal,
+			})
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				test.handler(s, w, r)
 			}))
@@ -162,6 +265,177 @@ func TestBrowserWebSocketHandlersNegotiateProtocol(t *testing.T) {
 				t.Fatalf("socket protocol = %q, want %q", got, browserSocketProtocol)
 			}
 		})
+	}
+}
+
+func TestBrowserTicketExpiryClosesEstablishedWebSocket(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	client := &ClientConn{ID: "device", InstanceID: "one", PeripheralV1: true}
+	s.clients[client.ID] = client
+	ticket := issueScopedAccessTicketWithSubject(
+		t, s, client.ID, "feidu-browser:42", 60, []string{browserCapabilityPeripherals},
+	)
+	s.accessTicketMu.Lock()
+	for hash, stored := range s.accessTickets {
+		stored.ExpiresAt = time.Now().Add(500 * time.Millisecond)
+		s.accessTickets[hash] = stored
+	}
+	s.accessTicketMu.Unlock()
+
+	httpServer := httptest.NewServer(http.HandlerFunc(s.HandlePeripheralsWS))
+	t.Cleanup(httpServer.Close)
+	capture := &browserCloseCapture{closed: make(chan struct{})}
+	header := make(http.Header)
+	header.Set("Sec-WebSocket-Protocol", browserSocketProtocol+", "+browserTicketProtocol+ticket)
+	socket, _, err := gws.NewClient(capture, &gws.ClientOption{
+		Addr: "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/peripherals?device=device", RequestHeader: header,
+	})
+	if err != nil {
+		t.Fatalf("connect browser: %v", err)
+	}
+	go socket.ReadLoop()
+	select {
+	case <-capture.closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("established browser WebSocket remained open after ticket expiry")
+	}
+}
+
+func TestBrowserTicketRevocationClosesEstablishedWebSocket(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	client := &ClientConn{ID: "device", InstanceID: "one", PeripheralV1: true}
+	s.clients[client.ID] = client
+	ticket := issueScopedAccessTicketWithSubject(
+		t, s, client.ID, "feidu-browser:42", 60, []string{browserCapabilityPeripherals},
+	)
+	var ticketID string
+	s.accessTicketMu.Lock()
+	for _, stored := range s.accessTickets {
+		ticketID = stored.ID
+	}
+	s.accessTicketMu.Unlock()
+
+	httpServer := httptest.NewServer(http.HandlerFunc(s.HandlePeripheralsWS))
+	t.Cleanup(httpServer.Close)
+	capture := &browserCloseCapture{closed: make(chan struct{})}
+	header := make(http.Header)
+	header.Set("Sec-WebSocket-Protocol", browserSocketProtocol+", "+browserTicketProtocol+ticket)
+	socket, _, err := gws.NewClient(capture, &gws.ClientOption{
+		Addr: "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/peripherals?device=device", RequestHeader: header,
+	})
+	if err != nil {
+		t.Fatalf("connect browser: %v", err)
+	}
+	go socket.ReadLoop()
+
+	body, err := json.Marshal(accessTicketRevokeRequest{TicketID: ticketID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodDelete, "/api/control/access-tickets", bytes.NewReader(body))
+	request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	response := httptest.NewRecorder()
+	s.HandleAccessTicketsAPI(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("revoke status = %d", response.Code)
+	}
+	select {
+	case <-capture.closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("established browser WebSocket remained open after ticket revocation")
+	}
+}
+
+func TestBrowserTicketRevokedAfterUpgradeAuthorizationIsNotTracked(t *testing.T) {
+	s := NewServer()
+	s.ControlToken = "control-secret"
+	client := &ClientConn{ID: "device", InstanceID: "one", PeripheralV1: true}
+	s.clients[client.ID] = client
+	ticket := issueScopedAccessTicketWithSubject(
+		t, s, client.ID, "feidu-browser:42", 60, []string{browserCapabilityPeripherals},
+	)
+	ticketHash := sha256.Sum256([]byte(ticket))
+	s.accessTicketMu.Lock()
+	ticketID := s.accessTickets[ticketHash].ID
+	s.accessTicketMu.Unlock()
+
+	authorized := make(chan struct{})
+	releaseUpgrade := make(chan struct{})
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := gws.NewUpgrader(&gws.BuiltinEventHandler{}, &gws.ServerOption{
+			SubProtocols: []string{browserSocketProtocol},
+			Authorize: func(r *http.Request, session gws.SessionStorage) bool {
+				session.Store("deviceID", client.ID)
+				if !s.authorizeBrowserUpgrade(r, session, client.ID) {
+					return false
+				}
+				close(authorized)
+				<-releaseUpgrade
+				return true
+			},
+		})
+		socket, err := upgrader.Upgrade(w, r)
+		if err != nil {
+			return
+		}
+		if _, ok := s.trackBrowserTicketConnection(socket); !ok {
+			_ = socket.WriteClose(4003, []byte("browser access expired"))
+			return
+		}
+		defer s.untrackBrowserTicketConnection(socket)
+		socket.ReadLoop()
+	}))
+	t.Cleanup(httpServer.Close)
+
+	type connectionResult struct {
+		socket  *gws.Conn
+		capture *browserCloseCapture
+		err     error
+	}
+	connected := make(chan connectionResult, 1)
+	go func() {
+		capture := &browserCloseCapture{closed: make(chan struct{})}
+		header := make(http.Header)
+		header.Set("Sec-WebSocket-Protocol", browserSocketProtocol+", "+browserTicketProtocol+ticket)
+		socket, _, err := gws.NewClient(capture, &gws.ClientOption{
+			Addr: "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/peripherals?device=device", RequestHeader: header,
+		})
+		connected <- connectionResult{socket: socket, capture: capture, err: err}
+	}()
+	select {
+	case <-authorized:
+	case <-time.After(2 * time.Second):
+		t.Fatal("browser upgrade authorization did not run")
+	}
+	body, err := json.Marshal(accessTicketRevokeRequest{TicketID: ticketID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodDelete, "/api/control/access-tickets", bytes.NewReader(body))
+	request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+	response := httptest.NewRecorder()
+	s.HandleAccessTicketsAPI(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("revoke status = %d", response.Code)
+	}
+	close(releaseUpgrade)
+	result := <-connected
+	if result.err != nil {
+		t.Fatalf("connect after authorized upgrade: %v", result.err)
+	}
+	go result.socket.ReadLoop()
+	select {
+	case <-result.capture.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("revoked ticket connection entered the browser read loop")
+	}
+	s.browserTicketMu.Lock()
+	tracked := len(s.browserTicketConnections[ticketID])
+	s.browserTicketMu.Unlock()
+	if tracked != 0 {
+		t.Fatalf("revoked ticket retained %d tracked browser connections", tracked)
 	}
 }
 
@@ -334,7 +608,7 @@ func TestAccessTicketCanBeRevokedByControlAPI(t *testing.T) {
 	create := httptest.NewRequest(
 		http.MethodPost,
 		"/api/control/access-tickets",
-		strings.NewReader("{\"deviceId\":\"device\",\"subject\":\"feidu-browser:42\",\"expiresInSeconds\":600}"),
+		strings.NewReader("{\"deviceId\":\"device\",\"subject\":\"feidu-user:42\",\"expiresInSeconds\":600}"),
 	)
 	create.Header.Set("X-RDev-Control-Token", s.ControlToken)
 	created := httptest.NewRecorder()
@@ -529,6 +803,189 @@ func TestAccessTicketSurvivesServerRestartRenewalAndRevocation(t *testing.T) {
 	if verified.authorizeDeviceCredential(verified.clients[client.ID], ticketValue) {
 		t.Fatal("revoked ticket returned after another server restart")
 	}
+}
+
+func TestAccessTicketRegistryBrowserCapabilityMigrationAndIsolation(t *testing.T) {
+	now := time.Date(2026, 9, 6, 8, 0, 0, 0, time.UTC)
+	client := &ClientConn{ID: "browser-registry-device", InstanceID: "instance", Password: "password"}
+	ticketValue := "rdvat_browser-registry-ticket"
+	ticketHash := sha256.Sum256([]byte(ticketValue))
+	baseRecord := accessTicketRegistryRecord{
+		TicketHash: fmt.Sprintf("%x", ticketHash[:]), ID: "11111111111111111111111111111111",
+		DeviceID: client.ID, DeviceCredentialVersion: 1, InstanceID: client.InstanceID,
+		PasswordFingerprint: passwordFingerprint(client.Password), Subject: "feidu-browser:42",
+		ExpiresAt: now.Add(time.Hour).Format(time.RFC3339),
+	}
+	writeRegistry := func(t *testing.T, path string, registry accessTicketRegistry) {
+		t.Helper()
+		data, err := json.MarshalIndent(registry, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = append(data, '\n')
+		if err = os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("v2 browser ticket restores only legacy capabilities and writes v3", func(t *testing.T) {
+		storePath := filepath.Join(t.TempDir(), "access_tickets.json")
+		writeRegistry(t, storePath, accessTicketRegistry{Schema: accessTicketRegistryV2, Tickets: []accessTicketRegistryRecord{baseRecord}})
+		s := NewServer()
+		s.accessTicketNow = func() time.Time { return now }
+		s.managedDevices[client.ID] = managedDevice{ID: client.ID, OwnerSubject: "feidu-user:42", CredentialVersion: 1}
+		if err := s.ConfigureAccessTicketStore(storePath); err != nil {
+			t.Fatal(err)
+		}
+		for _, capability := range []string{browserCapabilityDesktop, browserCapabilityFiles, browserCapabilityTerminal} {
+			if !s.browserAccessTicketValid(ticketValue, client.ID, capability) {
+				t.Fatalf("v2 browser ticket did not restore %q capability", capability)
+			}
+		}
+		if s.browserAccessTicketValid(ticketValue, client.ID, browserCapabilityPeripherals) {
+			t.Fatal("v2 browser ticket gained the peripherals capability")
+		}
+		s.accessTicketMu.Lock()
+		err := s.persistAccessTicketsLocked()
+		s.accessTicketMu.Unlock()
+		if err != nil {
+			t.Fatalf("persist migrated registry: %v", err)
+		}
+		stored, err := os.ReadFile(storePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rewritten accessTicketRegistry
+		if err = json.Unmarshal(stored, &rewritten); err != nil {
+			t.Fatal(err)
+		}
+		if rewritten.Schema != accessTicketRegistryV3 || len(rewritten.Tickets) != 1 {
+			t.Fatalf("rewritten registry = %#v", rewritten)
+		}
+		capabilities := rewritten.Tickets[0].Capabilities
+		if len(capabilities) != 3 || capabilities[0] != browserCapabilityDesktop ||
+			capabilities[1] != browserCapabilityFiles || capabilities[2] != browserCapabilityTerminal {
+			t.Fatalf("rewritten legacy capabilities = %v", capabilities)
+		}
+	})
+
+	t.Run("v3 single capability remains isolated after restart", func(t *testing.T) {
+		storePath := filepath.Join(t.TempDir(), "access_tickets.json")
+		record := baseRecord
+		record.Capabilities = []string{browserCapabilityPeripherals}
+		writeRegistry(t, storePath, accessTicketRegistry{Schema: accessTicketRegistryV3, Tickets: []accessTicketRegistryRecord{record}})
+		s := NewServer()
+		s.accessTicketNow = func() time.Time { return now }
+		s.managedDevices[client.ID] = managedDevice{ID: client.ID, OwnerSubject: "feidu-user:42", CredentialVersion: 1}
+		if err := s.ConfigureAccessTicketStore(storePath); err != nil {
+			t.Fatal(err)
+		}
+		if !s.browserAccessTicketValid(ticketValue, client.ID, browserCapabilityPeripherals) {
+			t.Fatal("v3 peripheral capability was not restored")
+		}
+		for _, capability := range []string{browserCapabilityDesktop, browserCapabilityFiles, browserCapabilityTerminal} {
+			if s.browserAccessTicketValid(ticketValue, client.ID, capability) {
+				t.Fatalf("v3 peripheral ticket gained %q capability", capability)
+			}
+		}
+	})
+
+	t.Run("v3 browser ticket requires capabilities", func(t *testing.T) {
+		storePath := filepath.Join(t.TempDir(), "access_tickets.json")
+		writeRegistry(t, storePath, accessTicketRegistry{Schema: accessTicketRegistryV3, Tickets: []accessTicketRegistryRecord{baseRecord}})
+		s := NewServer()
+		s.accessTicketNow = func() time.Time { return now }
+		if err := s.ConfigureAccessTicketStore(storePath); err == nil || err.Error() != "access ticket store browser capabilities are missing" {
+			t.Fatalf("missing v3 capabilities error = %v", err)
+		}
+	})
+}
+
+func TestAccessTicketPersistenceFailureRollsBackMemory(t *testing.T) {
+	now := time.Date(2026, 9, 6, 9, 0, 0, 0, time.UTC)
+	newServer := func(t *testing.T) (*Server, *ClientConn) {
+		t.Helper()
+		s := NewServer()
+		s.ControlToken = "control-secret"
+		s.accessTicketNow = func() time.Time { return now }
+		client := &ClientConn{ID: "device", InstanceID: "instance", Password: "password"}
+		s.clients[client.ID] = client
+		s.managedDevices[client.ID] = managedDevice{ID: client.ID, OwnerSubject: "feidu-user:42", CredentialVersion: 1}
+		return s, client
+	}
+	setFailingStore := func(t *testing.T, s *Server) {
+		t.Helper()
+		storeDirectory := filepath.Join(t.TempDir(), "access-ticket-store-directory")
+		if err := os.Mkdir(storeDirectory, 0700); err != nil {
+			t.Fatal(err)
+		}
+		s.accessTicketStorePath = storeDirectory
+	}
+
+	t.Run("create", func(t *testing.T) {
+		s, client := newServer(t)
+		setFailingStore(t, s)
+		request := httptest.NewRequest(http.MethodPost, "/api/control/access-tickets", strings.NewReader(
+			`{"deviceId":"`+client.ID+`","subject":"feidu-user:42","expiresInSeconds":600}`,
+		))
+		request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+		response := httptest.NewRecorder()
+		s.HandleAccessTicketsAPI(response, request)
+		if response.Code != http.StatusInternalServerError || len(s.accessTickets) != 0 {
+			t.Fatalf("create failure status=%d tickets=%d", response.Code, len(s.accessTickets))
+		}
+	})
+
+	t.Run("renew", func(t *testing.T) {
+		s, client := newServer(t)
+		ticketValue := issueAccessTicketWithSubject(t, s, client.ID, "feidu-user:42", 600)
+		ticketHash := sha256.Sum256([]byte(ticketValue))
+		originalExpiry := s.accessTickets[ticketHash].ExpiresAt
+		expiredHash := sha256.Sum256([]byte("rdvat_expired-rollback-ticket"))
+		s.accessTickets[expiredHash] = accessTicket{
+			ID: "22222222222222222222222222222222", DeviceID: client.ID,
+			DeviceCredentialVersion: 1, InstanceID: client.InstanceID,
+			PasswordFingerprint: passwordFingerprint(client.Password), Subject: "feidu-user:42", ExpiresAt: now.Add(-time.Minute),
+		}
+		setFailingStore(t, s)
+		body, err := json.Marshal(accessTicketRenewRequest{
+			TicketID: s.accessTickets[ticketHash].ID, ExpiresAtMs: now.Add(time.Hour).UnixMilli(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodPatch, "/api/control/access-tickets", bytes.NewReader(body))
+		request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+		response := httptest.NewRecorder()
+		s.HandleAccessTicketsAPI(response, request)
+		if response.Code != http.StatusInternalServerError {
+			t.Fatalf("renew failure status = %d", response.Code)
+		}
+		if got := s.accessTickets[ticketHash].ExpiresAt; !got.Equal(originalExpiry) {
+			t.Fatalf("renew failure retained expiry %s, want %s", got, originalExpiry)
+		}
+		if _, exists := s.accessTickets[expiredHash]; !exists {
+			t.Fatal("renew failure did not restore the pruned expired ticket")
+		}
+	})
+
+	t.Run("revoke", func(t *testing.T) {
+		s, client := newServer(t)
+		ticketValue := issueAccessTicketWithSubject(t, s, client.ID, "feidu-user:42", 600)
+		ticketHash := sha256.Sum256([]byte(ticketValue))
+		setFailingStore(t, s)
+		body, err := json.Marshal(accessTicketRevokeRequest{TicketID: s.accessTickets[ticketHash].ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodDelete, "/api/control/access-tickets", bytes.NewReader(body))
+		request.Header.Set("X-RDev-Control-Token", s.ControlToken)
+		response := httptest.NewRecorder()
+		s.HandleAccessTicketsAPI(response, request)
+		if response.Code != http.StatusInternalServerError || !s.authorizeDeviceCredential(client, ticketValue) {
+			t.Fatalf("revoke failure status=%d ticket_valid=%t", response.Code, s.authorizeDeviceCredential(client, ticketValue))
+		}
+	})
 }
 
 func TestAccessTicketRegistryV1IsCompatibleOnlyWithInitialDeviceCredentialVersion(t *testing.T) {
@@ -948,6 +1405,10 @@ func issueAccessTicket(t *testing.T, s *Server, deviceID string, lifetimeSeconds
 }
 
 func issueAccessTicketWithSubject(t *testing.T, s *Server, deviceID, subject string, lifetimeSeconds int64) string {
+	return issueScopedAccessTicketWithSubject(t, s, deviceID, subject, lifetimeSeconds, nil)
+}
+
+func issueScopedAccessTicketWithSubject(t *testing.T, s *Server, deviceID, subject string, lifetimeSeconds int64, capabilities []string) string {
 	t.Helper()
 	device := s.managedDevices[deviceID]
 	device.ID = deviceID
@@ -960,6 +1421,7 @@ func issueAccessTicketWithSubject(t *testing.T, s *Server, deviceID, subject str
 		DeviceID:        deviceID,
 		Subject:         subject,
 		ExpiresInSecond: lifetimeSeconds,
+		Capabilities:    capabilities,
 	})
 	if err != nil {
 		t.Fatal(err)

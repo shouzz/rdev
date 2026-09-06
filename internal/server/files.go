@@ -167,9 +167,13 @@ func (h *filesWSHandler) handleAuth(socket *fileSocket, msg fileMsg) {
 		socket.writeText(fileMsg{Op: "auth_fail", DeviceID: msg.DeviceID, Message: "device not connected"})
 		return
 	}
-	if h.srv.authorizeDeviceCredential(client, msg.Password) {
+	authorization, browserOK := h.srv.authorizeBrowserDeviceCredentialBinding(client, msg.Password, browserCapabilityFiles)
+	if !browserOK {
+		authorization, browserOK = h.srv.authorizeDeviceCredentialBinding(client, msg.Password)
+	}
+	if browserOK {
 		socket.authMu.Lock()
-		socket.authorized[msg.DeviceID] = deviceAuthorizationFor(client)
+		socket.authorized[msg.DeviceID] = authorization
 		delete(socket.authFails, msg.DeviceID)
 		socket.authMu.Unlock()
 		socket.writeText(fileMsg{Op: "auth_ok", DeviceID: msg.DeviceID})
@@ -192,7 +196,7 @@ func (h *filesWSHandler) isAuthorized(socket *fileSocket, client *ClientConn) bo
 	socket.authMu.RLock()
 	authorization, ok := socket.authorized[client.ID]
 	socket.authMu.RUnlock()
-	return ok && authorization.validFor(client)
+	return ok && h.srv.deviceAuthorizationValid(authorization, client)
 }
 
 func (h *filesWSHandler) clientFor(socket *fileSocket, deviceID string) (*ClientConn, bool) {
@@ -498,12 +502,20 @@ func (s *Server) HandleFilesWS(w http.ResponseWriter, r *http.Request) {
 		ReadMaxPayloadSize: 16 * 1024 * 1024,
 		ParallelGolimit:    1,
 		SubProtocols:       []string{browserSocketProtocol},
-		PermessageDeflate:  gws.PermessageDeflate{Enabled: false},
+		Authorize: func(r *http.Request, session gws.SessionStorage) bool {
+			return s.authorizeBrowserUpgrade(r, session, "")
+		},
+		PermessageDeflate: gws.PermessageDeflate{Enabled: false},
 	})
 	socket, err := upgrader.Upgrade(w, r)
 	if err != nil {
 		log.Printf("files ws upgrade error: %v", err)
 		return
 	}
+	if _, ok := s.trackBrowserTicketConnection(socket); !ok {
+		_ = socket.WriteClose(4003, []byte("browser access expired"))
+		return
+	}
+	defer s.untrackBrowserTicketConnection(socket)
 	socket.ReadLoop()
 }

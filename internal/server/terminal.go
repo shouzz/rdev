@@ -200,7 +200,9 @@ func (h *terminalWSHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 				return
 			}
 
-			if h.srv.authorizeDeviceCredential(client, tmsg.Password) {
+			_, browserOK := h.srv.authorizeBrowserDeviceCredentialBinding(client, tmsg.Password, browserCapabilityTerminal)
+			_, deviceOK := h.srv.authorizeDeviceCredentialBinding(client, tmsg.Password)
+			if browserOK || deviceOK {
 				h.authed = true
 				h.sendJSON(socket, terminalMsg{Op: "auth_ok"})
 				h.createSession(socket, deviceID)
@@ -329,7 +331,7 @@ func (s *Server) HandleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		SubProtocols:       []string{browserSocketProtocol},
 		Authorize: func(r *http.Request, session gws.SessionStorage) bool {
 			session.Store("deviceID", deviceID)
-			return true
+			return s.authorizeBrowserUpgrade(r, session, deviceID)
 		},
 		PermessageDeflate: gws.PermessageDeflate{Enabled: false},
 	})
@@ -339,5 +341,10 @@ func (s *Server) HandleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("terminal ws upgrade error: %v", err)
 		return
 	}
+	if _, ok := s.trackBrowserTicketConnection(socket); !ok {
+		_ = socket.WriteClose(4003, []byte("browser access expired"))
+		return
+	}
+	defer s.untrackBrowserTicketConnection(socket)
 	socket.ReadLoop()
 }

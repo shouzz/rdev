@@ -316,6 +316,7 @@ Examples:
 	mux.HandleFunc("/session", srv.HandleSessionAttachWS)
 	mux.HandleFunc("/batch", splitPageAndWebSocket(srv.StaticPageHandler("batch.html"), srv.HandleBatchWS))
 	mux.HandleFunc("/files", splitPageAndWebSocket(srv.StaticPageHandler("files.html"), srv.HandleFilesWS))
+	mux.HandleFunc("/peripherals", srv.HandlePeripheralsWS)
 	mux.HandleFunc("/sessions", srv.StaticPageHandler("sessions.html"))
 	mux.HandleFunc("/remote-desktop", srv.StaticPageHandler("desktop.html"))
 	mux.HandleFunc("/api/clients", srv.HandleAPI)

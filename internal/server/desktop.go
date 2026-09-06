@@ -147,7 +147,9 @@ func (h *desktopWSHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 			bc.writeJSON(desktopMsg{Op: "auth", Device: bc.deviceID, Message: "device credential required"})
 			return
 		}
-		if h.srv.authorizeDeviceCredential(client, msg.Pass) {
+		_, browserOK := h.srv.authorizeBrowserDeviceCredentialBinding(client, msg.Pass, browserCapabilityDesktop)
+		_, deviceOK := h.srv.authorizeDeviceCredentialBinding(client, msg.Pass)
+		if browserOK || deviceOK {
 			h.start(bc)
 			return
 		}
@@ -628,7 +630,7 @@ func (s *Server) HandleDesktopWS(w http.ResponseWriter, r *http.Request) {
 		Authorize: func(r *http.Request, session gws.SessionStorage) bool {
 			session.Store("deviceID", deviceID)
 			session.Store("desktopRequest", request)
-			return true
+			return s.authorizeBrowserUpgrade(r, session, deviceID)
 		},
 		PermessageDeflate: gws.PermessageDeflate{
 			Enabled:               true,
@@ -642,5 +644,10 @@ func (s *Server) HandleDesktopWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("desktop ws upgrade error: %v", err)
 		return
 	}
+	if _, ok := s.trackBrowserTicketConnection(socket); !ok {
+		_ = socket.WriteClose(4003, []byte("browser access expired"))
+		return
+	}
+	defer s.untrackBrowserTicketConnection(socket)
 	socket.ReadLoop()
 }

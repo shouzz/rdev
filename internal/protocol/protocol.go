@@ -66,6 +66,17 @@ const (
 	MsgDesktopClose     MessageType = "desktop_close"     // bidir: close desktop session
 	MsgDesktopClipboard MessageType = "desktop_clipboard" // bidir: request, set, or report session clipboard text
 
+	// Remote peripherals. USB metadata is inventory-only; serial sessions are
+	// explicitly opened and never restored automatically after reconnect.
+	MsgPeripheralListRequest MessageType = "peripheral_list"        // S->C: enumerate serial ports and USB-backed serial assets
+	MsgPeripheralListResult  MessageType = "peripheral_list_result" // C->S: current peripheral snapshot
+	MsgSerialOpen            MessageType = "serial_open"            // S->C: open one serial port
+	MsgSerialOpenResult      MessageType = "serial_open_result"     // C->S: serial open result
+	MsgSerialClose           MessageType = "serial_close"           // S->C: close one serial session
+	MsgSerialCloseResult     MessageType = "serial_close_result"    // C->S: serial close result
+	MsgSerialWriteResult     MessageType = "serial_write_result"    // C->S: bytes accepted by the serial driver
+	MsgSerialError           MessageType = "serial_error"           // C->S: asynchronous serial failure
+
 	// GPU desktop tunnel over shared TCP/KCP transport.
 	MsgGPUDesktopTunnel MessageType = "gpu_desktop_tunnel"
 
@@ -101,6 +112,7 @@ const (
 	BinFileTransferCancel byte = 0x24
 
 	BinDesktopFrame byte = 0x30 // Remote desktop encoded frame bytes
+	BinSerialData   byte = 0x40 // Raw serial bytes in either direction
 )
 
 // File binary extended layout after common header:
@@ -214,6 +226,14 @@ type Message struct {
 	Text            string          `json:"text,omitempty"`
 	ClipboardItems  []ClipboardItem `json:"clipboardItems,omitempty"`
 
+	// Remote peripheral inventory and serial console.
+	PeripheralV1 bool             `json:"peripheralV1,omitempty"`
+	SerialPorts  []SerialPortInfo `json:"serialPorts,omitempty"`
+	SerialPortID string           `json:"serialPortId,omitempty"`
+	SerialConfig *SerialConfig    `json:"serialConfig,omitempty"`
+	ErrorCode    string           `json:"errorCode,omitempty"`
+	DroppedBytes uint64           `json:"droppedBytes,omitempty"`
+
 	// Client log collection
 	LogSupported    bool       `json:"logSupported,omitempty"`
 	CloudTransferV1 bool       `json:"cloudTransferV1,omitempty"`
@@ -227,6 +247,29 @@ type Message struct {
 	// Legacy fields (text frames)
 	Data   string `json:"data,omitempty"`
 	Stderr string `json:"stderr,omitempty"`
+}
+
+// SerialPortInfo is a read-only serial asset snapshot. SerialNumber is
+// intentionally omitted so the browser does not receive a hardware identifier
+// that is not needed to open the current port.
+type SerialPortInfo struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	USB          bool   `json:"usb"`
+	VendorID     string `json:"vendorId,omitempty"`
+	ProductID    string `json:"productId,omitempty"`
+	Manufacturer string `json:"manufacturer,omitempty"`
+	Product      string `json:"product,omitempty"`
+}
+
+// SerialConfig is the portable subset implemented by the client on every
+// supported platform. FlowControl currently accepts only "none".
+type SerialConfig struct {
+	BaudRate    int    `json:"baudRate"`
+	DataBits    int    `json:"dataBits"`
+	Parity      string `json:"parity"`
+	StopBits    string `json:"stopBits"`
+	FlowControl string `json:"flowControl"`
 }
 
 // ClipboardItem is one base64-encoded clipboard representation.

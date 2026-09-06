@@ -16,19 +16,35 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/lxzan/gws"
 )
 
 const (
-	accessTicketPrefix      = "rdvat_"
-	browserSocketProtocol   = "rdev-browser-v1"
-	browserTicketProtocol   = "rdev-access-ticket."
-	browserTicketSubject    = "feidu-browser:"
-	accessTicketSecretBytes = 32
-	accessTicketMinLifetime = time.Minute
-	accessTicketMaxLifetime = 8 * time.Hour
-	accessTicketRegistryV1  = "rdev-access-ticket-registry.v1"
-	accessTicketRegistryV2  = "rdev-access-ticket-registry.v2"
+	accessTicketPrefix           = "rdvat_"
+	browserSocketProtocol        = "rdev-browser-v1"
+	browserTicketProtocol        = "rdev-access-ticket."
+	browserTicketSubject         = "feidu-browser:"
+	accessTicketSecretBytes      = 32
+	accessTicketMinLifetime      = time.Minute
+	accessTicketMaxLifetime      = 8 * time.Hour
+	accessTicketRegistryV1       = "rdev-access-ticket-registry.v1"
+	accessTicketRegistryV2       = "rdev-access-ticket-registry.v2"
+	accessTicketRegistryV3       = "rdev-access-ticket-registry.v3"
+	browserCapabilityTerminal    = "terminal"
+	browserCapabilityFiles       = "files"
+	browserCapabilityDesktop     = "desktop"
+	browserCapabilityPeripherals = "peripherals"
+	browserTicketSessionKey      = "browserAccessTicketID"
+	browserSubjectSessionKey     = "browserAccessSubject"
 )
+
+var browserCapabilityByPath = map[string]string{
+	"/terminal":    browserCapabilityTerminal,
+	"/files":       browserCapabilityFiles,
+	"/desktop":     browserCapabilityDesktop,
+	"/peripherals": browserCapabilityPeripherals,
+}
 
 type accessTicket struct {
 	ID                      string
@@ -37,6 +53,7 @@ type accessTicket struct {
 	InstanceID              string
 	PasswordFingerprint     string
 	Subject                 string
+	Capabilities            []string
 	ExpiresAt               time.Time
 }
 
@@ -46,14 +63,15 @@ type accessTicketRegistry struct {
 }
 
 type accessTicketRegistryRecord struct {
-	TicketHash              string `json:"ticket_hash"`
-	ID                      string `json:"id"`
-	DeviceID                string `json:"device_id"`
-	DeviceCredentialVersion uint64 `json:"device_credential_version,omitempty"`
-	InstanceID              string `json:"instance_id"`
-	PasswordFingerprint     string `json:"password_fingerprint"`
-	Subject                 string `json:"subject"`
-	ExpiresAt               string `json:"expires_at"`
+	TicketHash              string   `json:"ticket_hash"`
+	ID                      string   `json:"id"`
+	DeviceID                string   `json:"device_id"`
+	DeviceCredentialVersion uint64   `json:"device_credential_version,omitempty"`
+	InstanceID              string   `json:"instance_id"`
+	PasswordFingerprint     string   `json:"password_fingerprint"`
+	Subject                 string   `json:"subject"`
+	Capabilities            []string `json:"capabilities,omitempty"`
+	ExpiresAt               string   `json:"expires_at"`
 }
 
 type deviceAuthorization struct {
@@ -66,9 +84,10 @@ type deviceAuthorization struct {
 }
 
 type accessTicketCreateRequest struct {
-	DeviceID        string `json:"deviceId"`
-	Subject         string `json:"subject"`
-	ExpiresInSecond int64  `json:"expiresInSeconds"`
+	DeviceID        string   `json:"deviceId"`
+	Subject         string   `json:"subject"`
+	ExpiresInSecond int64    `json:"expiresInSeconds"`
+	Capabilities    []string `json:"capabilities,omitempty"`
 }
 
 type accessTicketCreateResponse struct {
@@ -127,7 +146,7 @@ func (s *Server) loadAccessTicketsLocked() error {
 	if err = decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return errors.New("decode access ticket store: trailing data")
 	}
-	if registry.Schema != accessTicketRegistryV1 && registry.Schema != accessTicketRegistryV2 {
+	if registry.Schema != accessTicketRegistryV1 && registry.Schema != accessTicketRegistryV2 && registry.Schema != accessTicketRegistryV3 {
 		return errors.New("access ticket store schema is invalid")
 	}
 	now := s.accessTicketCurrentTime()
@@ -158,6 +177,16 @@ func (s *Server) loadAccessTicketsLocked() error {
 		if record.Subject == "" || strings.TrimSpace(record.Subject) != record.Subject || len(record.Subject) > 128 {
 			return errors.New("access ticket store subject is invalid")
 		}
+		capabilities := record.Capabilities
+		if registry.Schema != accessTicketRegistryV3 {
+			capabilities = legacyBrowserCapabilities(record.Subject)
+		} else if strings.HasPrefix(record.Subject, browserTicketSubject) && capabilities == nil {
+			return errors.New("access ticket store browser capabilities are missing")
+		}
+		capabilities, err = normalizeAccessTicketCapabilities(record.Subject, capabilities)
+		if err != nil {
+			return fmt.Errorf("access ticket store capabilities: %w", err)
+		}
 		expiresAt, parseErr := time.Parse(time.RFC3339, record.ExpiresAt)
 		if parseErr != nil || expiresAt.UTC().Format(time.RFC3339) != record.ExpiresAt {
 			return errors.New("access ticket store expires_at is invalid")
@@ -173,7 +202,8 @@ func (s *Server) loadAccessTicketsLocked() error {
 		s.accessTickets[ticketHash] = accessTicket{
 			ID: record.ID, DeviceID: record.DeviceID, InstanceID: record.InstanceID,
 			DeviceCredentialVersion: record.DeviceCredentialVersion,
-			PasswordFingerprint:     record.PasswordFingerprint, Subject: record.Subject, ExpiresAt: expiresAt,
+			PasswordFingerprint:     record.PasswordFingerprint, Subject: record.Subject,
+			Capabilities: capabilities, ExpiresAt: expiresAt,
 		}
 	}
 	return nil
@@ -190,14 +220,15 @@ func (s *Server) persistAccessTicketsLocked() error {
 	sort.Slice(hashes, func(i, j int) bool {
 		return hex.EncodeToString(hashes[i][:]) < hex.EncodeToString(hashes[j][:])
 	})
-	registry := accessTicketRegistry{Schema: accessTicketRegistryV2, Tickets: make([]accessTicketRegistryRecord, 0, len(hashes))}
+	registry := accessTicketRegistry{Schema: accessTicketRegistryV3, Tickets: make([]accessTicketRegistryRecord, 0, len(hashes))}
 	for _, hash := range hashes {
 		ticket := s.accessTickets[hash]
 		registry.Tickets = append(registry.Tickets, accessTicketRegistryRecord{
 			TicketHash: hex.EncodeToString(hash[:]), ID: ticket.ID, DeviceID: ticket.DeviceID,
 			DeviceCredentialVersion: ticket.DeviceCredentialVersion,
 			InstanceID:              ticket.InstanceID, PasswordFingerprint: ticket.PasswordFingerprint,
-			Subject: ticket.Subject, ExpiresAt: ticket.ExpiresAt.UTC().Format(time.RFC3339),
+			Subject: ticket.Subject, Capabilities: append([]string(nil), ticket.Capabilities...),
+			ExpiresAt: ticket.ExpiresAt.UTC().Format(time.RFC3339),
 		})
 	}
 	data, err := json.MarshalIndent(registry, "", "  ")
@@ -243,15 +274,57 @@ func (s *Server) controlAuthOK(r *http.Request) bool {
 	return subtle.ConstantTimeCompare(want[:], got[:]) == 1
 }
 
+func legacyBrowserCapabilities(subject string) []string {
+	if !strings.HasPrefix(subject, browserTicketSubject) {
+		return nil
+	}
+	return []string{browserCapabilityDesktop, browserCapabilityFiles, browserCapabilityTerminal}
+}
+
+func normalizeAccessTicketCapabilities(subject string, capabilities []string) ([]string, error) {
+	if !strings.HasPrefix(subject, browserTicketSubject) {
+		if len(capabilities) != 0 {
+			return nil, errors.New("capabilities are supported only for browser tickets")
+		}
+		return nil, nil
+	}
+	if capabilities == nil {
+		capabilities = legacyBrowserCapabilities(subject)
+	}
+	if len(capabilities) == 0 || len(capabilities) > len(browserCapabilityByPath) {
+		return nil, errors.New("browser ticket capabilities must contain between 1 and 4 entries")
+	}
+	seen := make(map[string]struct{}, len(capabilities))
+	normalized := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		switch capability {
+		case browserCapabilityTerminal, browserCapabilityFiles, browserCapabilityDesktop, browserCapabilityPeripherals:
+		default:
+			return nil, errors.New("browser ticket capability is invalid")
+		}
+		if _, exists := seen[capability]; exists {
+			return nil, errors.New("browser ticket capabilities contain a duplicate")
+		}
+		seen[capability] = struct{}{}
+		normalized = append(normalized, capability)
+	}
+	sort.Strings(normalized)
+	return normalized, nil
+}
+
+func accessTicketHasCapability(ticket accessTicket, capability string) bool {
+	index := sort.SearchStrings(ticket.Capabilities, capability)
+	return index < len(ticket.Capabilities) && ticket.Capabilities[index] == capability
+}
+
 func (s *Server) browserSocketAuthOK(r *http.Request) bool {
 	if !s.secureControlEnabled() || r == nil || r.Method != http.MethodGet ||
 		!headerContainsToken(r.Header, "Connection", "upgrade") ||
 		!strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		return false
 	}
-	switch r.URL.Path {
-	case "/terminal", "/files", "/desktop":
-	default:
+	capability, allowedPath := browserCapabilityByPath[r.URL.Path]
+	if !allowedPath {
 		return false
 	}
 	for _, value := range r.Header.Values("Sec-WebSocket-Protocol") {
@@ -261,12 +334,65 @@ func (s *Server) browserSocketAuthOK(r *http.Request) bool {
 				continue
 			}
 			value := strings.TrimPrefix(protocol, browserTicketProtocol)
-			if s.browserAccessTicketValid(value, r.URL.Query().Get("device")) {
+			if s.browserAccessTicketValid(value, r.URL.Query().Get("device"), capability) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func (s *Server) browserSocketTicket(r *http.Request) (accessTicket, bool) {
+	if r == nil {
+		return accessTicket{}, false
+	}
+	capability, allowedPath := browserCapabilityByPath[r.URL.Path]
+	if !allowedPath {
+		return accessTicket{}, false
+	}
+	requestedDeviceID := r.URL.Query().Get("device")
+	for _, value := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, protocolValue := range strings.Split(value, ",") {
+			protocolValue = strings.TrimSpace(protocolValue)
+			if !strings.HasPrefix(protocolValue, browserTicketProtocol) {
+				continue
+			}
+			ticketValue := strings.TrimPrefix(protocolValue, browserTicketProtocol)
+			if !strings.HasPrefix(ticketValue, accessTicketPrefix) {
+				continue
+			}
+			hash := sha256.Sum256([]byte(ticketValue))
+			now := s.accessTicketCurrentTime()
+			s.enrollmentMu.Lock()
+			s.accessTicketMu.Lock()
+			ticket, ok := s.accessTickets[hash]
+			device, managed := s.managedDevices[ticket.DeviceID]
+			valid := ok && strings.HasPrefix(ticket.Subject, browserTicketSubject) &&
+				ticket.ExpiresAt.After(now) && accessTicketHasCapability(ticket, capability) &&
+				(requestedDeviceID == "" || requestedDeviceID == ticket.DeviceID) && managed &&
+				device.RevokedAt.IsZero() &&
+				accessTicketCredentialVersionMatches(ticket.DeviceCredentialVersion, device.CredentialVersion)
+			s.accessTicketMu.Unlock()
+			s.enrollmentMu.Unlock()
+			if valid {
+				return ticket, true
+			}
+		}
+	}
+	return accessTicket{}, false
+}
+
+func (s *Server) authorizeBrowserUpgrade(r *http.Request, session interface{ Store(string, any) }, deviceID string) bool {
+	if s.controlAuthOK(r) {
+		return true
+	}
+	ticket, ok := s.browserSocketTicket(r)
+	if !ok || (deviceID != "" && ticket.DeviceID != deviceID) {
+		return false
+	}
+	session.Store(browserTicketSessionKey, ticket.ID)
+	session.Store(browserSubjectSessionKey, ticket.Subject)
+	return true
 }
 
 func headerContainsToken(header http.Header, name, want string) bool {
@@ -280,7 +406,7 @@ func headerContainsToken(header http.Header, name, want string) bool {
 	return false
 }
 
-func (s *Server) browserAccessTicketValid(value, requestedDeviceID string) bool {
+func (s *Server) browserAccessTicketValid(value, requestedDeviceID, capability string) bool {
 	if !strings.HasPrefix(value, accessTicketPrefix) {
 		return false
 	}
@@ -296,7 +422,8 @@ func (s *Server) browserAccessTicketValid(value, requestedDeviceID string) bool 
 		}
 	}
 	ticket, ok := s.accessTickets[hash]
-	if !ok || !strings.HasPrefix(ticket.Subject, browserTicketSubject) || !ticket.ExpiresAt.After(now) {
+	if !ok || !strings.HasPrefix(ticket.Subject, browserTicketSubject) || !ticket.ExpiresAt.After(now) ||
+		!accessTicketHasCapability(ticket, capability) {
 		return false
 	}
 	device, managed := s.managedDevices[ticket.DeviceID]
@@ -341,6 +468,16 @@ func (s *Server) accessTicketValid(client *ClientConn, value string) bool {
 }
 
 func (s *Server) accessTicketForCredential(client *ClientConn, value string) (accessTicket, bool) {
+	ticket, valid := s.accessTicketForClient(client, value)
+	return ticket, valid && !strings.HasPrefix(ticket.Subject, browserTicketSubject)
+}
+
+func (s *Server) accessTicketForBrowserCredential(client *ClientConn, value, capability string) (accessTicket, bool) {
+	ticket, valid := s.accessTicketForClient(client, value)
+	return ticket, valid && strings.HasPrefix(ticket.Subject, browserTicketSubject) && accessTicketHasCapability(ticket, capability)
+}
+
+func (s *Server) accessTicketForClient(client *ClientConn, value string) (accessTicket, bool) {
 	if client == nil {
 		return accessTicket{}, false
 	}
@@ -369,6 +506,18 @@ func (s *Server) accessTicketForCredential(client *ClientConn, value string) (ac
 		constantTimeEqual(ticket.PasswordFingerprint, passwordFingerprint(client.Password)) &&
 		ticket.ExpiresAt.After(now)
 	return ticket, valid
+}
+
+func (s *Server) authorizeBrowserDeviceCredentialBinding(client *ClientConn, credential, capability string) (deviceAuthorization, bool) {
+	ticket, ok := s.accessTicketForBrowserCredential(client, credential, capability)
+	if !ok {
+		return deviceAuthorization{}, false
+	}
+	authorization := deviceAuthorizationFor(client)
+	authorization.TicketID = ticket.ID
+	authorization.TicketExpiresAt = ticket.ExpiresAt
+	authorization.DeviceCredentialVersion = ticket.DeviceCredentialVersion
+	return authorization, true
 }
 
 func deviceAuthorizationFor(client *ClientConn) deviceAuthorization {
@@ -444,6 +593,107 @@ func (s *Server) accessTicketExpiration(ticketID string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+func (s *Server) trackBrowserTicketConnection(socket *gws.Conn) (<-chan struct{}, bool) {
+	if socket == nil {
+		return nil, false
+	}
+	raw, _ := socket.Session().Load(browserTicketSessionKey)
+	ticketID, _ := raw.(string)
+	if ticketID == "" {
+		return nil, true
+	}
+	done := make(chan struct{})
+	s.enrollmentMu.Lock()
+	s.accessTicketMu.Lock()
+	now := s.accessTicketCurrentTime()
+	valid := false
+	for hash, ticket := range s.accessTickets {
+		if !ticket.ExpiresAt.After(now) {
+			delete(s.accessTickets, hash)
+			continue
+		}
+		if ticket.ID != ticketID || !strings.HasPrefix(ticket.Subject, browserTicketSubject) {
+			continue
+		}
+		device, managed := s.managedDevices[ticket.DeviceID]
+		valid = managed && device.RevokedAt.IsZero() &&
+			accessTicketCredentialVersionMatches(ticket.DeviceCredentialVersion, device.CredentialVersion)
+		break
+	}
+	if !valid {
+		s.accessTicketMu.Unlock()
+		s.enrollmentMu.Unlock()
+		return nil, false
+	}
+	s.browserTicketMu.Lock()
+	if s.browserTicketConnections[ticketID] == nil {
+		s.browserTicketConnections[ticketID] = make(map[*gws.Conn]chan struct{})
+	}
+	s.browserTicketConnections[ticketID][socket] = done
+	s.browserTicketMu.Unlock()
+	s.accessTicketMu.Unlock()
+	s.enrollmentMu.Unlock()
+	go s.watchBrowserTicketConnection(ticketID, done)
+	return done, true
+}
+
+func (s *Server) untrackBrowserTicketConnection(socket *gws.Conn) {
+	if socket == nil {
+		return
+	}
+	raw, _ := socket.Session().Load(browserTicketSessionKey)
+	ticketID, _ := raw.(string)
+	if ticketID == "" {
+		return
+	}
+	s.browserTicketMu.Lock()
+	connections := s.browserTicketConnections[ticketID]
+	done, exists := connections[socket]
+	if exists {
+		delete(connections, socket)
+		close(done)
+	}
+	if len(connections) == 0 {
+		delete(s.browserTicketConnections, ticketID)
+	}
+	s.browserTicketMu.Unlock()
+}
+
+func (s *Server) watchBrowserTicketConnection(ticketID string, done <-chan struct{}) {
+	for {
+		expiresAt, ok := s.accessTicketExpiration(ticketID)
+		if !ok {
+			s.closeBrowserTicketConnections(ticketID, "browser access expired")
+			return
+		}
+		delay := expiresAt.Sub(s.accessTicketCurrentTime())
+		if delay <= 0 {
+			s.closeBrowserTicketConnections(ticketID, "browser access expired")
+			return
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *Server) closeBrowserTicketConnections(ticketID, reason string) {
+	s.browserTicketMu.Lock()
+	connections := s.browserTicketConnections[ticketID]
+	delete(s.browserTicketConnections, ticketID)
+	s.browserTicketMu.Unlock()
+	for socket, done := range connections {
+		close(done)
+		_ = socket.WriteClose(4003, []byte(reason))
+	}
+}
+
 func (s *Server) authorizeBrowserDeviceRequest(client *ClientConn, r *http.Request) bool {
 	if client == nil || r == nil {
 		return false
@@ -495,6 +745,11 @@ func (s *Server) HandleAccessTicketsAPI(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "subject is required and must not exceed 128 bytes", http.StatusBadRequest)
 		return
 	}
+	capabilities, err := normalizeAccessTicketCapabilities(input.Subject, input.Capabilities)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if input.ExpiresInSecond < int64(accessTicketMinLifetime/time.Second) ||
 		input.ExpiresInSecond > int64(accessTicketMaxLifetime/time.Second) {
 		http.Error(w, "expiresInSeconds must be between 60 and 28800", http.StatusBadRequest)
@@ -531,6 +786,7 @@ func (s *Server) HandleAccessTicketsAPI(w http.ResponseWriter, r *http.Request) 
 		InstanceID:              client.InstanceID,
 		PasswordFingerprint:     passwordFingerprint(client.Password),
 		Subject:                 input.Subject,
+		Capabilities:            capabilities,
 		ExpiresAt:               expiresAt,
 	}
 	if err = s.persistAccessTicketsLocked(); err != nil {
@@ -580,12 +836,11 @@ func (s *Server) handleAccessTicketRenew(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var renewed accessTicket
-	var renewedHash [sha256.Size]byte
-	var originalExpiry time.Time
 	changed := false
 	s.enrollmentMu.Lock()
 	defer s.enrollmentMu.Unlock()
 	s.accessTicketMu.Lock()
+	original := cloneAccessTickets(s.accessTickets)
 	for hash, ticket := range s.accessTickets {
 		if !ticket.ExpiresAt.After(now) {
 			delete(s.accessTickets, hash)
@@ -602,10 +857,8 @@ func (s *Server) handleAccessTicketRenew(w http.ResponseWriter, r *http.Request)
 		if ticket.ExpiresAt.After(expiresAt) {
 			expiresAt = ticket.ExpiresAt
 		} else {
-			originalExpiry = ticket.ExpiresAt
 			ticket.ExpiresAt = expiresAt
 			s.accessTickets[hash] = ticket
-			renewedHash = hash
 			changed = true
 		}
 		renewed = ticket
@@ -613,9 +866,7 @@ func (s *Server) handleAccessTicketRenew(w http.ResponseWriter, r *http.Request)
 	}
 	if changed {
 		if err = s.persistAccessTicketsLocked(); err != nil {
-			ticket := s.accessTickets[renewedHash]
-			ticket.ExpiresAt = originalExpiry
-			s.accessTickets[renewedHash] = ticket
+			s.accessTickets = original
 			s.accessTicketMu.Unlock()
 			http.Error(w, "access ticket store write failed", http.StatusInternalServerError)
 			return
@@ -676,8 +927,11 @@ func (s *Server) handleAccessTicketRevoke(w http.ResponseWriter, r *http.Request
 		}
 	}
 	s.accessTicketMu.Unlock()
-	if revoked && s.accessTicketRevoked != nil {
-		s.accessTicketRevoked(input.TicketID)
+	if revoked {
+		s.closeBrowserTicketConnections(input.TicketID, "browser access revoked")
+		if s.accessTicketRevoked != nil {
+			s.accessTicketRevoked(input.TicketID)
+		}
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
@@ -748,9 +1002,6 @@ func accessTicketCredentialVersionMatches(ticketVersion, deviceVersion uint64) b
 }
 
 func (s *Server) invalidateAccessTicketConnectionsForDevice(deviceID string) {
-	if s.accessTicketRevoked == nil {
-		return
-	}
 	s.accessTicketMu.Lock()
 	ticketIDs := make([]string, 0)
 	for _, ticket := range s.accessTickets {
@@ -760,7 +1011,10 @@ func (s *Server) invalidateAccessTicketConnectionsForDevice(deviceID string) {
 	}
 	s.accessTicketMu.Unlock()
 	for _, ticketID := range ticketIDs {
-		s.accessTicketRevoked(ticketID)
+		s.closeBrowserTicketConnections(ticketID, "device authorization changed")
+		if s.accessTicketRevoked != nil {
+			s.accessTicketRevoked(ticketID)
+		}
 	}
 }
 

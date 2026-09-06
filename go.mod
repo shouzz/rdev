@@ -14,6 +14,7 @@ require (
 	github.com/minio/selfupdate v0.6.0
 	github.com/pkg/sftp v1.13.11
 	github.com/xtaci/kcp-go/v5 v5.6.72
+	go.bug.st/serial v1.8.0
 	golang.design/x/clipboard v0.9.0
 	golang.org/x/crypto v0.55.0
 	golang.org/x/sys v0.47.0
