@@ -449,7 +449,7 @@ func TestWhitespaceControlTokenDoesNotEnableOpenMode(t *testing.T) {
 	}
 }
 
-func TestManagedDeviceAccessTicketRequiresExactOwnerSubject(t *testing.T) {
+func TestManagedDeviceAccessTicketSharesAcrossFeiduAccounts(t *testing.T) {
 	s := NewServer()
 	s.ControlToken = "control-secret"
 	s.managedDevices["managed-device"] = managedDevice{
@@ -461,8 +461,13 @@ func TestManagedDeviceAccessTicketRequiresExactOwnerSubject(t *testing.T) {
 	request.Header.Set("X-RDev-Control-Token", s.ControlToken)
 	response := httptest.NewRecorder()
 	s.HandleAccessTicketsAPI(response, request)
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", response.Code)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.Code)
+	}
+	for _, ticket := range s.accessTickets {
+		if ticket.Subject != "feidu-user:7" {
+			t.Fatal("shared access did not preserve the actual operator")
+		}
 	}
 }
 
@@ -482,7 +487,7 @@ func TestUnmanagedDeviceAccessTicketIsRejected(t *testing.T) {
 	}
 }
 
-func TestManagedDeviceBrowserTicketMapsToExactAccountOwner(t *testing.T) {
+func TestManagedDeviceBrowserTicketAllowsCanonicalFeiduAccounts(t *testing.T) {
 	s := NewServer()
 	s.ControlToken = "control-secret"
 	s.managedDevices["managed-device"] = managedDevice{
@@ -496,7 +501,12 @@ func TestManagedDeviceBrowserTicketMapsToExactAccountOwner(t *testing.T) {
 	}{
 		{subject: "feidu-user:42", want: http.StatusOK},
 		{subject: "feidu-browser:42", want: http.StatusOK},
-		{subject: "feidu-browser:7", want: http.StatusForbidden},
+		{subject: "feidu-browser:7", want: http.StatusOK},
+		{subject: "feidu-user:7", want: http.StatusOK},
+		{subject: "feidu-user:0", want: http.StatusForbidden},
+		{subject: "feidu-browser:07", want: http.StatusForbidden},
+		{subject: "feidu-user:-1", want: http.StatusForbidden},
+		{subject: "feidu-user:unknown", want: http.StatusForbidden},
 		{subject: "feidu-agent-handoff:42", want: http.StatusForbidden},
 	} {
 		body, err := json.Marshal(accessTicketCreateRequest{

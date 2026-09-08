@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -675,7 +676,7 @@ func (s *Server) authorizeManagedRegistration(deviceID, secret string) (bool, bo
 	return bcrypt.CompareHashAndPassword([]byte(device.SecretHash), []byte(secret)) == nil, true
 }
 
-func (s *Server) managedDeviceOwnerMatches(deviceID, subject string) bool {
+func (s *Server) managedDeviceAccessAllowed(deviceID, subject string) bool {
 	s.enrollmentMu.Lock()
 	device, managed := s.managedDevices[deviceID]
 	s.enrollmentMu.Unlock()
@@ -685,19 +686,29 @@ func (s *Server) managedDeviceOwnerMatches(deviceID, subject string) bool {
 	if !device.RevokedAt.IsZero() {
 		return false
 	}
-	return managedDeviceOwnerSubjectMatches(device.OwnerSubject, subject)
+	return managedDeviceSubjectAllowed(device.OwnerSubject, subject)
 }
 
-func managedDeviceOwnerSubjectMatches(ownerSubject, subject string) bool {
-	if ownerSubject == subject {
+// The authenticated control plane supplies the actual operator, never the owner
+// on their behalf. Feidu devices are shared across valid Feidu account subjects.
+func managedDeviceSubjectAllowed(ownerSubject, subject string) bool {
+	if strings.HasPrefix(ownerSubject, "feidu-user:") {
+		return isFeiduAccountSubject(ownerSubject, "feidu-user:") &&
+			(isFeiduAccountSubject(subject, "feidu-user:") || isFeiduAccountSubject(subject, "feidu-browser:"))
+	}
+	return ownerSubject != "" && ownerSubject == subject
+}
+
+func isFeiduAccountSubject(subject, prefix string) bool {
+	if !strings.HasPrefix(subject, prefix) {
+		return false
+	}
+	accountID := strings.TrimPrefix(subject, prefix)
+	id, err := strconv.ParseUint(accountID, 10, 64)
+	if err == nil && id > 0 && strconv.FormatUint(id, 10) == accountID {
 		return true
 	}
-	const ownerPrefix = "feidu-user:"
-	const browserPrefix = "feidu-browser:"
-	return strings.HasPrefix(ownerSubject, ownerPrefix) &&
-		strings.HasPrefix(subject, browserPrefix) &&
-		strings.TrimPrefix(ownerSubject, ownerPrefix) != "" &&
-		strings.TrimPrefix(ownerSubject, ownerPrefix) == strings.TrimPrefix(subject, browserPrefix)
+	return false
 }
 
 func (s *Server) managedDeviceOwner(deviceID string) string {

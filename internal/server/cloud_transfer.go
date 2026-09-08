@@ -91,8 +91,8 @@ func (s *Server) HandleCloudTransferDispatchAPI(w http.ResponseWriter, r *http.R
 		http.Error(w, "device is not connected", http.StatusNotFound)
 		return
 	}
-	if !s.managedDeviceOwnerMatches(input.DeviceID, input.Subject) {
-		http.Error(w, "device is not owned by subject", http.StatusForbidden)
+	if !s.managedDeviceAccessAllowed(input.DeviceID, input.Subject) {
+		http.Error(w, "device access is not allowed for subject", http.StatusForbidden)
 		return
 	}
 	if !client.CloudTransferV1 {

@@ -30,11 +30,11 @@ func (*cloudTransferCaptureTransport) WritePing([]byte) error   { return nil }
 func (*cloudTransferCaptureTransport) Close(string) error       { return nil }
 func (*cloudTransferCaptureTransport) RemoteAddr() string       { return "127.0.0.1:12345" }
 
-func TestCloudTransferDispatchDeliversSecretOnlyToExactDevice(t *testing.T) {
+func TestCloudTransferDispatchSharesDeviceButDeliversSecretOnlyToExactDevice(t *testing.T) {
 	srv := NewServer()
 	srv.ControlToken = "test-control-token-with-at-least-32-bytes"
 	transport := &cloudTransferCaptureTransport{}
-	srv.managedDevices["device-one"] = managedDevice{ID: "device-one", OwnerSubject: "feidu-user:42"}
+	srv.managedDevices["device-one"] = managedDevice{ID: "device-one", OwnerSubject: "feidu-user:7"}
 	client := &ClientConn{ID: "device-one", InstanceID: "instance-one", Transport: transport, CloudTransferV1: true}
 	srv.clients["device-one"] = client
 	transport.onWrite = func(data []byte) {
@@ -72,11 +72,11 @@ func TestCloudTransferDispatchDeliversSecretOnlyToExactDevice(t *testing.T) {
 	}
 }
 
-func TestCloudTransferDispatchRejectsDifferentManagedDeviceOwner(t *testing.T) {
+func TestCloudTransferDispatchRejectsRevokedSharedDevice(t *testing.T) {
 	srv := NewServer()
 	srv.ControlToken = "test-control-token-with-at-least-32-bytes"
 	transport := &cloudTransferCaptureTransport{}
-	srv.managedDevices["device-one"] = managedDevice{ID: "device-one", OwnerSubject: "feidu-user:7"}
+	srv.managedDevices["device-one"] = managedDevice{ID: "device-one", OwnerSubject: "feidu-user:7", RevokedAt: time.Now()}
 	srv.clients["device-one"] = &ClientConn{ID: "device-one", InstanceID: "instance-one", Transport: transport}
 	token := "fdtx_" + base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
 	body := []byte(`{"deviceId":"device-one","subject":"feidu-user:42","transferId":"12345678-1234-1234-1234-1234567890ab","transferGeneration":1,"bootstrapUrl":"https://pan.feidu.fit/device/v1/rdev-transfers/12345678-1234-1234-1234-1234567890ab","transferToken":"` + token + `"}`)
@@ -90,7 +90,7 @@ func TestCloudTransferDispatchRejectsDifferentManagedDeviceOwner(t *testing.T) {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusForbidden)
 	}
 	if len(transport.message) != 0 {
-		t.Fatal("cloud transfer secret was delivered to a device owned by another subject")
+		t.Fatal("cloud transfer secret was delivered to a revoked shared device")
 	}
 }
 

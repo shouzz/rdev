@@ -770,9 +770,9 @@ func (s *Server) HandleAccessTicketsAPI(w http.ResponseWriter, r *http.Request) 
 	hash := sha256.Sum256([]byte(ticketValue))
 	s.enrollmentMu.Lock()
 	device, managed := s.managedDevices[input.DeviceID]
-	if !managed || !device.RevokedAt.IsZero() || !managedDeviceOwnerSubjectMatches(device.OwnerSubject, input.Subject) {
+	if !managed || !device.RevokedAt.IsZero() || !managedDeviceSubjectAllowed(device.OwnerSubject, input.Subject) {
 		s.enrollmentMu.Unlock()
-		http.Error(w, "device is not owned by subject", http.StatusForbidden)
+		http.Error(w, "device access is not allowed for subject", http.StatusForbidden)
 		return
 	}
 	s.accessTicketMu.Lock()
