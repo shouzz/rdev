@@ -389,6 +389,81 @@ function Wait-RDevElevationKey {
     return $false
 }
 
+function Get-RDevStartupDirectory {
+    return [Environment]::GetFolderPath('Startup')
+}
+
+function Start-RDevPersistentClient([string]$InstalledPath, [string]$IdentityFile) {
+    # A computer name is not a device identity. Reuse the protected local file,
+    # and do not overwrite a running executable or start a duplicate client.
+    $Candidates = if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        Get-CimInstance Win32_Process -Filter "Name = 'rdev-client.exe'" -ErrorAction Stop
+    } else {
+        Get-WmiObject Win32_Process -Filter "Name = 'rdev-client.exe'" -ErrorAction Stop
+    }
+    $Running = @($Candidates | Where-Object { $_.ExecutablePath -eq $InstalledPath })
+    foreach ($Existing in $Running) {
+        if (-not $Existing.CommandLine -or -not $Existing.CommandLine.Contains($IdentityFile)) {
+            throw 'The installed client is running with another identity. Stop that instance before changing its identity file.'
+        }
+    }
+    if ($Running.Count -eq 0) {
+        $Process = Start-Process -FilePath $InstalledPath -ArgumentList @('--identity-file', ('"' + $IdentityFile + '"')) -WindowStyle Hidden -PassThru -ErrorAction Stop
+        if ($Process.WaitForExit(1000)) {
+            throw "The installed client exited with code $($Process.ExitCode). Its saved identity was preserved; check that identity before enrolling again."
+        }
+    }
+    $StartupPath = Join-Path (Get-RDevStartupDirectory) 'RDev.cmd'
+    $StartupCommand = '@start "" /min "' + $InstalledPath + '" --identity-file "' + $IdentityFile + '"' + "`r`n"
+    [IO.File]::WriteAllText($StartupPath, $StartupCommand, (New-Object Text.UTF8Encoding($false)))
+    Write-Host '  RDev is running with its saved device identity and will reconnect after sign-in.' -ForegroundColor Green
+}
+
+function Invoke-RDevPersistentEnrollment([string]$Path, [string[]]$ClientArgs, [string]$Code) {
+    if ($Code -notmatch '^rdeve_[A-Za-z0-9_-]{43}$') { throw 'The enrollment code has an invalid format. Create a new invitation.' }
+    # Render native diagnostics as plain text, independently of PowerShell's
+    # ErrorRecord formatter, which also failed in the field screenshots.
+    $Info = New-Object Diagnostics.ProcessStartInfo
+    $Info.FileName = $Path
+    $Info.Arguments = (($ClientArgs | ForEach-Object {
+        '"' + (($_ -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
+    }) -join ' ')
+    $Info.UseShellExecute = $false
+    $Info.CreateNoWindow = $true
+    $Info.RedirectStandardInput = $true
+    $Info.RedirectStandardOutput = $true
+    $Info.RedirectStandardError = $true
+    # Framework creates its stdin writer with Console.InputEncoding and flushes
+    # the preamble immediately. Set a BOM-free encoding before starting it.
+    $PreviousInputEncoding = [Console]::InputEncoding
+    try {
+        [Console]::InputEncoding = New-Object Text.UTF8Encoding($false)
+        $Process = [Diagnostics.Process]::Start($Info)
+    } finally {
+        [Console]::InputEncoding = $PreviousInputEncoding
+    }
+    try {
+        $OutputTask = $Process.StandardOutput.ReadToEndAsync()
+        $ErrorTask = $Process.StandardError.ReadToEndAsync()
+        # .NET Framework may put a UTF-8 BOM on StandardInput. Enrollment codes
+        # are exact ASCII bytes, so write explicitly without a text preamble.
+        $InputBytes = (New-Object Text.UTF8Encoding($false)).GetBytes($Code + "`n")
+        $Process.StandardInput.BaseStream.Write($InputBytes, 0, $InputBytes.Length)
+        $Process.StandardInput.BaseStream.Close()
+        if (-not $Process.WaitForExit(30000)) {
+            $Process.Kill()
+            throw 'Device enrollment timed out. Check connectivity before retrying.'
+        }
+        $OutputText = $OutputTask.GetAwaiter().GetResult().Trim()
+        $ErrorText = $ErrorTask.GetAwaiter().GetResult().Trim()
+        if ($OutputText) { Write-Host $OutputText }
+        if ($ErrorText) { Write-Host $ErrorText -ForegroundColor Red }
+        return $Process.ExitCode
+    } finally {
+        $Process.Dispose()
+    }
+}
+
 function global:RDev {
     <#
     .SYNOPSIS
@@ -682,29 +757,30 @@ function global:RDev {
         $InstallDir = Join-Path $env:LOCALAPPDATA 'RDev'
         $InstalledPath = Join-Path $InstallDir 'rdev-client.exe'
         if (-not $IdentityFile) { $IdentityFile = Join-Path $InstallDir 'identity.bin' }
-        if (Test-Path -LiteralPath $IdentityFile) {
-            Write-Error "A managed-device identity already exists at $IdentityFile."
+        $IdentityFile = [IO.Path]::GetFullPath($IdentityFile)
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        if (Test-Path -LiteralPath $IdentityFile -PathType Leaf) {
+            $EnrollmentCode = $null
+            if (-not (Test-Path -LiteralPath $InstalledPath -PathType Leaf)) {
+                Copy-Item -LiteralPath $RunPath -Destination $InstalledPath -ErrorAction Stop
+            }
+            Start-RDevPersistentClient $InstalledPath $IdentityFile
             return
         }
-        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-        Copy-Item -LiteralPath $RunPath -Destination $InstalledPath -Force
+        Copy-Item -LiteralPath $RunPath -Destination $InstalledPath -Force -ErrorAction Stop
         if (-not $EnrollmentCode) { $EnrollmentCode = Read-Host '  One-time enrollment code' }
         $EnrollArgs = @('-s', $ClientServer)
         if ($Id) { $EnrollArgs += @('-i', $Id) }
-        $EnrollArgs += @('--enroll-stdin', '--enroll-only', '--replace-existing', '--identity-file', $IdentityFile)
-        $EnrollmentCode | & $InstalledPath @EnrollArgs
-        $EnrollExitCode = $LASTEXITCODE
+        # Fresh installations always receive a distinct server-assigned ID on
+        # collision, even when both computers were enrolled by the same account.
+        $EnrollArgs += @('--enroll-stdin', '--enroll-only', '--identity-file', $IdentityFile)
+        $EnrollExitCode = Invoke-RDevPersistentEnrollment $InstalledPath $EnrollArgs $EnrollmentCode
         $EnrollmentCode = $null
         if ($EnrollExitCode -ne 0) {
-            Write-Error "Enrollment failed with exit code $EnrollExitCode."
+            Write-Host "  Enrollment failed (exit $EnrollExitCode). HTTP 401 means the invitation was used or expired; create a new invitation for each new computer." -ForegroundColor Red
             return
         }
-        $StartupDir = [Environment]::GetFolderPath('Startup')
-        $StartupPath = Join-Path $StartupDir 'RDev.cmd'
-        $StartupCommand = '@start "" /min "' + $InstalledPath + '" --identity-file "' + $IdentityFile + '"' + "`r`n"
-        [IO.File]::WriteAllText($StartupPath, $StartupCommand, (New-Object Text.UTF8Encoding($false)))
-        Start-Process -FilePath $InstalledPath -ArgumentList @('--identity-file', ('"' + $IdentityFile + '"')) -WindowStyle Hidden | Out-Null
-        Write-Host "  RDev is installed for the current user and will reconnect after sign-in." -ForegroundColor Green
+        Start-RDevPersistentClient $InstalledPath $IdentityFile
         return
     }
 

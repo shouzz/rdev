@@ -717,7 +717,6 @@ if [ "$RDEV_PERSIST" = "1" ]; then
     [ "$RDEV_CLIENT" = "go" ] || { echo "Error: persistent enrollment requires the compatible Go client" >&2; exit 1; }
     [ "$OS" = "linux" ] || { echo "Error: persistent mode currently requires Linux and systemd" >&2; exit 1; }
     command -v systemctl >/dev/null 2>&1 || { echo "Error: systemd is required for persistent mode" >&2; exit 1; }
-    read_enrollment_code
     INSTALL_DIR="/usr/local/lib/rdev"
     INSTALLED_BIN="$INSTALL_DIR/rdev-client"
     IDENTITY_PATH="${RDEV_IDENTITY_FILE:-/var/lib/rdev/identity.json}"
@@ -725,12 +724,21 @@ if [ "$RDEV_PERSIST" = "1" ]; then
     UNIT_TMP="${TMPDIR:-/tmp}/rdev-client-$$.service"
     trap 'rm -f "$UNIT_TMP" 2>/dev/null' EXIT HUP INT TERM
     run_as_root mkdir -p "$INSTALL_DIR" "$(dirname "$IDENTITY_PATH")"
-    run_as_root install -m 0755 "$RUN_BIN" "$INSTALLED_BIN"
-    set -- -s "$RDEV_CLIENT_SERVER"
-    [ -n "$RDEV_ID" ] && set -- "$@" -i "$RDEV_ID"
-    set -- "$@" --enroll-stdin --enroll-only --replace-existing --identity-file "$IDENTITY_PATH"
-    printf '%s\n' "$ENROLLMENT_CODE" | run_as_root "$INSTALLED_BIN" "$@"
-    ENROLLMENT_CODE=""
+    if run_as_root test -f "$IDENTITY_PATH"; then
+        # Reuse this installation's identity; hostname alone cannot identify a computer.
+        RDEV_ENROLLMENT_CODE=""
+        if ! run_as_root test -x "$INSTALLED_BIN"; then
+            run_as_root install -m 0755 "$RUN_BIN" "$INSTALLED_BIN"
+        fi
+    else
+        read_enrollment_code
+        run_as_root install -m 0755 "$RUN_BIN" "$INSTALLED_BIN"
+        set -- -s "$RDEV_CLIENT_SERVER"
+        [ -n "$RDEV_ID" ] && set -- "$@" -i "$RDEV_ID"
+        set -- "$@" --enroll-stdin --enroll-only --identity-file "$IDENTITY_PATH"
+        printf '%s\n' "$ENROLLMENT_CODE" | run_as_root "$INSTALLED_BIN" "$@"
+        ENROLLMENT_CODE=""
+    fi
     umask 077
     printf '%s\n' \
         '[Unit]' \
@@ -749,6 +757,7 @@ if [ "$RDEV_PERSIST" = "1" ]; then
     run_as_root install -m 0644 "$UNIT_TMP" /etc/systemd/system/rdev-client.service
     run_as_root systemctl daemon-reload
     run_as_root systemctl enable --now rdev-client.service
+    run_as_root systemctl is-active --quiet rdev-client.service
     echo "  RDev is installed and will reconnect automatically." >&2
     exit 0
 fi

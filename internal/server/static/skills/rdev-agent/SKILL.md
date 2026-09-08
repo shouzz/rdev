@@ -7,7 +7,7 @@ description: Connect an AI coding agent to one exact RDev device and the account
 
 Use the handoff only for the device and task authorized by the user. Creating or redeeming a handoff does not authorize unrelated scans, deployments, file changes, or cloud mutations.
 
-The public join page uses `--replace-existing` only for persistent enrollment. It can replace only the exact, non-revoked managed device ID owned by the same Feidu account; the server rotates the device secret, advances the persisted device credential version, invalidates every access ticket issued for an older version, and disconnects the old connection. The invalidation applies to SSH and browser WebSocket entry points and remains effective after a server restart. HTTP 409 means the requested identity was not replaced and must not be bypassed with a guessed device ID.
+The public join launchers never use `--replace-existing`: a fresh installation receives a separate server-assigned ID when its hostname collides, including within the same account. A persistent installation reuses its OS-protected identity on subsequent runs and does not redeem another invitation. The advanced client's explicit `--replace-existing` option still permits only an exact, non-revoked managed ID owned by the same Feidu account; it rotates the secret, advances the credential version, invalidates old tickets, and disconnects the old connection. Never infer that two computers are the same device from a hostname.
 
 ## Redeem And Verify
 

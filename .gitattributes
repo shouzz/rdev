@@ -2,3 +2,4 @@ web/desktop.html text eol=lf
 internal/server/static/desktop.html text eol=lf
 web/public/terminal-images.js text eol=lf
 internal/server/static/terminal-images.js text eol=lf
+internal/server/static/run.sh text eol=lf

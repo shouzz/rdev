@@ -75,6 +75,9 @@
       "secret_storage": "server bcrypt hash only",
       "persistent_transport": "wss://r.feidu.fit",
       "persistent_reenrollment": {
+        "launcher_uses_replace_existing": false,
+        "fresh_install_collision": "allocate distinct server-assigned device ID, even for the same owner",
+        "existing_installation": "reuse OS-protected identity without redeeming an invitation",
         "client_flag": "--replace-existing",
         "allowed_scope": "same owner and exact managed device ID",
         "effect": "rotate device secret, revoke old access tickets, disconnect old connection",

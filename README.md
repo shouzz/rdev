@@ -79,7 +79,7 @@ RDev Server 每 5 秒发布独立 `device.telemetry` 设备事件。客户端登
 
 飞度发布中心接入使用后端专用的 `RDEV_CONTROL_TOKEN_FILE`。直接运行时该变量可省略；生产 Compose 会要求它指向宿主机上的绝对路径，文件内容至少 32 字节，并在 Linux 上使用 `0600` 权限。这个控制密钥不提供给浏览器、客户端或 Agent。
 
-启用网页“一次运行”或“保持在线”前，服务端数据目录的 `releases/` 必须提供当前源码构建的受管 Go 客户端，例如 `rdev-client-linux-amd64`、`rdev-client-linux-arm64` 和对应 Windows 资产。入网模式的启动脚本优先从同源 `/local-release` 下载并检查 `--enroll-stdin`、`--identity-file` 与 `--replace-existing` 能力；GitHub `latest` 不具备这些参数时会明确失败，不会继续建立无效的 systemd 服务。保持在线模式重装时会接管同一账号下的同名受管设备，原地轮换设备密钥、撤销旧票据并断开旧连接；不同账号、已撤销设备或未受管在线设备固定返回冲突，不会被接管。
+启用网页“一次运行”或“保持在线”前，服务端数据目录的 `releases/` 必须提供当前源码构建的受管 Go 客户端，例如 `rdev-client-linux-amd64`、`rdev-client-linux-arm64` 和对应 Windows 资产。入网模式的启动脚本优先从同源 `/local-release` 下载并检查受管入网能力；不兼容的客户端会明确失败。两种模式首次入网遇到计算机名重复时均分配独立设备 ID，不会替换另一台同名电脑。保持在线重复执行时复用本机受保护身份、恢复启动项，不再次消耗邀请码或启动重复客户端；每台新电脑需要独立的一次性邀请码。高级客户端的显式 `--replace-existing` 接管仍限同账号、未撤销的精确设备 ID。
 
 ### 启动客户端
 

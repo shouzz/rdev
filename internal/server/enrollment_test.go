@@ -95,6 +95,38 @@ func TestEnrollmentCreatesOneTimeManagedDeviceCredential(t *testing.T) {
 	}
 }
 
+func TestFreshPersistentInstallDoesNotReplaceSameHostname(t *testing.T) {
+	for _, secondOwner := range []string{"feidu-user:42", "feidu-user:43"} {
+		t.Run(secondOwner, func(t *testing.T) {
+			s := NewServer()
+			s.ControlToken = "test-control"
+			if err := s.ConfigureEnrollmentStore(filepath.Join(t.TempDir(), "managed.json"), "https://rdev.example.com"); err != nil {
+				t.Fatal(err)
+			}
+			first := redeemEnrollmentForTest(t, s, createEnrollmentForTest(t, s, "feidu-user:42", 600).Code, "same-hostname")
+			transport := &enrollmentTestTransport{closed: make(chan string, 1)}
+			s.clients[first.DeviceID] = &ClientConn{ID: first.DeviceID, RequestedID: first.DeviceID, Transport: transport}
+			second := redeemEnrollmentForTest(t, s, createEnrollmentForTest(t, s, secondOwner, 600).Code, "same-hostname")
+			if second.DeviceID != "same-hostname-2" {
+				t.Fatalf("second device ID = %q", second.DeviceID)
+			}
+			for _, device := range []enrollmentRedeemResponse{first, second} {
+				if allowed, managed := s.authorizeManagedRegistration(device.DeviceID, device.DeviceSecret); !allowed || !managed {
+					t.Fatal("fresh enrollment invalidated a device identity")
+				}
+			}
+			select {
+			case <-transport.closed:
+				t.Fatal("fresh installation disconnected the first computer")
+			default:
+			}
+			if s.managedDevices[first.DeviceID].CredentialVersion != 1 {
+				t.Fatal("fresh installation rotated the first computer's credential")
+			}
+		})
+	}
+}
+
 func TestPersistentReEnrollmentReplacesSameOwnerDevice(t *testing.T) {
 	now := time.Date(2026, 9, 4, 9, 0, 0, 0, time.UTC)
 	registryPath := filepath.Join(t.TempDir(), "managed_devices.json")

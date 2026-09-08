@@ -52,7 +52,9 @@ describe("RDev browser onboarding", () => {
       "Downloaded client does not support managed enrollment.",
     );
     expect(powershell).toContain("'--replace-existing'");
-    expect(shell).toContain("--enroll-only --replace-existing --identity-file");
+    expect(shell).toContain("--enroll-only --identity-file");
+    expect(powershell).not.toContain("'--enroll-only', '--replace-existing'");
+    expect(shell).not.toContain("--enroll-only --replace-existing");
   });
 
   test("Windows enrollment falls through when the verified local asset is missing", async () => {
