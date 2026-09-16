@@ -167,10 +167,7 @@ func (h *filesWSHandler) handleAuth(socket *fileSocket, msg fileMsg) {
 		socket.writeText(fileMsg{Op: "auth_fail", DeviceID: msg.DeviceID, Message: "device not connected"})
 		return
 	}
-	authorization, browserOK := h.srv.authorizeBrowserDeviceCredentialBinding(client, msg.Password, browserCapabilityFiles)
-	if !browserOK {
-		authorization, browserOK = h.srv.authorizeDeviceCredentialBinding(client, msg.Password)
-	}
+	authorization, browserOK := h.srv.authorizeBrowserOrDeviceCredentialBinding(socket.conn, client, msg.Password, browserCapabilityFiles)
 	if browserOK {
 		socket.authMu.Lock()
 		socket.authorized[msg.DeviceID] = authorization

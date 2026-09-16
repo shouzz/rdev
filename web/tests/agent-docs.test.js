@@ -16,7 +16,23 @@ describe("AI Agent artifact bridge", () => {
       ),
     );
 
-    expect(repository.schema).toBe("rdev.ai-agent-manifest.v4");
+    expect(repository.schema).toBe("rdev.ai-agent-manifest.v5");
+    expect(repository.default_authentication).toBe("permanent_device_token");
+    expect(repository.permanent_access.schema).toBe("rdev-device-access.v1");
+    expect(repository.permanent_access.fields).toEqual([
+      "schema", "device_id", "rdev_base", "api_base", "ssh_host", "ssh_port", "token",
+    ]);
+    expect(repository.permanent_access.additional_fields).toBe(false);
+    expect(repository.permanent_access.credentials).toEqual({
+      ssh_password: "token", FEIDU_DRIVE_TOKEN: "token",
+    });
+    expect(repository.permanent_access.expiry).toBe("none");
+    expect(repository.permanent_access.revoke_at_task_completion).toBe(false);
+    expect(repository.permanent_access.cloud_transfers.endpoints.create).toBe(
+      "POST /developer/v1/rdev/transfers",
+    );
+    expect(repository.handoff.mode).toBe("legacy_temporary_only");
+    expect(repository.agent_session.mode).toBe("legacy_temporary_only");
     expect(repository.handoff.redeem.url).toBe(
       "https://pan.feidu.fit/agent/v1/handoffs/redeem",
     );
@@ -97,6 +113,11 @@ describe("AI Agent artifact bridge", () => {
     ).toBe(8);
 
     expect(published.schema).toBe(repository.schema);
+    expect(published).toEqual(repository);
+    const embedded = JSON.parse(await readFile(
+      resolve(root, "internal/server/static/docs/ai-agent-manifest.json"), "utf8",
+    ));
+    expect(embedded).toEqual(repository);
     expect(published.rdev.base_url).toBe(repository.rdev.base_url);
     expect(published.artifact_plane.base_url).toBe(
       repository.artifact_plane.base_url,
@@ -175,15 +196,11 @@ describe("AI Agent artifact bridge", () => {
     expect(embeddedSkill.trimEnd()).toBe(repositorySkill.trimEnd());
     expect(publishedScript.trimEnd()).toBe(repositoryScript.trimEnd());
     expect(embeddedScript.trimEnd()).toBe(repositoryScript.trimEnd());
-    expect(repositorySkill).toContain(
-      "data.credentials.agent_session.renewal_token",
-    );
-    expect(repositorySkill).toContain("size_bytes");
-    expect(repositorySkill).toContain("observed_bytes_per_second");
-    expect(repositorySkill).toContain("/heartbeat");
-    expect(repositorySkill).toContain("/renew");
-    expect(repositorySkill).toContain("/transfers");
-    expect(repositorySkill).toContain("--auto-resume-attempts 0");
+    expect(repositorySkill).toContain("rdev-device-access.v1");
+    expect(repositorySkill).toContain("--import-clipboard");
+    expect(repositorySkill).toContain("--import-stdin");
+    expect(repositorySkill).toContain("/developer/v1/rdev/transfers");
+    expect(repositorySkill).not.toContain("Revoke it when the task is complete");
   });
 
   test("agent assets do not contain literal credentials or signed URLs", async () => {
@@ -216,8 +233,8 @@ describe("AI Agent artifact bridge", () => {
     expect(instructions).toContain("docs/ai-agent-artifact-bridge.md");
     expect(instructions).toContain("docs/ai-agent-manifest.json");
     expect(instructions).toContain("FEIDU_DRIVE_TOKEN");
-    expect(instructions).toContain("https://r.feidu.fit/api/config");
-    expect(instructions).toContain("data.credentials.device_id");
+    expect(instructions).toContain("rdev-device-access.v1");
+    expect(instructions).toContain("--device EXACT-ID");
     expect(instructions).not.toContain("https://r.feidu.fit/api/clients");
   });
 

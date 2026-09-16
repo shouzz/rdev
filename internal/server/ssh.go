@@ -86,7 +86,8 @@ func (s *SSHServer) untrackTicketConnection(ticketID, connectionID string) {
 }
 
 func (s *SSHServer) registerTicketConnection(ctx ssh.Context, authorization deviceAuthorization) {
-	if authorization.TicketID == "" || ctx == nil {
+	key := authorization.connectionKey()
+	if key == "" || ctx == nil {
 		return
 	}
 	connection, ok := ctx.Value(ssh.ContextKeyConn).(*gossh.ServerConn)
@@ -94,6 +95,23 @@ func (s *SSHServer) registerTicketConnection(ctx ssh.Context, authorization devi
 		return
 	}
 	connectionID := ctx.SessionID()
+	if authorization.MaintenanceTokenID != "" {
+		// Serialize registration with grant updates; a concurrent revoke must
+		// either close this tracked connection or reject it before tracking.
+		s.srv.enrollmentMu.Lock()
+		valid := s.srv.maintenanceAuthorizationValidLocked(authorization)
+		tracked := valid && s.trackTicketConnection(key, connectionID, connection)
+		s.srv.enrollmentMu.Unlock()
+		if !valid {
+			_ = connection.Close()
+		} else if tracked {
+			go func() {
+				<-ctx.Done()
+				s.untrackTicketConnection(key, connectionID)
+			}()
+		}
+		return
+	}
 	if s.trackTicketConnection(authorization.TicketID, connectionID, connection) {
 		go s.watchTicketConnection(authorization.TicketID, connectionID, ctx.Done())
 	}
@@ -128,8 +146,16 @@ func (s *SSHServer) authorizedTicketConnection(ctx ssh.Context) (*ClientConn, bo
 	authorization, _ := ctx.Value(sshDeviceAuthorizationKey).(deviceAuthorization)
 	s.registerTicketConnection(ctx, authorization)
 	client, authorized := s.srv.authorizedSSHClient(ctx)
-	if !authorized && authorization.TicketID != "" {
-		s.closeTicketConnections(authorization.TicketID)
+	if !authorized && authorization.connectionKey() != "" {
+		if authorization.MaintenanceTokenID != "" {
+			// A stale connection after a device reconnect must not close newer
+			// connections authenticated with the same permanent grant.
+			if connection, ok := ctx.Value(ssh.ContextKeyConn).(*gossh.ServerConn); ok && connection != nil {
+				_ = connection.Close()
+			}
+		} else {
+			s.closeTicketConnections(authorization.connectionKey())
+		}
 	}
 	return client, authorized
 }

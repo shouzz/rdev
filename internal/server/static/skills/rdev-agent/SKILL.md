@@ -1,86 +1,73 @@
 ---
 name: rdev-agent
-description: Connect an AI coding agent to one exact RDev device and the account-scoped Feidu artifact plane using a copied one-time handoff. Use for remote diagnosis, deployment, file transfer, OTA, or port forwarding after the user provides an RDev claim.
+description: Operate an exact RDev device with saved permanent device access, including SSH, SFTP, port forwarding and Feidu file transfers. Import copied device access once; subsequent AI sessions reuse it automatically.
 ---
 
 # RDev Agent
 
-Use the handoff only for the device and task authorized by the user. Creating or redeeming a handoff does not authorize unrelated scans, deployments, file changes, or cloud mutations.
+Use the saved authorization for the exact device and the user's requested work. Permanent device access is the default; it needs no claim, heartbeat, renewal or end-of-task revocation.
 
-The public join launchers never use `--replace-existing`: a fresh installation receives a separate server-assigned ID when its hostname collides, including within the same account. A persistent installation reuses its OS-protected identity on subsequent runs and does not redeem another invitation. The advanced client's explicit `--replace-existing` option still permits only an exact, non-revoked managed ID owned by the same Feidu account; it rotates the secret, advances the credential version, invalidates old tickets, and disconnects the old connection. Never infer that two computers are the same device from a hostname.
+## Import once
 
-## Redeem And Verify
+The authenticated Feidu device page supplies one JSON object with exactly `schema`, `device_id`, `rdev_base`, `api_base`, `ssh_host`, `ssh_port` and `token`. Its schema is `rdev-device-access.v1`; the single `fdpat_` is used by both RDev and Feidu. Do not ask the user to paste that JSON into an AI chat.
 
-1. Read the exact device ID, `fdhc_` claim, claim deadline, and requested task from the copied handoff. If the claim is expired or the task is not stated, stop and ask for a new handoff or the concrete task.
-2. Pass the claim to `rdev-agent.py start` only through its standard input or hidden interactive prompt. Never add the claim to process arguments. The tool sends one `POST application/json` request to `https://pan.feidu.fit/agent/v1/handoffs/redeem` with `{"claim":"<runtime claim>"}`. Require HTTP 200 and JSON `code == 0`, then clear the claim from runtime state.
-3. Read only these exact response fields:
-   - `data.credentials.device_id`
-   - `data.credentials.rdev_ticket.ticket`
-   - `data.credentials.developer_token.token`
-   - `data.credentials.agent_session.agent_session_id`
-   - `data.credentials.agent_session.renewal_token`
-   - `data.credentials.agent_session.state`
-   - `data.credentials.agent_session.ticket_remaining_seconds`
-   - `data.credentials.agent_session.developer_token_remaining_seconds`
-   - `data.credentials.agent_session.estimated_transfer_seconds`
-   - `data.credentials.agent_session.minimum_safety_margin_seconds`
-   - `data.credentials.agent_session.renewal_due_at_ms`
-   - `data.credentials.agent_session.absolute_expires_at_ms`
-   - `data.credentials.agent_session.selected_transport`
-4. Require the returned device ID to equal the copied device ID and the session state to equal `active`.
-5. Read `https://r.feidu.fit/api/config` and use its exact `sshPort`. Run one non-interactive, no-PTY `hostname` through SSH and verify the returned identity before starting the requested task. Do not call `/api/clients`.
-6. Report the verified device identity, current SSH port, remaining lease time, absolute session deadline, and selected transport without exposing any secret. Then continue only with the requested task.
+After the user copies access on the authorization page, run:
 
-Use the RDev ticket only as the runtime SSH/SFTP password. Set the developer token only in the runtime environment variable `FEIDU_DRIVE_TOKEN`. Do not put either value in command text that will be logged.
-
-## Keep The Session Alive
-
-Authenticate session operations with `Authorization: Bearer <renewal_token>`. Keep the token in memory.
-
-- Inspect the lease with `POST https://pan.feidu.fit/agent/v1/sessions/{agent_session_id}/heartbeat`.
-- Renew it with `POST https://pan.feidu.fit/agent/v1/sessions/{agent_session_id}/renew`.
-- Revoke it when the task is complete with `DELETE https://pan.feidu.fit/agent/v1/sessions/{agent_session_id}`.
-
-For heartbeat and renewal, send the exact workload fields `size_bytes` and `observed_bytes_per_second`. Before a long transfer, use the known file size and a measured end-to-end rate. Renew before `renewal_due_at_ms`, or earlier when the smaller remaining credential lifetime is not greater than `estimated_transfer_seconds + minimum_safety_margin_seconds`.
-
-A successful renewal returns the updated session under `data.session`. Keep the original RDev ticket, developer token, and renewal token; renewal extends their expiry in place and must not interrupt an established SSH, SFTP, or port-forwarding connection. Update only `ticket_expires_at_ms`, `developer_token_expires_at_ms`, the remaining-time fields, and `renewal_due_at_ms`. If a renewal response includes `renewal_token`, require it to be byte-for-byte identical. Stop on HTTP 401, a nonzero JSON `code`, a non-`active` state, or an elapsed `absolute_expires_at_ms`; ask the user for a new handoff instead of changing account, device, or path.
-
-Use the official `rdev-agent.py ssh`, `scp-to`, `scp-from`, and `drive` commands for long-running child processes. They maintain heartbeat and renewal in the background without restarting a healthy child process. A maintenance failure stops the child and returns nonzero; do not hide that result or start an unmanaged replacement command.
-
-For an unattended port forward, put every forwarding rule in an explicit Agent option before `--no-command`:
-
-```bash
-python3 rdev-agent.py ssh --local-forward '127.0.0.1:8080:127.0.0.1:80' --no-command
-python3 rdev-agent.py ssh --remote-forward '127.0.0.1:3000:127.0.0.1:3000' --no-command
+```powershell
+python rdev-agent.py --import-clipboard
 ```
 
-Repeat either forwarding option to open more than one rule. The Agent sets OpenSSH `ExitOnForwardFailure=yes`; a zero exit code therefore never means that a requested listener silently failed to bind. Do not place raw `-L`, `-R`, or `-N` after the device target through the remote-command argument.
+Windows imports the clipboard directly, saves current-user DPAPI protected access, and clears the same clipboard value after successful import. The tool prints only non-secret connection metadata. On Unix, pass the JSON through a protected stdin channel to `python3 rdev-agent.py --import-stdin`; the tool saves a mode `0600` file. Never interpolate the JSON or Token into shell command text or process arguments.
 
-## Choose The Data Plane
+Each device has its own saved entry. Reimporting identical access is harmless. Changed access requires explicit `--replace` after an intentional reset or change; network errors never reset it. Losing a local entry does not make the server able to recover plaintext from its hash: use another protected copy or the authorization page's explicit reset.
 
-Use `data.session.selected_transport` from heartbeat or renewal, or `data.credentials.agent_session.selected_transport` from redemption:
+## Use automatically
 
-- `sftp`: transfer directly through RDev using the exact device ID and current `sshPort`.
-- `cloud`: use the session transfer endpoints below so the device exchanges file bytes directly with the artifact provider.
-- `not_selected`: no workload was supplied; send a heartbeat with measured workload before choosing.
+If one device is saved, omit `--device`. For multiple devices, select the exact non-secret ID:
 
-Run `python3 tools/feidu-drive.py capabilities` before direct developer API operations. Resolve cloud objects only by the returned `content_id`; never infer identity from a name, path, hash, size, case, or similar object.
+```bash
+python3 rdev-agent.py --device DEVICE-ID status
+python3 rdev-agent.py --device DEVICE-ID ssh -- hostname
+python3 rdev-agent.py --device DEVICE-ID ssh --local-forward 127.0.0.1:8080:127.0.0.1:80 --no-command
+python3 rdev-agent.py --device DEVICE-ID sftp
+python3 rdev-agent.py --device DEVICE-ID sftp --batch-file -
+python3 rdev-agent.py --device DEVICE-ID scp-to ./artifact.bin /tmp/artifact.bin
+python3 rdev-agent.py --device DEVICE-ID scp-from /tmp/result.bin ./result.bin
+python3 rdev-agent.py --device DEVICE-ID drive capabilities
+```
 
-Create or resume a cloud transfer with `POST https://pan.feidu.fit/agent/v1/sessions/{agent_session_id}/transfers`. Use a canonical lowercase UUID as `transfer_id` and one exact direction:
+`status` reports saved connection information; it is not a live authorization or device-health check. Verify the exact endpoint and the device's returned identity when starting remote work, then continue the authorized task. Do not request another claim because an AI session changed, either server restarted, the device disconnected, or a cloud request failed.
 
-- `cloud_to_device`: send `transfer_id`, `direction`, `source_content_id`, `destination_parent_path`, `file_name`, and `size_bytes`.
-- `device_to_cloud`: send `transfer_id`, `direction`, `source_path`, `file_name`, and `size_bytes`.
+SSH uses a 10-second connection timeout and 15-second keepalives with three missed replies. Remote commands have no short automatic deadline. Fixed access does not start a lease-maintenance thread, and a Feidu outage cannot kill a healthy SSH process. If SSH exits, preserve its exit result and inspect remote task state before retrying a write; do not assume killing the local SSH process stopped the remote operation. Ordinary remote commands are never automatically replayed.
 
-Read status with `GET /agent/v1/sessions/{agent_session_id}/transfers/{transfer_id}`. Pause, resume, or cancel by appending `/pause`, `/resume`, or `/cancel` and sending `POST`. Keep the same `transfer_id` across retries. Do not proxy signed URLs or file bytes through the Agent when this cloud path is selected.
+The tool loads the same Token as the runtime SSH/SFTP password and `FEIDU_DRIVE_TOKEN` for the bundled drive client. No Token is needed in command text. SFTP is preferred for file transfer; modern SCP uses SFTP without `-O`. Use the exact copied SSH host and port. Do not infer device IDs or require `/api/clients` discovery.
 
-Prefer one `rdev-agent.py transfer create ... --wait` invocation for unattended work. Waiting maintains the renewable session, reports only state changes or 5% progress boundaries, and automatically resumes a failed transfer at most 2 times. Use `--auto-resume-attempts 0` when the requested operation must stop at the first failure. Do not build a manual high-frequency polling loop around the status endpoint.
+## Cloud transfers
 
-Treat `failed` and `cancelled` as nonzero terminal results. Only `completed` proves that an unattended transfer command succeeded.
+Use `drive capabilities` and returned `content_id` values for Feidu objects. Ordinary developer uploads/downloads retain the existing upload `operation_id` and `session_id` on recovery. For files larger than `104857600` bytes, use the cloud transfer commands so bytes flow directly between the device and storage:
 
-For direct SFTP and any local staging, compare size and SHA-256 before and after each hop. For cloud transfers, require the terminal transfer state and the service/device integrity result; an HTTP 200 from a control request alone is not completion.
+```bash
+python3 rdev-agent.py --device DEVICE-ID transfer create --direction cloud_to_device --source-content-id CONTENT-ID --destination-parent-path /tmp --file-name artifact.bin --size-bytes 104857601 --wait
+python3 rdev-agent.py --device DEVICE-ID transfer create --direction device_to_cloud --source-path /tmp/result.bin --file-name result.bin --size-bytes 104857601 --wait
+python3 rdev-agent.py --device DEVICE-ID transfer list
+python3 rdev-agent.py --device DEVICE-ID transfer status TRANSFER-UUID --wait
+python3 rdev-agent.py --device DEVICE-ID transfer resume TRANSFER-UUID
+```
 
-## Secrets And References
+The tool uses fixed-Token `POST/GET /developer/v1/rdev/transfers`, then `GET /{transfer_id}` or `POST /{transfer_id}/pause|resume|cancel`. The server derives account, device and root from the Token binding. AI does not create an AgentSession or handle internal `fdtx_` credentials.
 
-Never persist or echo the claim, Cookie, signed download URL, or upload URL. The official `rdev-agent.py` may persist the renewal token, RDev ticket, and developer token only in its protected local state: current-user DPAPI on Windows or a mode `0600` file on Unix. Do not place any secret in repositories, shell history, task descriptions, logs, screenshots, or AI memory.
+The tool prints a non-secret transfer UUID before create, allowing recovery after a lost response. Keep this ID. `--wait` reports state changes and 5% progress, retries recoverable reads, and resumes the original failed or expired transfer at most twice by default. An expired internal 24-hour task credential is recovered through the same fixed Token and transfer ID. Use `--auto-resume-attempts` to change the bound. Completed means success; failed, cancelled or exhausted recovery returns nonzero. Recover with the same ID, never a fresh object or a new claim. A user's paused or cancelled task is not automatically restarted.
 
-Read [the artifact bridge guide](https://r.feidu.fit/docs/ai-agent-artifact-bridge.md) for detailed file workflows and [the machine-readable manifest](https://r.feidu.fit/docs/ai-agent-manifest.json) for current protocol fields. Exact source definitions override these documents when developing the product itself.
+For manual SFTP/local staging compare file size and hashes across each hop. For cloud transfers require terminal `completed` plus the device/service integrity result; HTTP 200 from a control request alone is not completion.
+
+## Authorization and credentials
+
+Keep the Token only in the tool's protected store and process secret channels. Never print it, paste it into chat, place it in URLs, logs, source, screenshots or AI memory. The Feidu web workspace opens WebSocket with subprotocols `rdev-browser-v1` and `rdev-access-ticket.<runtime fdpat_>`, then sends that same Token and device ID in the channel auth message. Both handshake and message credentials must match; the Token is never in the URL. This release does not add fixed-Token support to the old standalone RDev HTML pages or raw VNC/GPU proxy paths. Do not forward the Feidu Authorization header to signed storage download URLs.
+
+View and revoke permanent authorization on the Feidu device page when requested. Finishing a maintenance task, stopping a command or closing an AI session does not revoke it. During a control-channel outage, RDev can authenticate using its persisted binding; a new Feidu revocation reaches it after synchronization returns. Report that condition accurately rather than treating offline status as credential expiry.
+
+## Legacy temporary handoffs
+
+Only an explicitly supplied legacy `fdhc_` uses `start --device ... --claim-expires-at ...`, with claim from hidden prompt/stdin. That path retains its original temporary AgentSession, heartbeat and renewal API. It is separate from permanent access. Never switch an imported permanent device to this path or request a replacement claim for it.
+
+Read [the artifact bridge guide](https://r.feidu.fit/docs/ai-agent-artifact-bridge.md) for protocol details and [the manifest](https://r.feidu.fit/docs/ai-agent-manifest.json) for exact schemas. Source definitions take precedence when developing RDev itself.

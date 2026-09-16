@@ -147,9 +147,8 @@ func (h *desktopWSHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 			bc.writeJSON(desktopMsg{Op: "auth", Device: bc.deviceID, Message: "device credential required"})
 			return
 		}
-		_, browserOK := h.srv.authorizeBrowserDeviceCredentialBinding(client, msg.Pass, browserCapabilityDesktop)
-		_, deviceOK := h.srv.authorizeDeviceCredentialBinding(client, msg.Pass)
-		if browserOK || deviceOK {
+		_, authorized := h.srv.authorizeBrowserOrDeviceCredentialBinding(socket, client, msg.Pass, browserCapabilityDesktop)
+		if authorized {
 			h.start(bc)
 			return
 		}

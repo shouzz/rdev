@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic client for renewable Feidu RDev agent sessions."""
+"""One-copy permanent RDev access, with explicit legacy session support."""
 
 from __future__ import annotations
 
@@ -33,6 +33,9 @@ DRIVE_CLIENT_SHA256 = "d206720ca2269a24fbbc9c4d45a503795cb9a86ddcd4831e5422fb53c
 CLAIM_RE = re.compile(r"^fdhc_[A-Za-z0-9_-]{43}$")
 RENEWAL_RE = re.compile(r"^fdrn_[A-Za-z0-9_-]{43}$")
 TICKET_RE = re.compile(r"^rdvat_[A-Za-z0-9_-]{43}$")
+DEVICE_TOKEN_RE = re.compile(r"^fdpat_[A-Za-z0-9_-]{32,128}$")
+ACCESS_SCHEMA = "rdev-device-access.v1"
+ACCESS_FIELDS = {"schema", "device_id", "rdev_base", "api_base", "ssh_host", "ssh_port", "token"}
 TERMINAL_TRANSFER_STATES = {"completed", "failed", "cancelled"}
 WINDOWS_STATE_MAGIC = b"feidu.rdev-agent-state.dpapi.v1\x00"
 LEASE_MAINTENANCE_INTERVAL_SECONDS = 60.0
@@ -41,6 +44,121 @@ PROCESS_TERMINATE_TIMEOUT_SECONDS = 5.0
 
 class AgentError(RuntimeError):
     pass
+
+
+class RetryableServiceError(AgentError):
+    """A failed read or idempotent transfer operation can be retried."""
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def permanent(state_data: dict) -> bool:
+    return state_data.get("schema") == ACCESS_SCHEMA
+
+
+def validate_access(data: dict) -> dict:
+    if not isinstance(data, dict) or set(data) != ACCESS_FIELDS or data.get("schema") != ACCESS_SCHEMA:
+        raise AgentError("device access must contain exactly the seven rdev-device-access.v1 fields")
+    device = data["device_id"]
+    if not isinstance(device, str) or not device or len(device) > 256 or any(c.isspace() or c in "@:/\\\x00" for c in device) or device.startswith("-"):
+        raise AgentError("device access has an invalid device_id")
+    host = data["ssh_host"]
+    if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9._:-]+", host) or host.startswith("-"):
+        raise AgentError("device access has an invalid ssh_host")
+    port = data["ssh_port"]
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise AgentError("device access has an invalid ssh_port")
+    if not isinstance(data["token"], str) or not DEVICE_TOKEN_RE.fullmatch(data["token"]):
+        raise AgentError("device access has an invalid token")
+    for field in ("rdev_base", "api_base"):
+        if not isinstance(data[field], str) or validate_base_url(data[field]) != data[field]:
+            raise AgentError("device access has an invalid service base URL")
+    return data
+
+
+def device_state_path(device_id: str) -> pathlib.Path:
+    name = hashlib.sha256(device_id.encode("utf-8")).hexdigest() + ".json"
+    return default_state_path().parent / "devices" / name
+
+
+def resolve_state(args) -> pathlib.Path:
+    if args.state is not None:
+        return args.state
+    device = getattr(args, "device", "")
+    if device and args.command != "start":
+        path = device_state_path(device)
+        state = locked_state(path)
+        if state["device_id"] != device:
+            raise AgentError("saved device identity does not match --device")
+        return path
+    paths = sorted((default_state_path().parent / "devices").glob("*.json"))
+    if args.command == "start" or not paths:
+        return default_state_path()
+    if len(paths) != 1:
+        raise AgentError("multiple devices saved; select the exact device with --device (no new authorization needed)")
+    return paths[0]
+
+
+def windows_clipboard(expected: str | None = None) -> str:
+    """Read directly into this process; clear only the value successfully imported."""
+    if os.name != "nt":
+        raise AgentError("--import-clipboard requires Windows; use --import-stdin on this platform")
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    user32.CloseClipboard.argtypes = []
+    user32.EmptyClipboard.argtypes = []
+    if not user32.OpenClipboard(None):
+        raise AgentError("clipboard is busy; retry import without copying a new token")
+    try:
+        handle = user32.GetClipboardData(13)  # CF_UNICODETEXT
+        if not handle:
+            raise AgentError("clipboard contains no device access text")
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            raise AgentError("cannot read device access from clipboard")
+        try:
+            text = ctypes.wstring_at(pointer)
+        finally:
+            kernel32.GlobalUnlock(handle)
+        if expected is not None and text == expected:
+            user32.EmptyClipboard()
+        return text
+    finally:
+        user32.CloseClipboard()
+
+
+def command_import(args) -> int:
+    raw = windows_clipboard() if args.import_clipboard else sys.stdin.read(65537)
+    try:
+        if len(raw) > 65536:
+            raise AgentError("device access input is too large")
+        data = validate_access(json.loads(raw))
+    except (ValueError, TypeError):
+        raise AgentError("device access input is invalid JSON") from None
+    if args.device and args.device != data["device_id"]:
+        raise AgentError("imported device identity does not match --device")
+    path = args.state or device_state_path(data["device_id"])
+    with state_lock(path):
+        if path.exists():
+            old = read_state(path)
+            if old != data and not args.replace:
+                raise AgentError("saved access differs; use --replace only after explicitly resetting or changing this device authorization")
+        write_state(path, data)
+    if args.import_clipboard:
+        with contextlib.suppress(AgentError):
+            windows_clipboard(expected=raw)
+    print(json.dumps(safe_status(data, {}), ensure_ascii=False))
+    return 0
 
 
 class WindowsDataBlob(ctypes.Structure):
@@ -106,7 +224,7 @@ def validate_base_url(value: str) -> str:
 def canonical_uuid(value: str, field: str) -> str:
     try:
         parsed = uuid.UUID(value)
-    except (ValueError, AttributeError) as error:
+    except (ValueError, AttributeError, TypeError) as error:
         raise AgentError(f"{field} is invalid") from error
     if str(parsed) != value:
         raise AgentError(f"{field} is invalid")
@@ -133,14 +251,15 @@ def request_json(base_url: str, method: str, path: str, payload=None, token: str
         headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=60) as response:
             if response.status != 200:
                 raise AgentError(f"service returned HTTP {response.status}")
             envelope = json.load(response)
     except urllib.error.HTTPError as error:
-        raise AgentError(f"service returned HTTP {error.code}") from None
+        kind = RetryableServiceError if error.code in {408, 429, 500, 502, 503, 504} else AgentError
+        raise kind(f"service returned HTTP {error.code}") from None
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
-        raise AgentError(f"service request failed: {type(error).__name__}") from None
+        raise RetryableServiceError(f"service request failed: {type(error).__name__}") from None
     if not isinstance(envelope, dict):
         raise AgentError("service returned an invalid API envelope")
     code = envelope.get("code")
@@ -237,9 +356,11 @@ def read_state(path: pathlib.Path) -> dict:
             payload = windows_crypt(payload[len(WINDOWS_STATE_MAGIC):], False)
         state_data = json.loads(payload.decode("utf-8"))
     except FileNotFoundError:
-        raise AgentError("no active RDev agent session; run start first") from None
+        raise AgentError("no saved RDev access; import the device access once with --import-clipboard or --import-stdin") from None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise AgentError(f"cannot read RDev agent session: {type(error).__name__}") from None
+    if isinstance(state_data, dict) and permanent(state_data):
+        return validate_access(state_data)
     required = {
         "schema", "api_base", "rdev_base", "agent_session_id", "device_id", "renewal_token",
         "rdev_ticket", "developer_token", "ticket_expires_at_ms", "developer_token_expires_at_ms",
@@ -377,6 +498,9 @@ def ensure_lease(path: pathlib.Path, state_data: dict, size_bytes: int = 0, obse
 def maintained_state(path: pathlib.Path, size_bytes: int = 0, observed_bps: int = 0, force_renew: bool = False):
     with state_lock(path):
         state_data = read_state(path)
+        if permanent(state_data):
+            workload_payload(size_bytes, observed_bps)
+            return state_data, {"state": "saved", "selected_transport": "cloud" if size_bytes > 104857600 else "sftp"}
         if force_renew:
             session = renew(path, state_data, size_bytes, observed_bps)
         else:
@@ -390,6 +514,14 @@ def locked_state(path: pathlib.Path) -> dict:
 
 
 def safe_status(state_data: dict, session: dict) -> dict:
+    if permanent(state_data):
+        return {
+            "device_id": state_data["device_id"], "authentication": "permanent",
+            "credential_state": "saved", "remote_authorization": "not_checked",
+            "rdev_base": state_data["rdev_base"], "api_base": state_data["api_base"],
+            "ssh_host": state_data["ssh_host"], "ssh_port": state_data["ssh_port"],
+            "expires_at": None, "selected_transport": session.get("selected_transport"),
+        }
     return {
         "agent_session_id": state_data["agent_session_id"],
         "device_id": state_data["device_id"],
@@ -453,6 +585,8 @@ def command_renew(args) -> int:
 def command_revoke(args) -> int:
     with state_lock(args.state):
         state_data = read_state(args.state)
+        if permanent(state_data):
+            raise AgentError("this is permanent device access; revoke it from the Feidu device authorization page only when explicitly requested")
         data = request_json(state_data["api_base"], "DELETE", session_path(state_data, ""), token=state_data["renewal_token"])
         session = data.get("session")
         if not isinstance(session, dict) or session.get("state") != "revoked":
@@ -530,18 +664,41 @@ def run_open_ssh(args, program: str, extra: list[str]) -> int:
     executable = shutil.which(program)
     if not executable:
         raise AgentError(f"{program} is not installed")
-    temporary, environment = askpass_environment(state_data["rdev_ticket"])
-    common = (["-P"] if program == "scp" else ["-p"]) + [str(state_data["ssh_port"])]
+    temporary, environment = askpass_environment(state_data["token"] if permanent(state_data) else state_data["rdev_ticket"])
+    common = (["-P"] if program in {"scp", "sftp"} else ["-p"]) + [str(state_data["ssh_port"])]
     common += ["-o", "PasswordAuthentication=yes", "-o", "PubkeyAuthentication=no", "-o", "NumberOfPasswordPrompts=1", "-o", "StrictHostKeyChecking=accept-new"]
+    common += ["-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
     try:
+        if permanent(state_data):
+            return run_fixed_subprocess([executable, *common, *extra], environment)
         return run_maintained_subprocess(args.state, [executable, *common, *extra], environment)
     finally:
         temporary.cleanup()
 
 
+def run_fixed_subprocess(command: list[str], environment: dict[str, str]) -> int:
+    # A network failure never deletes credentials or replays a remote command.
+    try:
+        process = subprocess.Popen(command, env=environment)
+    except OSError as error:
+        raise AgentError(f"cannot start child process: {type(error).__name__}") from None
+    try:
+        return process.wait()
+    except BaseException:
+        terminate_subprocess(process)
+        raise
+
+
+def ssh_target(state_data: dict) -> str:
+    host = state_data.get("ssh_host") or urllib.parse.urlsplit(state_data["rdev_base"]).hostname
+    if ":" in host:
+        host = "[" + host + "]"
+    return f"{state_data['device_id']}@{host}"
+
+
 def command_ssh(args) -> int:
     state_data = locked_state(args.state)
-    target = f"{state_data['device_id']}@{urllib.parse.urlsplit(state_data['rdev_base']).hostname}"
+    target = ssh_target(state_data)
     command = args.remote_command
     if command and command[0] == "--":
         command = command[1:]
@@ -561,14 +718,22 @@ def command_ssh(args) -> int:
 
 def command_scp_to(args) -> int:
     state_data = locked_state(args.state)
-    target = f"{state_data['device_id']}@{urllib.parse.urlsplit(state_data['rdev_base']).hostname}:{args.remote_path}"
+    target = ssh_target(state_data) + ":" + args.remote_path
     return run_open_ssh(args, "scp", [args.local_path, target])
 
 
 def command_scp_from(args) -> int:
     state_data = locked_state(args.state)
-    source = f"{state_data['device_id']}@{urllib.parse.urlsplit(state_data['rdev_base']).hostname}:{args.remote_path}"
+    source = ssh_target(state_data) + ":" + args.remote_path
     return run_open_ssh(args, "scp", [source, args.local_path])
+
+
+def command_sftp(args) -> int:
+    state_data = locked_state(args.state)
+    extra = []
+    if args.batch_file:
+        extra = ["-o", "BatchMode=no", "-b", args.batch_file]
+    return run_open_ssh(args, "sftp", [*extra, ssh_target(state_data)])
 
 
 def cached_drive_client() -> pathlib.Path:
@@ -592,19 +757,45 @@ def cached_drive_client() -> pathlib.Path:
 def command_drive(args) -> int:
     state_data, _ = maintained_state(args.state)
     environment = os.environ.copy()
-    environment["FEIDU_DRIVE_TOKEN"] = state_data["developer_token"]
-    return run_maintained_subprocess(args.state, [sys.executable, str(cached_drive_client()), *args.drive_args], environment)
+    environment["FEIDU_DRIVE_TOKEN"] = state_data["token"] if permanent(state_data) else state_data["developer_token"]
+    if any(value == "--token" or value.startswith("--token=") or value == "--base-url" or value.startswith("--base-url=") for value in args.drive_args):
+        raise AgentError("drive credentials and service URL are loaded from saved access; do not pass overrides")
+    command = [sys.executable, str(cached_drive_client()), "--base-url", state_data["api_base"], *args.drive_args]
+    if permanent(state_data):
+        return run_fixed_subprocess(command, environment)
+    return run_maintained_subprocess(args.state, command, environment)
+
+
+def transfer_endpoint(state_data: dict) -> str:
+    return "/developer/v1/rdev/transfers" if permanent(state_data) else session_path(state_data, "transfers")
+
+
+def transfer_token(state_data: dict) -> str:
+    return state_data["token"] if permanent(state_data) else state_data["renewal_token"]
+
+
+def validate_transfer(state_data: dict, transfer: dict, transfer_id: str) -> dict:
+    if not isinstance(transfer, dict) or transfer.get("transfer_id") != transfer_id:
+        raise AgentError("cloud transfer response identity is invalid")
+    if permanent(state_data):
+        if transfer.get("device_id") != state_data["device_id"]:
+            raise AgentError("cloud transfer response device identity is invalid")
+    elif transfer.get("agent_session_id") != state_data["agent_session_id"]:
+        raise AgentError("cloud transfer response identity is invalid")
+    return transfer
+
+
+def safe_transfer(transfer: dict) -> dict:
+    fields = {"transfer_id", "device_id", "direction", "status", "size_bytes", "bytes_done", "result_content_id", "created_at_ms", "updated_at_ms", "expires_at_ms", "generation"}
+    return {key: value for key, value in transfer.items() if key in fields}
 
 
 def transfer_request(state_data: dict, method: str, transfer_id: str, action: str = "", payload=None) -> dict:
     canonical_uuid(transfer_id, "transfer_id")
     suffix = "/" + action if action else ""
-    path = session_path(state_data, "transfers") + "/" + urllib.parse.quote(transfer_id, safe="") + suffix
-    data = request_json(state_data["api_base"], method, path, payload, state_data["renewal_token"])
-    transfer = data.get("transfer")
-    if not isinstance(transfer, dict) or transfer.get("transfer_id") != transfer_id or transfer.get("agent_session_id") != state_data["agent_session_id"]:
-        raise AgentError("cloud transfer response identity is invalid")
-    return transfer
+    path = transfer_endpoint(state_data) + "/" + urllib.parse.quote(transfer_id, safe="") + suffix
+    data = request_json(state_data["api_base"], method, path, payload, transfer_token(state_data))
+    return validate_transfer(state_data, data.get("transfer"), transfer_id)
 
 
 def command_transfer_create(args) -> int:
@@ -616,14 +807,25 @@ def command_transfer_create(args) -> int:
         "source_path": args.source_path, "destination_parent_path": args.destination_parent_path,
         "file_name": args.file_name, "size_bytes": args.size_bytes,
     }
-    path = session_path(state_data, "transfers")
-    data = request_json(state_data["api_base"], "POST", path, payload, state_data["renewal_token"])
-    transfer = data.get("transfer")
-    if not isinstance(transfer, dict) or transfer.get("transfer_id") != transfer_id or transfer.get("agent_session_id") != state_data["agent_session_id"]:
-        raise AgentError("cloud transfer response identity is invalid")
+    path = transfer_endpoint(state_data)
+    # Publish the non-secret identity before dispatch so a lost response can be
+    # recovered with the original ID, never by creating a second cloud object.
+    print(json.dumps({"transfer_id": transfer_id, "status": "submitting"}), flush=True)
+    for attempt in range(args.auto_resume_attempts + 1):
+        try:
+            data = request_json(state_data["api_base"], "POST", path, payload, transfer_token(state_data))
+            break
+        except RetryableServiceError:
+            if not permanent(state_data) or not args.wait or attempt >= args.auto_resume_attempts:
+                raise
+            # Create is idempotent for this explicit transfer UUID. Reuse the
+            # entire original payload after an uncertain acknowledgement.
+            print(json.dumps({"transfer_id": transfer_id, "status": "submitting_retry", "attempt": attempt + 1}), flush=True)
+            time.sleep(min(30, max(args.interval, 2 ** (attempt + 1))))
+    transfer = validate_transfer(state_data, data.get("transfer"), transfer_id)
     if args.wait:
         return wait_for_transfer(args, transfer_id, transfer)
-    print(json.dumps(transfer, ensure_ascii=False))
+    print(json.dumps(safe_transfer(transfer), ensure_ascii=False))
     return 0
 
 
@@ -643,6 +845,7 @@ def wait_for_transfer(args, transfer_id: str, initial=None) -> int:
     last_report = None
     automatic_resumes = 0
     next_lease_check = 0.0
+    network_failures = 0
     while True:
         now = time.monotonic()
         if now >= next_lease_check:
@@ -652,16 +855,35 @@ def wait_for_transfer(args, transfer_id: str, initial=None) -> int:
         else:
             state_data = locked_state(args.state)
         if transfer is None:
-            transfer = transfer_request(state_data, "GET", transfer_id)
+            try:
+                transfer = transfer_request(state_data, "GET", transfer_id)
+                network_failures = 0
+            except RetryableServiceError:
+                if not permanent(state_data) or network_failures >= args.auto_resume_attempts:
+                    raise
+                network_failures += 1
+                print(json.dumps({"transfer_id": transfer_id, "status": "reconnecting", "attempt": network_failures}), flush=True)
+                time.sleep(min(30, max(args.interval, 2 ** network_failures)))
+                continue
         report_key = transfer_report_key(transfer)
         if report_key != last_report:
-            print(json.dumps(transfer, ensure_ascii=False), flush=True)
+            print(json.dumps(safe_transfer(transfer), ensure_ascii=False), flush=True)
             last_report = report_key
         status = transfer.get("status")
-        if status in TERMINAL_TRANSFER_STATES:
-            if status == "failed" and automatic_resumes < args.auto_resume_attempts:
+        expired = permanent(state_data) and type(transfer.get("expires_at_ms")) is int and 0 < transfer["expires_at_ms"] <= int(time.time() * 1000)
+        if status in TERMINAL_TRANSFER_STATES or expired:
+            if (status == "failed" or (expired and status not in {"completed", "cancelled", "paused"})) and automatic_resumes < args.auto_resume_attempts:
                 automatic_resumes += 1
-                transfer = transfer_request(state_data, "POST", transfer_id, "resume")
+                try:
+                    transfer = transfer_request(state_data, "POST", transfer_id, "resume")
+                except RetryableServiceError:
+                    # Response may have been lost after resume succeeded. Read
+                    # the same task before deciding whether another resume is needed.
+                    if not permanent(state_data):
+                        raise
+                    transfer = None
+                    time.sleep(args.interval)
+                    continue
                 print(json.dumps({
                     "transfer_id": transfer_id, "recovery_attempt": automatic_resumes,
                     "maximum_recovery_attempts": args.auto_resume_attempts, "status": transfer.get("status"),
@@ -669,21 +891,33 @@ def wait_for_transfer(args, transfer_id: str, initial=None) -> int:
                 last_report = None
                 time.sleep(args.interval)
                 continue
-            return 1 if status in {"failed", "cancelled"} else 0
+            return 0 if status == "completed" else 1
         time.sleep(args.interval)
-        transfer = transfer_request(state_data, "GET", transfer_id)
+        transfer = None
 
 
 def command_transfer_control(args) -> int:
     state_data, _ = maintained_state(args.state)
+    if args.transfer_command == "list":
+        data = request_json(state_data["api_base"], "GET", transfer_endpoint(state_data), token=transfer_token(state_data))
+        items = data.get("items")
+        if not isinstance(items, list):
+            raise AgentError("cloud transfer list response is invalid")
+        for transfer in items:
+            if not isinstance(transfer, dict):
+                raise AgentError("cloud transfer list response is invalid")
+            transfer_id = canonical_uuid(transfer.get("transfer_id"), "transfer_id")
+            validate_transfer(state_data, transfer, transfer_id)
+        print(json.dumps({"items": [safe_transfer(item) for item in items]}, ensure_ascii=False))
+        return 0
     if args.transfer_command == "status":
         transfer = transfer_request(state_data, "GET", args.transfer_id)
         if args.wait:
             return wait_for_transfer(args, args.transfer_id, transfer)
-        print(json.dumps(transfer, ensure_ascii=False))
+        print(json.dumps(safe_transfer(transfer), ensure_ascii=False))
         return 1 if transfer.get("status") in {"failed", "cancelled"} else 0
     transfer = transfer_request(state_data, "POST", args.transfer_id, args.transfer_command)
-    print(json.dumps(transfer, ensure_ascii=False))
+    print(json.dumps(safe_transfer(transfer), ensure_ascii=False))
     return 0
 
 
@@ -691,16 +925,23 @@ def command_maintain(args) -> int:
     while True:
         state_data, session = maintained_state(args.state)
         print(json.dumps(safe_status(state_data, session), ensure_ascii=False), flush=True)
+        if permanent(state_data):
+            return 0
         if session.get("state") != "active":
             return 0
         time.sleep(args.interval)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Renewable Feidu RDev agent session client")
-    parser.add_argument("--state", type=pathlib.Path, default=default_state_path())
-    commands = parser.add_subparsers(dest="command", required=True)
-    start = commands.add_parser("start")
+    parser = argparse.ArgumentParser(description="Import permanent device access once; use SSH, SFTP and Feidu without renewing credentials")
+    parser.add_argument("--state", type=pathlib.Path, default=None)
+    parser.add_argument("--device", default="", help="select a saved device by its exact ID")
+    imports = parser.add_mutually_exclusive_group()
+    imports.add_argument("--import-clipboard", action="store_true", help="import copied device access without printing credentials (Windows)")
+    imports.add_argument("--import-stdin", action="store_true", help="import device access JSON from a protected stdin channel")
+    parser.add_argument("--replace", action="store_true", help="explicitly replace an existing saved device authorization")
+    commands = parser.add_subparsers(dest="command")
+    start = commands.add_parser("start", help="legacy temporary claim only")
     start.add_argument("--device", required=True)
     start.add_argument("--claim-expires-at", required=True)
     start.add_argument("--api-base", default=API_BASE)
@@ -721,12 +962,15 @@ def build_parser() -> argparse.ArgumentParser:
     scp_from = commands.add_parser("scp-from")
     scp_from.add_argument("remote_path")
     scp_from.add_argument("local_path")
+    sftp = commands.add_parser("sftp")
+    sftp.add_argument("--batch-file", default="", help="SFTP batch file; '-' reads commands from stdin")
     drive = commands.add_parser("drive")
     drive.add_argument("drive_args", nargs=argparse.REMAINDER)
     maintain = commands.add_parser("maintain")
     maintain.add_argument("--interval", type=int, default=60)
     transfer = commands.add_parser("transfer")
     transfer_commands = transfer.add_subparsers(dest="transfer_command", required=True)
+    transfer_commands.add_parser("list")
     create = transfer_commands.add_parser("create")
     create.add_argument("--transfer-id", default="")
     create.add_argument("--direction", choices=("cloud_to_device", "device_to_cloud"), required=True)
@@ -753,17 +997,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if (args.import_clipboard or args.import_stdin) and args.command:
+        parser.error("import is a separate command")
+    if not (args.import_clipboard or args.import_stdin or args.command):
+        parser.error("choose a command or --import-clipboard / --import-stdin")
+    if args.replace and not (args.import_clipboard or args.import_stdin):
+        parser.error("--replace is only used with an import")
     if getattr(args, "interval", 1) <= 0:
         parser.error("--interval must be greater than zero")
     if getattr(args, "auto_resume_attempts", 0) < 0:
         parser.error("--auto-resume-attempts must not be negative")
     handlers = {
         "start": command_start, "status": command_status, "renew": command_renew, "revoke": command_revoke,
-        "ssh": command_ssh, "scp-to": command_scp_to, "scp-from": command_scp_from,
+        "ssh": command_ssh, "sftp": command_sftp, "scp-to": command_scp_to, "scp-from": command_scp_from,
         "drive": command_drive, "transfer": command_transfer_create if getattr(args, "transfer_command", "") == "create" else command_transfer_control,
         "maintain": command_maintain,
     }
     try:
+        if args.import_clipboard or args.import_stdin:
+            return command_import(args)
+        args.state = resolve_state(args)
         return handlers[args.command](args)
     except AgentError as error:
         print(f"rdev-agent: {error}", file=sys.stderr)

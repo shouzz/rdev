@@ -81,6 +81,9 @@ type deviceAuthorization struct {
 	PasswordFingerprint     string
 	TicketID                string
 	TicketExpiresAt         time.Time
+	MaintenanceTokenID      string
+	MaintenanceGeneration   uint64
+	MaintenanceCapability   string
 }
 
 type accessTicketCreateRequest struct {
@@ -386,6 +389,15 @@ func (s *Server) authorizeBrowserUpgrade(r *http.Request, session interface{ Sto
 	if s.controlAuthOK(r) {
 		return true
 	}
+	if auth, subject, ok := s.maintenanceBrowserAuthorization(r); ok {
+		if deviceID != "" && auth.DeviceID != deviceID {
+			return false
+		}
+		session.Store(maintenanceSessionKey, auth)
+		session.Store(browserTicketSessionKey, auth.connectionKey())
+		session.Store(browserSubjectSessionKey, subject)
+		return true
+	}
 	ticket, ok := s.browserSocketTicket(r)
 	if !ok || (deviceID != "" && ticket.DeviceID != deviceID) {
 		return false
@@ -407,6 +419,10 @@ func headerContainsToken(header http.Header, name, want string) bool {
 }
 
 func (s *Server) browserAccessTicketValid(value, requestedDeviceID, capability string) bool {
+	if strings.HasPrefix(value, maintenanceTokenPrefix) {
+		_, _, valid := s.maintenanceGrantForCredential(value, requestedDeviceID, capability)
+		return valid
+	}
 	if !strings.HasPrefix(value, accessTicketPrefix) {
 		return false
 	}
@@ -446,6 +462,9 @@ func (s *Server) authorizeDeviceCredential(client *ClientConn, credential string
 func (s *Server) authorizeDeviceCredentialBinding(client *ClientConn, credential string) (deviceAuthorization, bool) {
 	if client == nil {
 		return deviceAuthorization{}, false
+	}
+	if strings.HasPrefix(credential, maintenanceTokenPrefix) {
+		return s.maintenanceAuthorization(client, credential, maintenanceCapabilitySSH)
 	}
 	if credential != "" {
 		if ticket, ok := s.accessTicketForCredential(client, credential); ok {
@@ -509,6 +528,9 @@ func (s *Server) accessTicketForClient(client *ClientConn, value string) (access
 }
 
 func (s *Server) authorizeBrowserDeviceCredentialBinding(client *ClientConn, credential, capability string) (deviceAuthorization, bool) {
+	if strings.HasPrefix(credential, maintenanceTokenPrefix) {
+		return s.maintenanceAuthorization(client, credential, capability)
+	}
 	ticket, ok := s.accessTicketForBrowserCredential(client, credential, capability)
 	if !ok {
 		return deviceAuthorization{}, false
@@ -543,6 +565,11 @@ func (authorization deviceAuthorization) validFor(client *ClientConn) bool {
 func (s *Server) deviceAuthorizationValid(authorization deviceAuthorization, client *ClientConn) bool {
 	if !authorization.validFor(client) {
 		return false
+	}
+	if authorization.MaintenanceTokenID != "" {
+		s.enrollmentMu.Lock()
+		defer s.enrollmentMu.Unlock()
+		return s.maintenanceAuthorizationValidLocked(authorization)
 	}
 	if authorization.TicketID == "" {
 		return true
@@ -596,6 +623,13 @@ func (s *Server) accessTicketExpiration(ticketID string) (time.Time, bool) {
 func (s *Server) trackBrowserTicketConnection(socket *gws.Conn) (<-chan struct{}, bool) {
 	if socket == nil {
 		return nil, false
+	}
+	if raw, exists := socket.Session().Load(maintenanceSessionKey); exists {
+		auth, ok := raw.(deviceAuthorization)
+		if !ok {
+			return nil, false
+		}
+		return s.trackMaintenanceBrowserConnection(socket, auth)
 	}
 	raw, _ := socket.Session().Load(browserTicketSessionKey)
 	ticketID, _ := raw.(string)
@@ -699,10 +733,14 @@ func (s *Server) authorizeBrowserDeviceRequest(client *ClientConn, r *http.Reque
 		return false
 	}
 	if credential := r.Header.Get("X-RDev-Device-Credential"); credential != "" {
+		if strings.HasPrefix(credential, maintenanceTokenPrefix) {
+			_, ok := s.maintenanceAuthorization(client, credential, browserCapabilityDesktop)
+			return ok
+		}
 		return s.authorizeDeviceCredential(client, credential)
 	}
 	password := r.URL.Query().Get("password")
-	if strings.HasPrefix(password, accessTicketPrefix) {
+	if strings.HasPrefix(password, accessTicketPrefix) || strings.HasPrefix(password, maintenanceTokenPrefix) {
 		return false
 	}
 	return s.authorizeDeviceCredential(client, password)

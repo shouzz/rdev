@@ -32,6 +32,7 @@ const (
 	managedDeviceIDMaxBytes   = 128
 	managedDeviceRegistryV2   = "rdev-device-registry.v2"
 	managedDeviceRegistryV3   = "rdev-device-registry.v3"
+	managedDeviceRegistryV4   = "rdev-device-registry.v4"
 )
 
 var (
@@ -57,6 +58,7 @@ type managedDevice struct {
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	RevokedAt         time.Time
+	MaintenanceToken  *maintenanceTokenGrant
 }
 
 type managedDeviceRegistry struct {
@@ -66,13 +68,14 @@ type managedDeviceRegistry struct {
 }
 
 type managedDeviceRegistryRecord struct {
-	ID                string `json:"id"`
-	OwnerSubject      string `json:"owner_subject"`
-	SecretHash        string `json:"secret_hash"`
-	CredentialVersion uint64 `json:"credential_version,omitempty"`
-	CreatedAt         string `json:"created_at"`
-	UpdatedAt         string `json:"updated_at"`
-	RevokedAt         string `json:"revoked_at,omitempty"`
+	ID                string                 `json:"id"`
+	OwnerSubject      string                 `json:"owner_subject"`
+	SecretHash        string                 `json:"secret_hash"`
+	CredentialVersion uint64                 `json:"credential_version,omitempty"`
+	CreatedAt         string                 `json:"created_at"`
+	UpdatedAt         string                 `json:"updated_at"`
+	RevokedAt         string                 `json:"revoked_at,omitempty"`
+	MaintenanceToken  *maintenanceTokenGrant `json:"maintenance_token,omitempty"`
 }
 
 type enrollmentRegistryRecord struct {
@@ -259,6 +262,10 @@ func (s *Server) HandleManagedDeviceLifecycleAPI(w http.ResponseWriter, r *http.
 	if !s.requireEnrollmentControl(w, r) {
 		return
 	}
+	if strings.HasSuffix(r.URL.EscapedPath(), "/maintenance-token") {
+		s.handleMaintenanceToken(w, r)
+		return
+	}
 	rotate := strings.HasSuffix(r.URL.EscapedPath(), "/rotate-secret")
 	deviceID, ok := exactPathIdentifier(r, "/api/control/devices/", rotate)
 	if !ok {
@@ -388,6 +395,7 @@ func (s *Server) HandleEnrollmentRedeemAPI(w http.ResponseWriter, r *http.Reques
 	}
 	if replacing {
 		updatedDevice.CreatedAt = originalDevice.CreatedAt
+		updatedDevice.MaintenanceToken = originalDevice.MaintenanceToken
 		updatedDevice.CredentialVersion, err = nextManagedDeviceCredentialVersion(originalDevice.CredentialVersion)
 		if err != nil {
 			s.enrollmentMu.Unlock()
@@ -644,6 +652,7 @@ func (s *Server) disconnectManagedDevice(deviceID, reason string) {
 	}
 	s.mu.Unlock()
 	s.invalidateAccessTicketConnectionsForDevice(deviceID)
+	s.closeDeviceMaintenanceConnections(deviceID, reason)
 	if len(connected) == 0 {
 		return
 	}
@@ -806,7 +815,7 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 	if err = decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return errors.New("decode managed device registry: trailing data")
 	}
-	if registry.Schema != managedDeviceRegistryV2 && registry.Schema != managedDeviceRegistryV3 {
+	if registry.Schema != managedDeviceRegistryV2 && registry.Schema != managedDeviceRegistryV3 && registry.Schema != managedDeviceRegistryV4 {
 		return errors.New("managed device registry schema is invalid")
 	}
 	for _, record := range registry.Devices {
@@ -844,9 +853,20 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 		if _, duplicate := s.managedDevices[record.ID]; duplicate {
 			return errors.New("managed device registry contains duplicate ids")
 		}
+		if record.MaintenanceToken != nil {
+			if registry.Schema != managedDeviceRegistryV4 || normalizeMaintenanceGrant(record.MaintenanceToken) != nil {
+				return errors.New("managed device maintenance grant is invalid")
+			}
+			for _, other := range s.managedDevices {
+				if other.MaintenanceToken != nil && (other.MaintenanceToken.TokenID == record.MaintenanceToken.TokenID || other.MaintenanceToken.TokenHash == record.MaintenanceToken.TokenHash) {
+					return errors.New("managed device maintenance grant is duplicated")
+				}
+			}
+		}
 		s.managedDevices[record.ID] = managedDevice{
 			ID: record.ID, OwnerSubject: record.OwnerSubject, SecretHash: record.SecretHash,
 			CredentialVersion: credentialVersion, CreatedAt: createdAt, UpdatedAt: updatedAt, RevokedAt: revokedAt,
+			MaintenanceToken: record.MaintenanceToken,
 		}
 	}
 	seenEnrollmentIDs := make(map[string]struct{}, len(registry.Enrollments))
@@ -929,7 +949,11 @@ func (s *Server) persistManagedDeviceRegistryLocked() error {
 		record := managedDeviceRegistryRecord{
 			ID: id, OwnerSubject: device.OwnerSubject, SecretHash: device.SecretHash,
 			CredentialVersion: device.CredentialVersion,
+			MaintenanceToken:  device.MaintenanceToken,
 			CreatedAt:         device.CreatedAt.UTC().Format(time.RFC3339), UpdatedAt: device.UpdatedAt.UTC().Format(time.RFC3339),
+		}
+		if device.MaintenanceToken != nil {
+			registry.Schema = managedDeviceRegistryV4
 		}
 		if !device.RevokedAt.IsZero() {
 			record.RevokedAt = device.RevokedAt.UTC().Format(time.RFC3339)

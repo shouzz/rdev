@@ -200,9 +200,8 @@ func (h *terminalWSHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 				return
 			}
 
-			_, browserOK := h.srv.authorizeBrowserDeviceCredentialBinding(client, tmsg.Password, browserCapabilityTerminal)
-			_, deviceOK := h.srv.authorizeDeviceCredentialBinding(client, tmsg.Password)
-			if browserOK || deviceOK {
+			_, authorized := h.srv.authorizeBrowserOrDeviceCredentialBinding(socket, client, tmsg.Password, browserCapabilityTerminal)
+			if authorized {
 				h.authed = true
 				h.sendJSON(socket, terminalMsg{Op: "auth_ok"})
 				h.createSession(socket, deviceID)

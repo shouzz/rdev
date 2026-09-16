@@ -1956,6 +1956,8 @@ func (s *Server) HandleConfigAPI(w http.ResponseWriter, r *http.Request) {
 		"kcpPort":      s.KCPPort,
 		"vncAddr":      s.VNCAddr,
 		"authRequired": map[bool]string{true: "true", false: "false"}[s.secureControlEnabled()],
+		"maxSessions":  strconv.Itoa(s.MaxSessions),
+		"maxForwards":  strconv.Itoa(s.MaxForwards),
 	})
 }
 

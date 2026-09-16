@@ -1,5 +1,5 @@
 {
-  "schema": "rdev.ai-agent-manifest.v4",
+  "schema": "rdev.ai-agent-manifest.v5",
   "handoff": {
     "issuer_ui": "https://pan.feidu.fit/rdev",
     "claim_prefix": "fdhc_",
@@ -9,7 +9,9 @@
       "method": "POST",
       "url": "https://pan.feidu.fit/agent/v1/handoffs/redeem",
       "content_type": "application/json",
-      "body": {"claim": "<runtime fdhc_ claim>"},
+      "body": {
+        "claim": "<runtime fdhc_ claim>"
+      },
       "required_http_status": 200,
       "required_json_code": 0
     },
@@ -21,8 +23,13 @@
       "renewal_token": "data.credentials.agent_session.renewal_token"
     },
     "credential_max_ttl_seconds": 28800,
-    "session_duration_hours": [2, 8, 24],
-    "single_use": true
+    "session_duration_hours": [
+      2,
+      8,
+      24
+    ],
+    "single_use": true,
+    "mode": "legacy_temporary_only"
   },
   "agent_session": {
     "renewal_token_prefix": "fdrn_",
@@ -38,21 +45,45 @@
       "transfer_resume": "POST /agent/v1/sessions/{agent_session_id}/transfers/{transfer_id}/resume",
       "transfer_cancel": "POST /agent/v1/sessions/{agent_session_id}/transfers/{transfer_id}/cancel"
     },
-    "status_fields": ["ticket_remaining_seconds", "developer_token_remaining_seconds", "estimated_transfer_seconds", "minimum_safety_margin_seconds", "renewal_due_at_ms", "absolute_expires_at_ms", "selected_transport"],
+    "status_fields": [
+      "ticket_remaining_seconds",
+      "developer_token_remaining_seconds",
+      "estimated_transfer_seconds",
+      "minimum_safety_margin_seconds",
+      "renewal_due_at_ms",
+      "absolute_expires_at_ms",
+      "selected_transport"
+    ],
     "renewal_token_policy": "stable_until_absolute_expiry_or_revoke",
     "renewal_response": "data.session",
     "credential_policy": "values_stable_expiry_extended_in_place",
-    "state_storage": {"windows": "current-user DPAPI", "unix": "mode 0600"},
+    "state_storage": {
+      "windows": "current-user DPAPI",
+      "unix": "mode 0600"
+    },
     "tool": "/skills/rdev-agent/scripts/rdev-agent.py",
-    "skill": "/skills/rdev-agent/SKILL.md"
+    "skill": "/skills/rdev-agent/SKILL.md",
+    "mode": "legacy_temporary_only"
   },
   "rdev": {
     "base_url": "https://r.feidu.fit",
-    "discovery": ["GET /api/config"],
-    "device_id_source": "data.credentials.device_id",
-    "password_source": "data.credentials.rdev_ticket.ticket",
-    "protected_endpoints_not_required": ["GET /api/clients"],
-    "device_operations": ["ssh", "exec", "scp", "sftp", "rsync", "port_forward", "remote_desktop"],
+    "discovery": [
+      "GET /api/config"
+    ],
+    "device_id_source": "permanent_access.device_id",
+    "password_source": "permanent_access.token",
+    "protected_endpoints_not_required": [
+      "GET /api/clients"
+    ],
+    "device_operations": [
+      "ssh",
+      "exec",
+      "scp",
+      "sftp",
+      "rsync",
+      "port_forward",
+      "remote_desktop"
+    ],
     "verified_windows_scp": {
       "client_version": "go/v0.2.121-feidu.16",
       "asset": "rdev-client-windows-amd64.exe",
@@ -61,16 +92,36 @@
     },
     "file_websocket": {
       "url": "wss://r.feidu.fit/files",
-      "auth_message": {"op": "auth", "deviceId": "<device id>", "password": "<runtime secret>"},
-      "semantic_locations": ["home", "desktop"],
+      "auth_message": {
+        "op": "auth",
+        "deviceId": "<device id>",
+        "password": "<same runtime token as handshake>"
+      },
+      "semantic_locations": [
+        "home",
+        "desktop"
+      ],
       "binary_frame": "[type:1][task_id_length:1][task_id][offset:uint64_be][payload]",
-      "types": {"upload_chunk": "0x20", "upload_ack": "0x21", "download_chunk": "0x22", "transfer_end": "0x23", "cancel": "0x24"}
+      "types": {
+        "upload_chunk": "0x20",
+        "upload_ack": "0x21",
+        "download_chunk": "0x22",
+        "transfer_end": "0x23",
+        "cancel": "0x24"
+      },
+      "handshake_subprotocols": [
+        "rdev-browser-v1",
+        "rdev-access-ticket.<runtime fdpat_>"
+      ]
     },
     "managed_enrollment": {
       "issuer_ui": "https://pan.feidu.fit/rdev",
       "public_join": "https://r.feidu.fit/join#<runtime rdeve_ code>",
       "code_prefix": "rdeve_",
-      "modes": ["temporary", "persistent"],
+      "modes": [
+        "temporary",
+        "persistent"
+      ],
       "persistent_identity": "OS-protected identity file",
       "secret_storage": "server bcrypt hash only",
       "persistent_transport": "wss://r.feidu.fit",
@@ -83,25 +134,67 @@
         "effect": "rotate device secret, revoke old access tickets, disconnect old connection",
         "conflict_http_status": 409
       }
-    }
+    },
+    "ssh_host_source": "permanent_access.ssh_host",
+    "ssh_port_source": "permanent_access.ssh_port"
   },
   "artifact_plane": {
     "base_url": "https://pan.feidu.fit",
     "token_env": "FEIDU_DRIVE_TOKEN",
     "cli": "python3 tools/feidu-drive.py",
-    "download": ["GET /developer/v1/capabilities", "GET /developer/v1/contents", "GET /developer/v1/contents/{content_id}", "GET /developer/v1/contents/{content_id}/download"],
-    "upload": ["POST /developer/v1/direct-upload-sessions", "GET /developer/v1/direct-upload-sessions/{session_id}", "PUT /developer/v1/direct-upload-sessions/{session_id}/parts/{part_number}", "POST /developer/v1/direct-upload-sessions/{session_id}/parts/refresh", "POST /developer/v1/direct-upload-sessions/{session_id}/rapid-proof", "POST /developer/v1/direct-upload-sessions/{session_id}/complete", "POST /developer/v1/direct-upload-sessions/{session_id}/cancel"],
+    "download": [
+      "GET /developer/v1/capabilities",
+      "GET /developer/v1/contents",
+      "GET /developer/v1/contents/{content_id}",
+      "GET /developer/v1/contents/{content_id}/download"
+    ],
+    "upload": [
+      "POST /developer/v1/direct-upload-sessions",
+      "GET /developer/v1/direct-upload-sessions/{session_id}",
+      "PUT /developer/v1/direct-upload-sessions/{session_id}/parts/{part_number}",
+      "POST /developer/v1/direct-upload-sessions/{session_id}/parts/refresh",
+      "POST /developer/v1/direct-upload-sessions/{session_id}/rapid-proof",
+      "POST /developer/v1/direct-upload-sessions/{session_id}/complete",
+      "POST /developer/v1/direct-upload-sessions/{session_id}/cancel"
+    ],
     "token_prefix": "fdpat_",
-    "lifecycle": ["none", "hide", "archive"],
-    "rules": ["use content_id only", "never log token", "never persist signed URL", "sequential multipart with max 3 attempts per part", "HTTP 200 or 409 means part accepted"]
+    "lifecycle": [
+      "none",
+      "hide",
+      "archive"
+    ],
+    "rules": [
+      "use content_id only",
+      "never log token",
+      "never persist signed URL",
+      "sequential multipart with max 3 attempts per part",
+      "HTTP 200 or 409 means part accepted"
+    ]
   },
   "bridge": {
     "automatic_threshold_bytes": 104857600,
     "automatic_large_file": {
       "local_staging_required": false,
-      "cloud_to_device": ["browser_multipart_to_aliyundrive", "device_https_download", "size_sha1_verify", "atomic_publish"],
-      "device_to_cloud": ["device_size_sha1_verify", "device_sequential_multipart_to_aliyundrive", "result_content_id_bind", "browser_download_ticket"],
-      "transfer_states": ["queued", "running", "paused", "completed", "failed", "cancelled"],
+      "cloud_to_device": [
+        "browser_multipart_to_aliyundrive",
+        "device_https_download",
+        "size_sha1_verify",
+        "atomic_publish"
+      ],
+      "device_to_cloud": [
+        "device_size_sha1_verify",
+        "device_sequential_multipart_to_aliyundrive",
+        "result_content_id_bind",
+        "browser_download_ticket"
+      ],
+      "transfer_states": [
+        "queued",
+        "running",
+        "paused",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
       "transfer_token_prefix": "fdtx_",
       "transfer_generation": "positive_uint64_monotonic_per_transfer",
       "dispatch_acceptance": "device_plan_and_running_progress_acknowledged",
@@ -111,14 +204,105 @@
     },
     "manual_agent_workflow": {
       "local_staging_required": true,
-      "cloud_to_device": ["artifact_download", "hash_verify", "rdev_scp_or_sftp_upload", "device_hash_verify"],
-      "device_to_cloud": ["device_hash_verify", "rdev_scp_or_sftp_download", "artifact_upload", "content_id_record"]
+      "cloud_to_device": [
+        "artifact_download",
+        "hash_verify",
+        "rdev_scp_or_sftp_upload",
+        "device_hash_verify"
+      ],
+      "device_to_cloud": [
+        "device_hash_verify",
+        "rdev_scp_or_sftp_download",
+        "artifact_upload",
+        "content_id_record"
+      ]
     },
-    "integrity": ["size", "sha256_local", "sha256_remote"],
-    "secret_policy": "handoff_claim_and_credentials_runtime_only"
+    "integrity": [
+      "size",
+      "sha256_local",
+      "sha256_remote"
+    ],
+    "secret_policy": "permanent_token_in_protected_local_store_only_no_chat_logs_urls_or_source"
   },
   "documentation": {
     "human": "/docs/ai-agent-artifact-bridge.md",
     "repository": "docs/ai-agent-artifact-bridge.md"
+  },
+  "default_authentication": "permanent_device_token",
+  "permanent_access": {
+    "schema": "rdev-device-access.v1",
+    "fields": [
+      "schema",
+      "device_id",
+      "rdev_base",
+      "api_base",
+      "ssh_host",
+      "ssh_port",
+      "token"
+    ],
+    "additional_fields": false,
+    "ssh_port_type": "integer",
+    "issuer_ui": "https://pan.feidu.fit/rdev",
+    "token_prefix": "fdpat_",
+    "expiry": "none",
+    "scope": "one_token_per_device",
+    "import": {
+      "windows": "python rdev-agent.py --import-clipboard",
+      "unix": "python3 rdev-agent.py --import-stdin"
+    },
+    "select": "--device EXACT-ID",
+    "state_storage": {
+      "windows": "current-user DPAPI",
+      "unix": "mode 0600"
+    },
+    "credentials": {
+      "ssh_password": "token",
+      "FEIDU_DRIVE_TOKEN": "token"
+    },
+    "renewal": "not_required",
+    "revoke_at_task_completion": false,
+    "status": "saved_metadata_only",
+    "ssh": {
+      "connect_timeout_seconds": 10,
+      "keepalive_interval_seconds": 15,
+      "keepalive_count_max": 3,
+      "command_deadline": null,
+      "replay_remote_commands": false
+    },
+    "cloud_transfers": {
+      "authentication": "Bearer token",
+      "endpoints": {
+        "create": "POST /developer/v1/rdev/transfers",
+        "list": "GET /developer/v1/rdev/transfers",
+        "get": "GET /developer/v1/rdev/transfers/{transfer_id}",
+        "pause": "POST /developer/v1/rdev/transfers/{transfer_id}/pause",
+        "resume": "POST /developer/v1/rdev/transfers/{transfer_id}/resume",
+        "cancel": "POST /developer/v1/rdev/transfers/{transfer_id}/cancel"
+      },
+      "identity": "account_device_root_derived_from_token_binding",
+      "list_response": "data.items",
+      "transfer_response": "data.transfer",
+      "internal_credentials": "fdtx_managed_by_server_and_device_only",
+      "recovery": "resume_original_transfer_id_with_fixed_token",
+      "automatic_resume_attempts": 2
+    },
+    "revocation": "explicit_Feidu_device_authorization_page",
+    "offline_control": "persisted_RDev_binding_until_control_synchronizes_updates",
+    "tool": "/skills/rdev-agent/scripts/rdev-agent.py",
+    "skill": "/skills/rdev-agent/SKILL.md",
+    "browser": {
+      "entry": "Feidu_authenticated_device_workspace",
+      "handshake_subprotocols": [
+        "rdev-browser-v1",
+        "rdev-access-ticket.<runtime fdpat_>"
+      ],
+      "message_credential": "same_token_and_device_as_handshake",
+      "token_in_url": false,
+      "excluded": [
+        "legacy_standalone_RDev_HTML",
+        "raw_VNC_proxy",
+        "raw_GPU_proxy"
+      ]
+    }
   }
 }
