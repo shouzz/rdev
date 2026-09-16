@@ -724,7 +724,8 @@ func cloudTransferAPI(ctx context.Context, method, endpoint, token string, input
 	}
 	envelope := cloudTransferEnvelope[json.RawMessage]{}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
+	// The API may add metadata while deployed device clients remain unchanged.
+	// Decode known fields normally; body bounds, types and business checks remain.
 	if err = decoder.Decode(&envelope); err != nil {
 		return cloudTransferCategory("response_envelope", errors.New("cloud transfer API response is invalid"))
 	}
@@ -738,7 +739,6 @@ func cloudTransferAPI(ctx context.Context, method, endpoint, token string, input
 		envelope.Data = []byte("{}")
 	}
 	decoder = json.NewDecoder(bytes.NewReader(envelope.Data))
-	decoder.DisallowUnknownFields()
 	if err = decoder.Decode(output); err != nil {
 		return cloudTransferCategory("response_data", errors.New("cloud transfer API data is invalid"))
 	}

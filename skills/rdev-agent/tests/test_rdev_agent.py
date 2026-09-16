@@ -37,13 +37,15 @@ class Handler(BaseHTTPRequestHandler):
     device_id = "DEVICE-EXACT"
     requests = []
     response_code = 0
+    response_message = "test response"
+    http_status = 200
 
     def log_message(self, *_):
         return
 
     def respond(self, data):
-        payload = json.dumps({"code": self.response_code, "message": "test response", "data": data}).encode()
-        self.send_response(200)
+        payload = json.dumps({"code": self.response_code, "message": self.response_message, "data": data}).encode()
+        self.send_response(self.http_status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -145,6 +147,8 @@ class RDevAgentTest(unittest.TestCase):
         Handler.requests = []
         Handler.renewal_response_token = Handler.missing_token
         Handler.response_code = 0
+        Handler.response_message = "test response"
+        Handler.http_status = 200
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -229,9 +233,9 @@ class RDevAgentTest(unittest.TestCase):
         with patcher, self.assertRaisesRegex(rdev_agent.AgentError, "cannot read RDev agent session: UnicodeDecodeError"):
             rdev_agent.read_state(self.state)
 
-    def test_business_error_reports_only_integer_api_code(self):
+    def test_business_error_reports_integer_api_code_and_readable_message(self):
         Handler.response_code = 503
-        with self.assertRaisesRegex(rdev_agent.AgentError, r"^service returned API code 503$"):
+        with self.assertRaisesRegex(rdev_agent.AgentError, r"^service returned API code 503: test response$"):
             rdev_agent.request_json(
                 self.base,
                 "POST",
@@ -521,6 +525,63 @@ class PermanentAccessTest(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         self.assertEqual(request.call_args_list[0], request.call_args_list[1])
         self.assertEqual(request.call_args.args[3]["transfer_id"], transfer_id)
+
+    def test_device_upload_requires_exact_remote_basename_before_dispatch(self):
+        self.save_access()
+        for source, name in [
+            ("/tmp/result.bin", "result.bin"),
+            (r"C:\Users\test\result.bin", "result.bin"),
+            (r"\\server\share\result.bin", "result.bin"),
+            ("C:/Users/test/result.bin", "result.bin"),
+            (r"/tmp/literal\name.bin", r"literal\name.bin"),
+        ]:
+            with self.subTest(source=source):
+                command = ["transfer", "create", "--direction", "device_to_cloud", "--source-path", source, "--file-name", "renamed.bin", "--size-bytes", "104857601"]
+                Handler.requests = []
+                code, output, errors = self.run_main(command)
+                self.assertEqual(code, 2)
+                self.assertIn("exact source filename", errors)
+                self.assertEqual(output, "")
+                self.assertEqual(Handler.requests, [])
+                command[command.index("--file-name") + 1] = name
+                code, _, errors = self.run_main(command)
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(len(Handler.requests), 1)
+
+    def test_source_basename_rule_does_not_apply_to_cloud_download_or_legacy(self):
+        self.save_access()
+        command = ["transfer", "create", "--direction", "cloud_to_device", "--source-content-id", "content", "--file-name", "new-name.bin", "--size-bytes", "104857601"]
+        self.assertEqual(self.run_main(command)[0], 0)
+        state = {"api_base": self.base, "agent_session_id": Handler.session_id, "renewal_token": Handler.renewal}
+        command[command.index("--direction") + 1] = "device_to_cloud"
+        command += ["--source-path", "/tmp/original.bin"]
+        with mock.patch.object(rdev_agent, "maintained_state", return_value=(state, {})):
+            self.assertEqual(self.run_main(command)[0], 0)
+
+    def test_transfer_failure_diagnostics_are_readable_bounded_and_redacted(self):
+        credentials = [prefix + "secretValue123" for prefix in ("fdpat_", "fdtx_", "rdvat_", "fdhc_", "fdrn_")]
+        transfer = {"status": "failed", "failure_class": "source_name_mismatch", "error_message": "Use the source filename. " + " ".join(credentials) + " https://storage.example/path?signature=private-value#fragment\n" + "x" * 500}
+        result = rdev_agent.safe_transfer(transfer)
+        self.assertEqual(result["failure_class"], "source_name_mismatch")
+        self.assertIn("Use the source filename.", result["error_message"])
+        self.assertLessEqual(len(result["error_message"]), 240)
+        for secret in [*credentials, "private-value", "signature", "\n"]:
+            self.assertNotIn(secret, result["error_message"])
+        for bad in ("bad class", "bad\nline", "x" * 65, "fdpat_secret", "非ASCII", "https://example.test"):
+            self.assertNotIn("failure_class", rdev_agent.safe_transfer(dict(transfer, failure_class=bad)))
+
+    def test_api_and_http_name_rejection_reports_sanitized_explanation(self):
+        Handler.response_code = 400
+        Handler.response_message = "device_to_cloud: use the source filename; fdpat_secretValue123 https://example.test/path?secret=private"
+        for http_status in (200, 400):
+            Handler.http_status = http_status
+            with self.subTest(http_status=http_status), self.assertRaises(rdev_agent.AgentError) as caught:
+                rdev_agent.request_json(self.base, "GET", "/developer/v1/rdev/transfers")
+            message = str(caught.exception)
+            self.assertIn("use the source filename", message)
+            self.assertNotIn("fdpat_", message)
+            self.assertNotIn("private", message)
+            self.assertNotIn("secret=", message)
 
     def test_transfer_cross_device_rejected_and_internal_secrets_not_reported(self):
         data = self.access()

@@ -10,8 +10,10 @@ import datetime as dt
 import getpass
 import hashlib
 import json
+import ntpath
 import os
 import pathlib
+import posixpath
 import re
 import shutil
 import stat
@@ -53,6 +55,16 @@ class RetryableServiceError(AgentError):
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def safe_error_message(value) -> str:
+    """Keep useful short diagnostics without credentials or signed URLs."""
+    if not isinstance(value, str):
+        return ""
+    text = re.sub(r"(?i)\b(?:fdpat|fdtx|rdvat|fdhc|fdrn)_[A-Za-z0-9_-]*", "[redacted]", value)
+    text = re.sub(r"(?i)\b(?:https?|wss?)://[^\s<>\"']+", "[url]", text)
+    text = " ".join("".join(c if c.isprintable() else " " for c in text).split())
+    return text[:240]
 
 
 def permanent(state_data: dict) -> bool:
@@ -257,7 +269,15 @@ def request_json(base_url: str, method: str, path: str, payload=None, token: str
             envelope = json.load(response)
     except urllib.error.HTTPError as error:
         kind = RetryableServiceError if error.code in {408, 429, 500, 502, 503, 504} else AgentError
-        raise kind(f"service returned HTTP {error.code}") from None
+        message = ""
+        try:
+            failure = json.loads(error.read(65536))
+            if isinstance(failure, dict):
+                message = safe_error_message(failure.get("message"))
+        except (ValueError, OSError):
+            pass
+        detail = ": " + message if message else ""
+        raise kind(f"service returned HTTP {error.code}{detail}") from None
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
         raise RetryableServiceError(f"service request failed: {type(error).__name__}") from None
     if not isinstance(envelope, dict):
@@ -266,7 +286,9 @@ def request_json(base_url: str, method: str, path: str, payload=None, token: str
     if not isinstance(code, int) or isinstance(code, bool):
         raise AgentError("service returned an invalid API envelope")
     if code != 0:
-        raise AgentError(f"service returned API code {code}")
+        message = safe_error_message(envelope.get("message"))
+        detail = ": " + message if message else ""
+        raise AgentError(f"service returned API code {code}{detail}")
     if not isinstance(envelope.get("data"), dict):
         raise AgentError("service returned an invalid API envelope")
     return envelope["data"]
@@ -787,7 +809,14 @@ def validate_transfer(state_data: dict, transfer: dict, transfer_id: str) -> dic
 
 def safe_transfer(transfer: dict) -> dict:
     fields = {"transfer_id", "device_id", "direction", "status", "size_bytes", "bytes_done", "result_content_id", "created_at_ms", "updated_at_ms", "expires_at_ms", "generation"}
-    return {key: value for key, value in transfer.items() if key in fields}
+    result = {key: value for key, value in transfer.items() if key in fields}
+    message = safe_error_message(transfer.get("error_message"))
+    if message:
+        result["error_message"] = message
+    failure_class = transfer.get("failure_class")
+    if isinstance(failure_class, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", failure_class) and safe_error_message(failure_class) == failure_class:
+        result["failure_class"] = failure_class
+    return result
 
 
 def transfer_request(state_data: dict, method: str, transfer_id: str, action: str = "", payload=None) -> dict:
@@ -800,6 +829,13 @@ def transfer_request(state_data: dict, method: str, transfer_id: str, action: st
 
 def command_transfer_create(args) -> int:
     state_data, _ = maintained_state(args.state, args.size_bytes, args.observed_bytes_per_second)
+    if permanent(state_data) and args.direction == "device_to_cloud":
+        # Parse the remote path independently of the tool's host OS, while
+        # retaining literal backslashes in absolute POSIX filenames.
+        windows_path = bool(ntpath.splitdrive(args.source_path)[0]) or ("\\" in args.source_path and not args.source_path.startswith("/"))
+        source_name = (ntpath if windows_path else posixpath).basename(args.source_path)
+        if source_name in {"", ".", ".."} or args.file_name != source_name:
+            raise AgentError("device_to_cloud does not support renaming: set --file-name to the exact source filename (basename of --source-path)")
     transfer_id = args.transfer_id or str(uuid.uuid4())
     canonical_uuid(transfer_id, "transfer_id")
     payload = {

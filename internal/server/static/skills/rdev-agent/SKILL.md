@@ -54,6 +54,8 @@ python3 rdev-agent.py --device DEVICE-ID transfer status TRANSFER-UUID --wait
 python3 rdev-agent.py --device DEVICE-ID transfer resume TRANSFER-UUID
 ```
 
+For `device_to_cloud`, `--file-name` must exactly equal the source filename in `--source-path` (Windows or POSIX basename); the current device client does not support renaming during upload.
+
 The tool uses fixed-Token `POST/GET /developer/v1/rdev/transfers`, then `GET /{transfer_id}` or `POST /{transfer_id}/pause|resume|cancel`. The server derives account, device and root from the Token binding. AI does not create an AgentSession or handle internal `fdtx_` credentials.
 
 The tool prints a non-secret transfer UUID before create, allowing recovery after a lost response. Keep this ID. `--wait` reports state changes and 5% progress, retries recoverable reads, and resumes the original failed or expired transfer at most twice by default. An expired internal 24-hour task credential is recovered through the same fixed Token and transfer ID. Use `--auto-resume-attempts` to change the bound. Completed means success; failed, cancelled or exhausted recovery returns nonzero. Recover with the same ID, never a fresh object or a new claim. A user's paused or cancelled task is not automatically restarted.

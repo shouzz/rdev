@@ -91,6 +91,8 @@ python3 rdev-agent.py --device DEVICE-ID transfer status TRANSFER-UUID --wait
 python3 rdev-agent.py --device DEVICE-ID transfer resume TRANSFER-UUID
 ```
 
+当前设备客户端上传不支持改名：`device_to_cloud` 的 `--file-name` 必须与 `--source-path` 的源文件名完全一致（支持 Windows/POSIX 路径），工具和服务端会在创建前拒绝不一致请求。
+
 工具在创建请求前输出非秘密 `transfer_id`，请求响应丢失后仍可查询和恢复原任务。`--wait` 只输出状态变化和每 5% 的进度边界，默认最多自动恢复两次。短暂控制请求失败重试读取；失败或内部凭据跨 24 小时到期，调用固定 Token 的 resume 恢复同一任务。`--auto-resume-attempts 0` 禁用自动恢复。中断后继续 `transfer status UUID --wait`，不另建任务、不索要新 claim。暂停和取消不会自动恢复。只有 `completed` 是成功，`failed`、`cancelled` 或恢复次数用尽返回非零。
 
 内部 `fdtx_` 及其轮换由飞度和设备管理，AI 只持有固定 `fdpat_`。恢复保留原 `transfer_id`、`operation_id` 和上传会话；设备下载断点保留于 `.rdev-cloud.part`。大小/哈希校验通过后原子发布。不要从 HTTP 200 控制响应直接宣称文件传输完成。

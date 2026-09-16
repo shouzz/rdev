@@ -103,6 +103,61 @@ func TestCloudTransferHTTPClientsAreReused(t *testing.T) {
 	}
 }
 
+func TestCloudTransferAPIAcceptsAdditionalResponseMetadata(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"code":0,"message":"ok","traceId":"compatibility-test",
+			"server_metrics":{"elapsed_ms":3},
+			"data":{
+				"session":{"session_id":"existing-upload","operation_id":"existing-operation",
+					"status":"uploading","size_bytes":4096,"part_size":4096,"part_count":1,
+					"completed_bytes":0,"average_bytes_per_second":0},
+				"parts":[{"part_number":1,"upload_url":"https://storage.example/part/1","retry_count":0}],
+				"statistics":{"completed_parts":0}
+			}
+		}`)
+	}))
+	defer api.Close()
+	var upload cloudUploadSessionResponse
+	if err := cloudTransferAPI(context.Background(), http.MethodPost, api.URL, cloudTransferTestToken(), struct{}{}, &upload); err != nil {
+		t.Fatalf("added server metadata broke an existing upload client: %v", err)
+	}
+	if upload.Session.SessionID != "existing-upload" || upload.Session.OperationID != "existing-operation" ||
+		upload.Session.Status != "uploading" || upload.Session.SizeBytes != 4096 || upload.Session.PartSize != 4096 || upload.Session.PartCount != 1 ||
+		len(upload.Parts) != 1 || upload.Parts[0].PartNumber != 1 || upload.Parts[0].UploadURL != "https://storage.example/part/1" {
+		t.Fatal("known upload fields were not preserved alongside the additional metadata")
+	}
+}
+
+func TestCloudTransferAPIResponseCompatibilityPreservesValidation(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		body     string
+		category string
+	}{
+		{"business rejection", `{"code":1,"data":{},"statistics":{}}`, "api_rejected"},
+		{"invalid code type", `{"code":"0","data":{}}`, "response_envelope"},
+		{"invalid data type", `{"code":0,"data":{"session":{"size_bytes":"4096"}}}`, "response_data"},
+		{"negative unsigned size", `{"code":0,"data":{"session":{"size_bytes":-1}}}`, "response_data"},
+		{"second JSON value", `{"code":0,"data":{}} {"code":0}`, "api_rejected"},
+		{"invalid JSON", `{"code":0,"data":`, "response_envelope"},
+		{"oversized metadata", `{"code":0,"data":{},"padding":"` + strings.Repeat("x", cloudTransferAPIBodyLimit) + `"}`, "response_too_large"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer api.Close()
+			var upload cloudUploadSessionResponse
+			err := cloudTransferAPI(context.Background(), http.MethodGet, api.URL, cloudTransferTestToken(), nil, &upload)
+			if err == nil || cloudTransferFailureCategory(err) != test.category {
+				t.Fatalf("error = %v, category = %s, want %s", err, cloudTransferFailureCategory(err), test.category)
+			}
+		})
+	}
+}
+
 func TestCloudTransferSameGenerationRedispatchAcknowledgesExistingRun(t *testing.T) {
 	client := NewClient("wss://rdev.example.com", "device", "", "")
 	transport := &cloudTransferMessageTransport{}
