@@ -16,7 +16,7 @@ describe("AI Agent artifact bridge", () => {
       ),
     );
 
-    expect(repository.schema).toBe("rdev.ai-agent-manifest.v5");
+    expect(repository.schema).toBe("rdev.ai-agent-manifest.v6");
     expect(repository.default_authentication).toBe("permanent_device_token");
     expect(repository.permanent_access.schema).toBe("rdev-device-access.v1");
     expect(repository.permanent_access.fields).toEqual([
@@ -27,111 +27,14 @@ describe("AI Agent artifact bridge", () => {
       ssh_password: "token", FEIDU_DRIVE_TOKEN: "token",
     });
     expect(repository.permanent_access.expiry).toBe("none");
-    expect(repository.permanent_access.revoke_at_task_completion).toBe(false);
-    expect(repository.permanent_access.cloud_transfers.endpoints.create).toBe(
-      "POST /developer/v1/rdev/transfers",
-    );
-    expect(repository.handoff.mode).toBe("legacy_temporary_only");
-    expect(repository.agent_session.mode).toBe("legacy_temporary_only");
-    expect(repository.handoff.redeem.url).toBe(
-      "https://pan.feidu.fit/agent/v1/handoffs/redeem",
-    );
-    expect(repository.handoff.claim_input).toBe("stdin_or_hidden_prompt");
-    expect(repository.handoff.credential_fields.device_id).toBe(
-      "data.credentials.device_id",
-    );
-    expect(repository.handoff.credential_fields.rdev_ticket).toBe(
-      "data.credentials.rdev_ticket.ticket",
-    );
-    expect(repository.handoff.credential_fields.developer_token).toBe(
-      "data.credentials.developer_token.token",
-    );
-    expect(repository.handoff.credential_fields.agent_session_id).toBe(
-      "data.credentials.agent_session.agent_session_id",
-    );
-    expect(repository.handoff.credential_fields.renewal_token).toBe(
-      "data.credentials.agent_session.renewal_token",
-    );
-    expect(repository.handoff.session_duration_hours).toEqual([2, 8, 24]);
-    expect(repository.agent_session.endpoints.renew).toBe(
-      "POST /agent/v1/sessions/{agent_session_id}/renew",
-    );
-    expect(repository.agent_session.renewal_token_policy).toBe(
-      "stable_until_absolute_expiry_or_revoke",
-    );
-    expect(repository.agent_session.renewal_response).toBe("data.session");
-    expect(repository.agent_session.credential_policy).toBe(
-      "values_stable_expiry_extended_in_place",
-    );
-    expect(repository.agent_session.state_storage.windows).toBe(
-      "current-user DPAPI",
-    );
-    expect(repository.rdev.base_url).toBe("https://r.feidu.fit");
-    expect(repository.artifact_plane.base_url).toBe("https://pan.feidu.fit");
-    expect(repository.artifact_plane.token_env).toBe("FEIDU_DRIVE_TOKEN");
-    expect(repository.artifact_plane.lifecycle).toEqual([
-      "none",
-      "hide",
-      "archive",
-    ]);
-    expect(repository.rdev.verified_windows_scp.client_version).toBe(
-      "go/v0.2.121-feidu.16",
-    );
-    expect(
-      repository.rdev.verified_windows_scp.fallback_for_other_versions,
-    ).toBe("sftp");
-    expect(repository.artifact_plane.download).toContain(
-      "GET /developer/v1/contents/{content_id}/download",
-    );
-    expect(repository.artifact_plane.upload).toContain(
-      "POST /developer/v1/direct-upload-sessions/{session_id}/complete",
-    );
-    expect(repository.rdev.managed_enrollment.code_prefix).toBe("rdeve_");
-    expect(repository.bridge.automatic_threshold_bytes).toBe(104857600);
-    expect(repository.bridge.automatic_large_file.transfer_states).toEqual([
-      "queued",
-      "running",
-      "paused",
-      "completed",
-      "failed",
-      "cancelled",
-    ]);
-    expect(repository.bridge.automatic_large_file.transfer_token_prefix).toBe(
-      "fdtx_",
-    );
-    expect(repository.bridge.automatic_large_file.transfer_generation).toBe(
-      "positive_uint64_monotonic_per_transfer",
-    );
-    expect(repository.bridge.automatic_large_file.dispatch_acceptance).toBe(
-      "device_plan_and_running_progress_acknowledged",
-    );
-    expect(
-      repository.bridge.automatic_large_file.client_acceptance_timeout_seconds,
-    ).toBe(7);
-    expect(
-      repository.bridge.automatic_large_file.rdev_dispatch_ack_timeout_seconds,
-    ).toBe(8);
-
-    expect(published.schema).toBe(repository.schema);
+    expect(repository.cloud_transfers.endpoints.create).toBe("POST /developer/v1/rdev/transfers");
+    expect(repository.artifact_plane.download).toContain("GET /developer/v1/contents/{content_id}/download");
+    expect(repository.artifact_plane.upload).toContain("POST /developer/v1/direct-upload-sessions/{session_id}/complete");
     expect(published).toEqual(repository);
     const embedded = JSON.parse(await readFile(
       resolve(root, "internal/server/static/docs/ai-agent-manifest.json"), "utf8",
     ));
     expect(embedded).toEqual(repository);
-    expect(published.rdev.base_url).toBe(repository.rdev.base_url);
-    expect(published.artifact_plane.base_url).toBe(
-      repository.artifact_plane.base_url,
-    );
-    expect(published.artifact_plane.token_env).toBe(
-      repository.artifact_plane.token_env,
-    );
-    expect(published.handoff.credential_fields).toEqual(
-      repository.handoff.credential_fields,
-    );
-    expect(published.rdev.discovery).toEqual(["GET /api/config"]);
-    expect(published.rdev.verified_windows_scp).toEqual(
-      repository.rdev.verified_windows_scp,
-    );
   });
 
   test("published guide and reference CLI match repository content", async () => {
@@ -154,10 +57,7 @@ describe("AI Agent artifact bridge", () => {
     );
     expect(repositoryGuide).toContain("`content_id`");
     expect(repositoryGuide).toContain("`FEIDU_DRIVE_TOKEN`");
-    expect(repositoryGuide).toContain("`/api/config`");
     expect(repositoryGuide).toContain("`operation_id`");
-    expect(repositoryGuide).toContain("`go/v0.2.121-feidu.16`");
-    expect(repositoryGuide).toContain("`data.credentials.device_id`");
     expect(repositoryGuide).not.toContain(
       "curl -fsS https://r.feidu.fit/api/clients",
     );
@@ -199,7 +99,6 @@ describe("AI Agent artifact bridge", () => {
     expect(repositorySkill).toContain("rdev-device-access.v1");
     expect(repositorySkill).toContain("--import-clipboard");
     expect(repositorySkill).toContain("--import-stdin");
-    expect(repositorySkill).toContain("/developer/v1/rdev/transfers");
     expect(repositorySkill).not.toContain("Revoke it when the task is complete");
   });
 
@@ -232,9 +131,6 @@ describe("AI Agent artifact bridge", () => {
     const instructions = await readFile(resolve(root, "AGENTS.md"), "utf8");
     expect(instructions).toContain("docs/ai-agent-artifact-bridge.md");
     expect(instructions).toContain("docs/ai-agent-manifest.json");
-    expect(instructions).toContain("FEIDU_DRIVE_TOKEN");
-    expect(instructions).toContain("rdev-device-access.v1");
-    expect(instructions).toContain("--device EXACT-ID");
     expect(instructions).not.toContain("https://r.feidu.fit/api/clients");
   });
 

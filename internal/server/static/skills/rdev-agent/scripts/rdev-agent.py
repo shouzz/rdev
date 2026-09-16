@@ -149,22 +149,43 @@ def windows_clipboard(expected: str | None = None) -> str:
         user32.CloseClipboard()
 
 
+def parse_access_text(raw: str) -> dict:
+    """Accept copied JSON or the complete Feidu handoff, without parsing prose."""
+    if len(raw) > 65536:
+        raise AgentError("device access input is too large")
+    raw = raw.lstrip("\ufeff").strip()
+    try:
+        return validate_access(json.loads(raw))
+    except (ValueError, TypeError):
+        pass
+    blocks = re.findall(r"^```(?:json)?[ \t]*\r?\n(.*?)^```[ \t]*\r?$", raw, re.MULTILINE | re.DOTALL)
+    candidates = []
+    for block in blocks:
+        try:
+            data = json.loads(block)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("schema") == ACCESS_SCHEMA:
+            candidates.append(data)
+    if len(candidates) != 1:
+        raise AgentError("copy one device's complete handoff or access JSON")
+    return validate_access(candidates[0])
+
+
 def command_import(args) -> int:
     raw = windows_clipboard() if args.import_clipboard else sys.stdin.read(65537)
-    try:
-        if len(raw) > 65536:
-            raise AgentError("device access input is too large")
-        data = validate_access(json.loads(raw))
-    except (ValueError, TypeError):
-        raise AgentError("device access input is invalid JSON") from None
+    data = parse_access_text(raw)
     if args.device and args.device != data["device_id"]:
         raise AgentError("imported device identity does not match --device")
     path = args.state or device_state_path(data["device_id"])
     with state_lock(path):
         if path.exists():
             old = read_state(path)
-            if old != data and not args.replace:
-                raise AgentError("saved access differs; use --replace only after explicitly resetting or changing this device authorization")
+            same_destination = permanent(old) and all(
+                old.get(key) == data[key] for key in ACCESS_FIELDS - {"token"}
+            )
+            if old != data and not same_destination and not args.replace:
+                raise AgentError("saved device destination differs; use --replace to change it")
         write_state(path, data)
     if args.import_clipboard:
         with contextlib.suppress(AgentError):
@@ -974,7 +995,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="", help="select a saved device by its exact ID")
     imports = parser.add_mutually_exclusive_group()
     imports.add_argument("--import-clipboard", action="store_true", help="import copied device access without printing credentials (Windows)")
-    imports.add_argument("--import-stdin", action="store_true", help="import device access JSON from a protected stdin channel")
+    imports.add_argument("--import-stdin", action="store_true", help="import copied handoff text or device access JSON from stdin")
     parser.add_argument("--replace", action="store_true", help="explicitly replace an existing saved device authorization")
     commands = parser.add_subparsers(dest="command")
     start = commands.add_parser("start", help="legacy temporary claim only")

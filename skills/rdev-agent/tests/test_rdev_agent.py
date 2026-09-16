@@ -432,22 +432,47 @@ class PermanentAccessTest(unittest.TestCase):
         else:
             self.assertEqual(self.state.stat().st_mode & 0o777, 0o600)
 
-    def test_import_exact_schema_and_explicit_replacement(self):
+    def test_import_token_refresh_and_destination_replacement(self):
         data = self.save_access()
         data["token"] = "fdpat_" + "n" * 43
         code, output, errors = self.run_main(["--import-stdin"], json.dumps(data))
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(rdev_agent.read_state(self.state), data)
+        self.assertNotIn(data["token"], output + errors)
+        data["ssh_host"] = "other.example"
+        code, _, errors = self.run_main(["--import-stdin"], json.dumps(data))
         self.assertEqual(code, 2)
         self.assertIn("--replace", errors)
-        self.assertNotIn(data["token"], output + errors)
+        self.assertEqual(rdev_agent.read_state(self.state)["ssh_host"], "127.0.0.1")
         code, _, errors = self.run_main(["--import-stdin", "--replace"], json.dumps(data))
         self.assertEqual((code, errors), (0, ""))
         data["claim"] = "not allowed"
         code, _, _ = self.run_main(["--import-stdin", "--replace"], json.dumps(data))
         self.assertEqual(code, 2)
 
+    def test_complete_handoff_import_and_reuse(self):
+        data = self.access()
+        handoff = "Device DEVICE-EXACT: SSH, files, terminal and drive.\nTool: https://r.feidu.fit/skills/rdev-agent/SKILL.md\n\n```json\n" + json.dumps(data, indent=2) + "\n```"
+        for raw in (handoff, "\ufeff" + handoff.replace("\n", "\r\n") + "\r\nExtra prose\r\n", json.dumps(data)):
+            code, output, errors = self.run_main(["--import-stdin"], raw)
+            self.assertEqual((code, errors), (0, ""))
+            self.assertEqual(rdev_agent.read_state(self.state), data)
+            self.assertNotIn(data["token"], output + errors)
+        self.assertEqual(Handler.requests, [])
+
+    def test_ambiguous_or_malformed_handoff_does_not_overwrite(self):
+        data = self.save_access()
+        before = self.state.read_bytes()
+        block = "```json\n" + json.dumps(data) + "\n```\n"
+        for raw in (block + block, "```json\n{\n```", "x" * 65537):
+            code, output, errors = self.run_main(["--import-stdin"], raw)
+            self.assertEqual(code, 2)
+            self.assertEqual(self.state.read_bytes(), before)
+            self.assertNotIn(data["token"], output + errors)
+
     def test_clipboard_import_clears_only_successful_input_without_output(self):
         data = self.access()
-        raw = json.dumps(data)
+        raw = "Device access\n\n```json\n" + json.dumps(data) + "\n```"
         with mock.patch.object(rdev_agent, "windows_clipboard", return_value=raw) as clipboard:
             code, output, errors = self.run_main(["--import-clipboard"])
         self.assertEqual((code, errors), (0, ""))

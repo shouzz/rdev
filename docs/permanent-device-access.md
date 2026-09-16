@@ -1,6 +1,6 @@
 # Permanent device access
 
-Feidu grants one permanent `fdpat_` per device after the account and directory are authorized. The one-copy configuration is `rdev-device-access.v1`; its seven fields and import commands are documented in [the artifact bridge](ai-agent-artifact-bridge.md). The same saved token supplies SSH/SFTP and the Feidu developer API. Normal connection loss, a new AI conversation, client restart, or server restart does not rotate or expire it.
+Feidu grants one permanent `fdpat_` per device after the account and directory are authorized. The one-copy configuration is `rdev-device-access.v1`; its seven fields are listed in [the manifest](ai-agent-manifest.json) and import commands in [the artifact bridge](ai-agent-artifact-bridge.md). The same saved token supplies SSH/SFTP and the Feidu developer API. Normal connection loss, a new AI conversation, client restart, or server restart does not rotate or expire it.
 
 ## Server contract
 
