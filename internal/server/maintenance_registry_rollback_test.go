@@ -115,3 +115,69 @@ func TestMaintenanceRegistryRollbackPreservesLatestStateAndLoadsV3(t *testing.T)
 		t.Fatal("converted v3 registry unexpectedly retained fixed-token authorization")
 	}
 }
+
+func TestPermanentEnrollmentRollbackKeepsDeviceTokensAndInviteState(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("offline tool runs on Linux")
+	}
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 unavailable")
+	}
+	_, file, _, _ := runtime.Caller(0)
+	script := filepath.Join(filepath.Dir(file), "..", "..", "scripts", "maintenance-registry-rollback.py")
+	path := filepath.Join(t.TempDir(), "registry.json")
+	s := maintenanceTestServer(t, path)
+	used := createEnrollmentForTest(t, s, "feidu-user:42", 0)
+	device := redeemEnrollmentForTest(t, s, used.Code, "preserved-device")
+	_, grant := maintenanceTestRandom(t)
+	maintenanceTestInstall(t, s, device.DeviceID, grant)
+	active := createEnrollmentForTest(t, s, "feidu-user:42", 0)
+	revoked := createEnrollmentForTest(t, s, "feidu-user:42", 0)
+	if err = s.revokeEnrollment(revoked.EnrollmentID); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expected managedDeviceRegistry
+	if err = json.Unmarshal(before, &expected); err != nil {
+		t.Fatal(err)
+	}
+	expected.Schema = managedDeviceRegistryV4
+	for i := range expected.Enrollments {
+		expected.Enrollments[i].ExpiresAt = "9999-12-31T23:59:59Z"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, python, script, path, "--target-schema", "v4").CombinedOutput()
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	var result struct {
+		Backup  string `json:"backup"`
+		Removed int    `json:"removed_maintenance_authorizations"`
+	}
+	if json.Unmarshal(output, &result) != nil || result.Removed != 0 {
+		t.Fatal("conversion removed fixed tokens")
+	}
+	backup, err := os.ReadFile(result.Backup)
+	if err != nil || !bytes.Equal(backup, before) {
+		t.Fatal("backup differs")
+	}
+	data, _ := os.ReadFile(path)
+	var actual managedDeviceRegistry
+	if json.Unmarshal(data, &actual) != nil || !reflect.DeepEqual(expected, actual) {
+		t.Fatal("conversion changed unrelated state")
+	}
+	reloaded := maintenanceTestServer(t, path)
+	if ok, _ := reloaded.authorizeManagedRegistration(device.DeviceID, device.DeviceSecret); !ok {
+		t.Fatal("device identity lost")
+	}
+	for _, item := range []struct{ id, state string }{{used.EnrollmentID, "consumed"}, {active.EnrollmentID, "active"}, {revoked.EnrollmentID, "revoked"}} {
+		if getEnrollmentStatusForTest(t, reloaded, item.id).State != item.state {
+			t.Fatal("invitation state lost")
+		}
+	}
+}

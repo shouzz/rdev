@@ -85,7 +85,7 @@ class RegistryRollbackTests(unittest.TestCase):
         self.assertEqual(9, json.loads(self.registry.read_bytes())["devices"][1]["credential_version"])
 
     def test_invalid_or_future_input_never_changes_registry_or_creates_backup(self):
-        future = fixture(); future["schema"] = "rdev-device-registry.v5"
+        future = fixture(); future["schema"] = "rdev-device-registry.v6"
         unknown = fixture(); unknown["devices"][0]["future_field"] = "unrepresentable"
         invalid_v3 = fixture(); invalid_v3["schema"] = rollback.SCHEMA_V3
         cases = [b'{"schema":"first","schema":"second"}', b'{"schema":NaN}', b'{"broken":',

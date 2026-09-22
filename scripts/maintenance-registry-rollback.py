@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline v4 -> v3 registry conversion. Stop RDev before invoking this tool."""
+"""Offline v5/v4 -> v4/v3 registry conversion. Stop RDev before invoking this tool."""
 
 import argparse
 import datetime
@@ -14,6 +14,7 @@ import uuid
 
 SCHEMA_V3 = "rdev-device-registry.v3"
 SCHEMA_V4 = "rdev-device-registry.v4"
+SCHEMA_V5 = "rdev-device-registry.v5"
 ROOT_FIELDS = {"schema", "devices", "enrollments"}
 DEVICE_FIELDS = {
     "id", "owner_subject", "secret_hash", "credential_version", "created_at",
@@ -42,7 +43,9 @@ def reject_constant(_value):
     raise RollbackError("registry contains a non-JSON numeric constant")
 
 
-def prepare_registry(raw):
+def prepare_registry(raw, target=SCHEMA_V3):
+    if target not in (SCHEMA_V3, SCHEMA_V4):
+        raise RollbackError("target must be v3 or v4")
     try:
         registry = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object, parse_constant=reject_constant)
     except (ValueError, UnicodeError):
@@ -50,8 +53,8 @@ def prepare_registry(raw):
     if not isinstance(registry, dict) or set(registry) != ROOT_FIELDS:
         raise RollbackError("registry top-level fields are not compatible with v3")
     schema = registry["schema"]
-    if schema not in (SCHEMA_V3, SCHEMA_V4):
-        raise RollbackError("only v3 and v4 registries are supported")
+    if schema not in (SCHEMA_V3, SCHEMA_V4, SCHEMA_V5):
+        raise RollbackError("only v3, v4 and v5 registries are supported")
     for field in ("devices", "enrollments"):
         if not isinstance(registry[field], list):
             raise RollbackError("registry record collections must be JSON arrays")
@@ -77,13 +80,22 @@ def prepare_registry(raw):
             raise RollbackError("enrollment is missing required v3 fields")
         if not all(isinstance(value, str) for value in enrollment.values()):
             raise RollbackError("enrollment values are not compatible with v3")
-    removed = sum("maintenance_token" in device for device in registry["devices"])
-    if schema == SCHEMA_V4:
+        if enrollment["expires_at"] == "":
+            if schema != SCHEMA_V5:
+                raise RollbackError("legacy enrollment is missing its expiry")
+            # Old versions require a future timestamp. Preserve usability on
+            # rollback without restoring already consumed/revoked invitations.
+            enrollment["expires_at"] = "9999-12-31T23:59:59Z"
+    removed = 0
+    if target == SCHEMA_V3:
+        removed = sum("maintenance_token" in device for device in registry["devices"])
         for device in registry["devices"]:
             device.pop("maintenance_token", None)
         registry["schema"] = SCHEMA_V3
+    elif schema == SCHEMA_V5:
+        registry["schema"] = SCHEMA_V4
     converted = (json.dumps(registry, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    return registry, converted, removed, schema == SCHEMA_V4
+    return registry, converted, removed, schema != registry["schema"]
 
 
 def read_snapshot(path):
@@ -125,21 +137,22 @@ def private_temp(directory, content, owner=None):
     return Path(name)
 
 
-def rollback_registry(path):
+def rollback_registry(path, target=SCHEMA_V3):
     if os.name != "posix":
         raise RollbackError("run this offline tool on the Linux RDev server or WSL")
     path = Path(os.path.abspath(path))
     if path.is_symlink():
         raise RollbackError("registry path must not be a symbolic link")
     raw, original_stat = read_snapshot(path)
-    registry, converted, removed, changed = prepare_registry(raw)
-    result = {"changed": changed, "registry": str(path), "schema": SCHEMA_V3,
+    registry, converted, removed, changed = prepare_registry(raw, target)
+    result = {"changed": changed, "registry": str(path), "schema": registry["schema"],
               "devices": len(registry["devices"]), "enrollments": len(registry["enrollments"]),
               "removed_maintenance_authorizations": removed}
     if not changed:
         return result
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = path.with_name(path.name + ".v4-backup-" + stamp + "-" + uuid.uuid4().hex + ".json")
+    source_version = json.loads(raw)["schema"].rsplit(".", 1)[1]
+    backup = path.with_name(path.name + "." + source_version + "-backup-" + stamp + "-" + uuid.uuid4().hex + ".json")
     temporary = private_temp(path.parent, raw)
     try:
         # Publishing a fully written inode is atomic and cannot overwrite a backup.
@@ -161,11 +174,12 @@ def rollback_registry(path):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Offline RDev registry v4 -> v3 rollback. Stop RDev first. This tool never stops or starts services.")
+    parser = argparse.ArgumentParser(description="Offline RDev registry rollback. Stop RDev first. This tool never stops or starts services.")
     parser.add_argument("registry", help="exact managed_devices.json path on the stopped server")
+    parser.add_argument("--target-schema", choices=("v3", "v4"), default="v3", help="v4 keeps fixed device tokens for feidu.19/20")
     args = parser.parse_args(argv)
     try:
-        result = rollback_registry(args.registry)
+        result = rollback_registry(args.registry, "rdev-device-registry." + args.target_schema)
     except RollbackError as error:
         print("registry rollback failed: " + str(error), file=sys.stderr)
         return 1

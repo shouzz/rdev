@@ -33,6 +33,7 @@ const (
 	managedDeviceRegistryV2   = "rdev-device-registry.v2"
 	managedDeviceRegistryV3   = "rdev-device-registry.v3"
 	managedDeviceRegistryV4   = "rdev-device-registry.v4"
+	managedDeviceRegistryV5   = "rdev-device-registry.v5"
 )
 
 var (
@@ -177,9 +178,9 @@ func (s *Server) HandleEnrollmentCreateAPI(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "subject is required and must not exceed 128 bytes", http.StatusBadRequest)
 		return
 	}
-	lifetime := time.Duration(input.ExpiresInSecond) * time.Second
-	if lifetime < enrollmentMinLifetime || lifetime > enrollmentMaxLifetime {
-		http.Error(w, "expiresInSeconds must be between 60 and 900", http.StatusBadRequest)
+	// Validate seconds before converting to Duration so large inputs cannot overflow.
+	if input.ExpiresInSecond != 0 && (input.ExpiresInSecond < int64(enrollmentMinLifetime/time.Second) || input.ExpiresInSecond > int64(enrollmentMaxLifetime/time.Second)) {
+		http.Error(w, "expiresInSeconds must be 0 (no expiry) or between 60 and 900", http.StatusBadRequest)
 		return
 	}
 	code, enrollmentID, err := newEnrollmentValue()
@@ -188,7 +189,10 @@ func (s *Server) HandleEnrollmentCreateAPI(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	now := s.enrollmentCurrentTime()
-	expiresAt := now.Add(lifetime).UTC().Truncate(time.Second)
+	var expiresAt time.Time
+	if input.ExpiresInSecond > 0 {
+		expiresAt = now.Add(time.Duration(input.ExpiresInSecond) * time.Second).UTC().Truncate(time.Second)
+	}
 	hash := sha256.Sum256([]byte(code))
 
 	s.enrollmentMu.Lock()
@@ -212,12 +216,13 @@ func (s *Server) HandleEnrollmentCreateAPI(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Content-Type", "application/json")
+	expiresAtText, expiresAtMs := enrollmentExpiry(expiresAt)
 	_ = json.NewEncoder(w).Encode(enrollmentCreateResponse{
 		EnrollmentID: enrollmentID,
 		Code:         code,
 		JoinURL:      joinURL,
-		ExpiresAt:    expiresAt.Format(time.RFC3339),
-		ExpiresAtMs:  expiresAt.UnixMilli(),
+		ExpiresAt:    expiresAtText,
+		ExpiresAtMs:  expiresAtMs,
 	})
 }
 
@@ -335,7 +340,7 @@ func (s *Server) HandleEnrollmentRedeemAPI(w http.ResponseWriter, r *http.Reques
 	now := s.enrollmentCurrentTime()
 	s.enrollmentMu.Lock()
 	invite, ok := s.enrollments[hash]
-	if !ok || !invite.ExpiresAt.After(now) || !invite.ConsumedAt.IsZero() || !invite.RevokedAt.IsZero() {
+	if !ok || invite.expired(now) || !invite.ConsumedAt.IsZero() || !invite.RevokedAt.IsZero() {
 		s.enrollmentMu.Unlock()
 		http.Error(w, "invalid or expired enrollment", http.StatusUnauthorized)
 		return
@@ -519,6 +524,17 @@ func (s *Server) enrollmentByIDLocked(enrollmentID string) (enrollmentInvite, bo
 	return enrollmentInvite{}, false
 }
 
+func (invite enrollmentInvite) expired(now time.Time) bool {
+	return !invite.ExpiresAt.IsZero() && !invite.ExpiresAt.After(now)
+}
+
+func enrollmentExpiry(expiresAt time.Time) (string, int64) {
+	if expiresAt.IsZero() {
+		return "", 0
+	}
+	return expiresAt.UTC().Format(time.RFC3339), expiresAt.UnixMilli()
+}
+
 func enrollmentStatusFor(invite enrollmentInvite, now time.Time) enrollmentStatusResponse {
 	state := "active"
 	switch {
@@ -526,13 +542,14 @@ func enrollmentStatusFor(invite enrollmentInvite, now time.Time) enrollmentStatu
 		state = "revoked"
 	case !invite.ConsumedAt.IsZero():
 		state = "consumed"
-	case !invite.ExpiresAt.After(now):
+	case invite.expired(now):
 		state = "expired"
 	}
+	expiresAtText, expiresAtMs := enrollmentExpiry(invite.ExpiresAt)
 	response := enrollmentStatusResponse{
 		EnrollmentID: invite.ID, Subject: invite.Subject, State: state,
 		CreatedAt: invite.CreatedAt.UTC().Format(time.RFC3339),
-		ExpiresAt: invite.ExpiresAt.UTC().Format(time.RFC3339), ExpiresAtMs: invite.ExpiresAt.UnixMilli(),
+		ExpiresAt: expiresAtText, ExpiresAtMs: expiresAtMs,
 		IssuedDeviceID: invite.IssuedDeviceID,
 	}
 	if !invite.ConsumedAt.IsZero() {
@@ -815,7 +832,7 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 	if err = decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return errors.New("decode managed device registry: trailing data")
 	}
-	if registry.Schema != managedDeviceRegistryV2 && registry.Schema != managedDeviceRegistryV3 && registry.Schema != managedDeviceRegistryV4 {
+	if registry.Schema != managedDeviceRegistryV2 && registry.Schema != managedDeviceRegistryV3 && registry.Schema != managedDeviceRegistryV4 && registry.Schema != managedDeviceRegistryV5 {
 		return errors.New("managed device registry schema is invalid")
 	}
 	for _, record := range registry.Devices {
@@ -854,7 +871,7 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 			return errors.New("managed device registry contains duplicate ids")
 		}
 		if record.MaintenanceToken != nil {
-			if registry.Schema != managedDeviceRegistryV4 || normalizeMaintenanceGrant(record.MaintenanceToken) != nil {
+			if (registry.Schema != managedDeviceRegistryV4 && registry.Schema != managedDeviceRegistryV5) || normalizeMaintenanceGrant(record.MaintenanceToken) != nil {
 				return errors.New("managed device maintenance grant is invalid")
 			}
 			for _, other := range s.managedDevices {
@@ -891,12 +908,12 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 		if parseErr != nil {
 			return errors.New("enrollment registry created_at is invalid")
 		}
-		expiresAt, parseErr := parseRegistryTime(record.ExpiresAt, true)
-		if parseErr != nil || !expiresAt.After(createdAt) {
+		expiresAt, parseErr := parseRegistryTime(record.ExpiresAt, registry.Schema != managedDeviceRegistryV5)
+		if parseErr != nil || (!expiresAt.IsZero() && !expiresAt.After(createdAt)) || (expiresAt.IsZero() && record.ExpiresAt != "") {
 			return errors.New("enrollment registry expires_at is invalid")
 		}
 		consumedAt, parseErr := parseRegistryTime(record.ConsumedAt, false)
-		if parseErr != nil || (!consumedAt.IsZero() && (consumedAt.Before(createdAt) || !consumedAt.Before(expiresAt))) {
+		if parseErr != nil || (!consumedAt.IsZero() && (consumedAt.Before(createdAt) || (!expiresAt.IsZero() && !consumedAt.Before(expiresAt)))) {
 			return errors.New("enrollment registry consumed_at is invalid")
 		}
 		revokedAt, parseErr := parseRegistryTime(record.RevokedAt, false)
@@ -969,9 +986,13 @@ func (s *Server) persistManagedDeviceRegistryLocked() error {
 	})
 	for _, codeHash := range enrollmentHashes {
 		invite := s.enrollments[codeHash]
+		expiresAtText, _ := enrollmentExpiry(invite.ExpiresAt)
+		if invite.ExpiresAt.IsZero() {
+			registry.Schema = managedDeviceRegistryV5
+		}
 		record := enrollmentRegistryRecord{
 			ID: invite.ID, Subject: invite.Subject, CodeHash: hex.EncodeToString(codeHash[:]),
-			CreatedAt: invite.CreatedAt.UTC().Format(time.RFC3339), ExpiresAt: invite.ExpiresAt.UTC().Format(time.RFC3339),
+			CreatedAt: invite.CreatedAt.UTC().Format(time.RFC3339), ExpiresAt: expiresAtText,
 			IssuedDeviceID: invite.IssuedDeviceID,
 		}
 		if !invite.ConsumedAt.IsZero() {
