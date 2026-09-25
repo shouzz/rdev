@@ -25,6 +25,8 @@
       "FEIDU_DRIVE_TOKEN": "token"
     },
     "tool": "/skills/rdev-agent/scripts/rdev-agent.py",
+    "tool_sha256": "7a1d2c08fadecbf1abf988a50349b7959ad40df04eb659c3758c29f3e7d7c83c",
+    "stdin_encoding": "utf-8; utf-16/utf-32 require BOM",
     "skill": "/skills/rdev-agent/SKILL.md",
     "input": "access_json_or_handoff_with_one_json_code_block"
   },

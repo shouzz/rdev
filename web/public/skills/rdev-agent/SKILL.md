@@ -11,6 +11,8 @@ description: RDev 远程设备操作：SSH、文件传输、端口转发和飞�
 Windows：`python rdev-agent.py --import-clipboard`；其他系统：`python3 rdev-agent.py --import-stdin`。
 支持完整交接文本或 `rdev-device-access.v1` JSON，导入后自动保存、后续自动复用。
 
+Windows 优先从剪贴板导入。脚本传输使用 UTF-8 字节；stdin 也接受带 BOM 的 UTF-16/UTF-32，不依赖 `PYTHONIOENCODING`。PowerShell 管道发送前需设 `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`，不要用默认代码页传中文。可用 `--device '准确设备ID' --import-stdin` 核对身份；非法编码或身份不符不会覆盖已存配置。不得输出 Token 或自动猜测、修正设备名。
+
 ```bash
 python rdev-agent.py --device DEVICE-ID ssh -- hostname
 python rdev-agent.py --device DEVICE-ID sftp

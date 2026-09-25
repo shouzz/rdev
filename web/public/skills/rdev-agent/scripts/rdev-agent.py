@@ -42,6 +42,7 @@ TERMINAL_TRANSFER_STATES = {"completed", "failed", "cancelled"}
 WINDOWS_STATE_MAGIC = b"feidu.rdev-agent-state.dpapi.v1\x00"
 LEASE_MAINTENANCE_INTERVAL_SECONDS = 60.0
 PROCESS_TERMINATE_TIMEOUT_SECONDS = 5.0
+ACCESS_INPUT_MAX_BYTES = 65536
 
 
 class AgentError(RuntimeError):
@@ -75,7 +76,9 @@ def validate_access(data: dict) -> dict:
     if not isinstance(data, dict) or set(data) != ACCESS_FIELDS or data.get("schema") != ACCESS_SCHEMA:
         raise AgentError("device access must contain exactly the seven rdev-device-access.v1 fields")
     device = data["device_id"]
-    if not isinstance(device, str) or not device or len(device) > 256 or any(c.isspace() or c in "@:/\\\x00" for c in device) or device.startswith("-"):
+    if (not isinstance(device, str) or not device or len(device) > 128
+            or any(ord(c) < 32 or ord(c) == 127 or c.isspace() or c in "@:/\\\ufffd" or 0xD800 <= ord(c) <= 0xDFFF for c in device)
+            or len(device.encode("utf-8")) > 128 or device.startswith("-")):
         raise AgentError("device access has an invalid device_id")
     host = data["ssh_host"]
     if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9._:-]+", host) or host.startswith("-"):
@@ -172,8 +175,34 @@ def parse_access_text(raw: str) -> dict:
     return validate_access(candidates[0])
 
 
+def read_access_stdin() -> str:
+    """Decode bytes independently of Python's Windows console/code-page settings."""
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is None:
+        # Embedded callers may provide an already decoded Unicode text stream.
+        raw = sys.stdin.read(ACCESS_INPUT_MAX_BYTES + 1)
+        try:
+            payload = raw.encode("utf-8", errors="strict")
+        except UnicodeError:
+            raise AgentError("device access input contains invalid Unicode") from None
+    else:
+        payload = stream.read(ACCESS_INPUT_MAX_BYTES + 1)
+    if len(payload) > ACCESS_INPUT_MAX_BYTES:
+        raise AgentError("device access input is too large")
+    # Check UTF-32 before UTF-16 because their little-endian BOMs overlap.
+    encoding = "utf-8-sig"
+    if payload.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        encoding = "utf-32"
+    elif payload.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    try:
+        return payload.decode(encoding, errors="strict")
+    except UnicodeError:
+        raise AgentError("device access input must be UTF-8, or UTF-16/UTF-32 with a BOM; use --import-clipboard on Windows") from None
+
+
 def command_import(args) -> int:
-    raw = windows_clipboard() if args.import_clipboard else sys.stdin.read(65537)
+    raw = windows_clipboard() if args.import_clipboard else read_access_stdin()
     data = parse_access_text(raw)
     if args.device and args.device != data["device_id"]:
         raise AgentError("imported device identity does not match --device")
@@ -190,7 +219,8 @@ def command_import(args) -> int:
     if args.import_clipboard:
         with contextlib.suppress(AgentError):
             windows_clipboard(expected=raw)
-    print(json.dumps(safe_status(data, {}), ensure_ascii=False))
+    # ASCII JSON also keeps redirected status safe under legacy console encodings.
+    print(json.dumps(safe_status(data, {}), ensure_ascii=True))
     return 0
 
 
