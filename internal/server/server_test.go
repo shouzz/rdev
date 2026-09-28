@@ -15,6 +15,22 @@ import (
 	"rdev/internal/protocol"
 )
 
+func TestWindowsLaunchersAreServedWithoutStaleCaching(t *testing.T) {
+	s := &Server{}
+	for _, path := range []string{"/run.cmd", "/run-cmd.ps1", "/run.ps1"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			w := httptest.NewRecorder()
+			s.StaticHandler().ServeHTTP(w, httptest.NewRequest(method, path, nil))
+			if w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("X-Content-Type-Options") != "nosniff" {
+				t.Fatalf("%s %s: %d %v", method, path, w.Code, w.Header())
+			}
+			if path == "/run.cmd" && w.Header().Get("Content-Disposition") != `attachment; filename="run.cmd"` {
+				t.Fatal("CMD launcher must download as a file")
+			}
+		}
+	}
+}
+
 func TestProxySessionHistoryReplayAndLimit(t *testing.T) {
 	sess := &ProxySession{}
 	sess.BroadcastOutput([]byte("hello "))

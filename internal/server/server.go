@@ -2027,7 +2027,19 @@ func (s *Server) StaticHandler() http.Handler {
 	if err != nil {
 		return http.NotFoundHandler()
 	}
-	return http.FileServer(http.FS(sub))
+	files := http.FileServer(http.FS(sub))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/run.cmd", "/run-cmd.ps1", "/run.ps1":
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			if r.URL.Path == "/run.cmd" {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Content-Disposition", `attachment; filename="run.cmd"`)
+			}
+		}
+		files.ServeHTTP(w, r)
+	})
 }
 
 // StaticPageHandler serves a named embedded UI page without exposing the .html suffix.

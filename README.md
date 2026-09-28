@@ -201,6 +201,9 @@ go test ./...
 
 ## Windows 兼容性
 
+- Windows 启动入口见 [CMD / PowerShell 启动说明](docs/windows-launchers.md)。网页明确选择 CMD 或 PowerShell；命令使用系统绝对路径，不依赖 PATH。也可下载 `/run.cmd`，运行后粘贴邀请码，默认保持在线。
+- 脚本最低要求 PowerShell 5.1。Windows 7 SP1 需安装 .NET Framework 4.8、WMF 5.1，以及有效的 TLS 1.2 / 根证书更新。不得关闭证书验证；未更新的原生 PowerShell 2.0 会明确拒绝。
+- Windows 7/8/8.1 自动选择单独的 `go-win7 patched-1.26.4` 32/64 位客户端，并核对固定 SHA-256；普通 Go 构建不能替代兼容构建。当前已完成现代 Windows 上的真实注册回归，Win7 实机验收仍需单独进行。
 - Windows 10/11 的实验 Rust 客户端优先使用 `portable-pty`/ConPTY，失败后退回 pipe shell。
 - Windows 10 build 17763（1809）之前没有 ConPTY；`run.ps1` 会自动下载 WinPTY 后再启动交互终端。
 - 原生 32 位 Windows 会自动下载 `rdev-client-windows-386.exe`；32 位 PowerShell 运行在 64 位 Windows 上仍会正确下载其原生 `amd64`/`arm64` 客户端。

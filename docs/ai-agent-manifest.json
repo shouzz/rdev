@@ -1,6 +1,14 @@
 {
   "schema": "rdev.ai-agent-manifest.v6",
   "default_authentication": "permanent_device_token",
+  "windows_launchers": {
+    "cmd": "/run.cmd",
+    "powershell": "/run-cmd.ps1",
+    "minimum_powershell": "5.1",
+    "legacy_windows_prerequisites": "Windows 7 SP1, .NET 4.8, WMF 5.1, TLS 1.2",
+    "legacy_windows_runtime_acceptance": "pending_real_windows7",
+    "credential_transport": "process_environment_or_interactive_prompt"
+  },
   "permanent_access": {
     "schema": "rdev-device-access.v1",
     "fields": [

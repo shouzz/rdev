@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$ServerBinary,
-    [Parameter(Mandatory=$true)][string]$ClientBinary
+    [Parameter(Mandatory=$true)][string]$ClientBinary,
+    [ValidateSet('', 'amd64', '386')][string]$LegacyArch = ''
 )
 # Windows PowerShell 5.1 integration test with real published clients. Only the
 # startup folder and per-installation user directory are redirected into QA.
@@ -11,6 +12,8 @@ $ClientBinary = (Resolve-Path -LiteralPath $ClientBinary).Path
 $OriginalTemp = $env:TEMP
 $OriginalLocal = $env:LOCALAPPDATA
 $OriginalUpdate = $env:RDEV_AUTO_UPDATE
+$OriginalArch = $env:PROCESSOR_ARCHITECTURE
+$OriginalNativeArch = $env:PROCESSOR_ARCHITEW6432
 $Root = Join-Path $OriginalTemp ('rdev-enrollment-qa-' + [Guid]::NewGuid().ToString('N'))
 $ServerProcess = $null
 New-Item -ItemType Directory -Path $Root | Out-Null
@@ -60,9 +63,24 @@ try {
     Assert-QA $Ready 'QA server did not become ready'
     . (Join-Path $PSScriptRoot '../internal/server/static/run.ps1')
     function Get-RDevStartupDirectory { return (Join-Path $env:LOCALAPPDATA 'startup') }
-    $CacheDir = Join-Path $env:TEMP ('rdev-cache/go-vqa-windows-amd64-rdev-client-windows-amd64.exe-' + $script:LocalClientRevision)
+    $Asset = 'rdev-client-windows-amd64.exe'
+    $Suffix = $script:LocalClientRevision
+    $Arch = 'amd64'
+    if ($LegacyArch) {
+        # Exercises actual pinned Win7 binaries on the current Windows host;
+        # this selection fixture does not claim Win7 OS acceptance.
+        function Get-WindowsVersion { return [Version]'6.1.7601' }
+        function Install-WinPTYIfRequired { return '' }
+        $Arch=$LegacyArch
+        $env:PROCESSOR_ARCHITECTURE=if($Arch -eq '386'){'x86'}else{'AMD64'}
+        $env:PROCESSOR_ARCHITEW6432=$null
+        $Asset='rdev-client-windows-win7-'+$Arch+'.exe'
+        $Suffix=$script:WindowsClientHashes[$Asset].Substring(0,16)
+    }
+    Assert-QA ((Get-RDevSHA256 $ClientBinary) -eq $script:WindowsClientHashes[$Asset]) 'Candidate hash does not match launcher pin'
+    $CacheDir = Join-Path $env:TEMP ('rdev-cache/go-vqa-windows-'+$Arch+'-'+$Asset+'-'+$Suffix)
     New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
-    Copy-Item -LiteralPath $ClientBinary -Destination (Join-Path $CacheDir 'rdev-client-windows-amd64.exe')
+    Copy-Item -LiteralPath $ClientBinary -Destination (Join-Path $CacheDir $Asset)
     New-Item -ItemType File -Path (Join-Path $CacheDir '.complete') | Out-Null
     New-Item -ItemType File -Path (Join-Path $CacheDir '.runtime-complete') | Out-Null
     function New-QAInvite([string]$Subject) {
@@ -130,7 +148,9 @@ try {
 
     Set-QAMachine 'machine d'
     $env:RDEV_ENROLLMENT_CODE = $Invites[0].code
-    RDev $ServerList -Version qa -Persist -Id 'SAME-COMPUTER-NAME'
+    $Rejected = $false
+    try { RDev $ServerList -Version qa -Persist -Id 'SAME-COMPUTER-NAME' } catch { $Rejected = $true }
+    Assert-QA $Rejected 'Failed enrollment did not return a terminating error'
     Assert-QA (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'RDev/identity.bin'))) 'Consumed invitation unexpectedly created identity'
     Assert-QA (-not (Test-Path -LiteralPath (Join-Path (Get-RDevStartupDirectory) 'RDev.cmd'))) 'Failed enrollment installed startup entry'
     $null = Wait-QAClients 3
@@ -142,6 +162,8 @@ try {
     $env:TEMP = $OriginalTemp
     $env:LOCALAPPDATA = $OriginalLocal
     $env:RDEV_AUTO_UPDATE = $OriginalUpdate
+    $env:PROCESSOR_ARCHITECTURE=$OriginalArch
+    $env:PROCESSOR_ARCHITEW6432=$OriginalNativeArch
     $env:RDEV_ENROLLMENT_CODE = $null
     $Headers=$null; $Token=$null; $Invites=$null; $Invite=$null; $Unused=$null; $Registry=$null
     $Resolved = (Resolve-Path -LiteralPath $Root).Path

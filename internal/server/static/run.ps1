@@ -1,19 +1,19 @@
 # rdev-client one-click runner for Windows
-# Compatible with: PowerShell 2.0+ (Win7/8/8.1/10/11)
+# Requires PowerShell 5.1+ and TLS 1.2. Win7 SP1 additionally needs .NET 4.8,
+# WMF 5.1 and a client built with go-win7; script parsing is not OS acceptance.
 #
-# One-liner:
-#   powershell -Command "iwr -useb http://SERVER/run.ps1 | iex; RDev ws://SERVER"
-#   powershell -Command "iwr -useb http://SERVER/run.ps1 | iex; RDev ws://SERVER -Id my-pc -Password secret"
-#
-# PS 2.0 (Win7/8):
-#   powershell -Command "$wc=New-Object Net.WebClient; $wc.DownloadString('http://SERVER/run.ps1') | iex; RDev ws://SERVER"
+# CMD or PowerShell: download https://r.feidu.fit/run.cmd and run it.
+
+if ($PSVersionTable.PSVersion -lt [Version]'5.1') {
+    throw 'RDev requires PowerShell 5.1. On Windows 7 SP1 install .NET 4.8 and WMF 5.1 first.'
+}
 
 # -- TLS compat ------------------------------------------------
 try {
     # Win7/PowerShell 2.0 often defaults to SSL3/TLS1.0. Force TLS1.2 before HTTPS downloads.
     [Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], 3072)
 } catch {
-    try { [Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], 768) } catch {}
+    throw 'TLS 1.2 is unavailable. Update .NET and Windows; certificate validation must remain enabled.'
 }
 
 # ── Mirror list ─────────────────────────────────────────────
@@ -41,6 +41,11 @@ $script:DefaultControlBase = 'https://r.feidu.fit'
 $script:LocalClientRevision = 'feidu-20260905-7be947e'
 $script:LocalWindowsAMD64Asset = 'rdev-client-windows-amd64.exe'
 $script:LocalWindowsAMD64SHA256 = '9a72a3dfa04696a2b2b67f13a51daa533c8dc4757dd2d92b962576d298185abd'
+$script:WindowsClientHashes = @{
+    'rdev-client-windows-amd64.exe' = $script:LocalWindowsAMD64SHA256
+    'rdev-client-windows-win7-amd64.exe' = '7e25b7a9e429b4e6aa013f272c51c12566c8c5a7cb804db7917a18135b86e239'
+    'rdev-client-windows-win7-386.exe' = 'ad2ff87eb913763bf676981eb613a164c5fac93a1a64f0b2157c7d92d37402e4'
+}
 
 function Convert-RDevMirrorUrl([string]$Mirror, [string]$Url) {
     return "https://$Mirror/$Url"
@@ -316,14 +321,14 @@ function Test-RDevManagedEnrollmentSupport([string]$Path) {
 }
 
 function Test-RDevVerifiedManagedEnrollmentClient([string]$Path, [string]$Asset) {
-    if ($Asset -ne $script:LocalWindowsAMD64Asset) { return $false }
-    return (Get-RDevSHA256 $Path) -eq $script:LocalWindowsAMD64SHA256
+    if (-not $script:WindowsClientHashes.ContainsKey($Asset)) { return $false }
+    return (Get-RDevSHA256 $Path) -eq $script:WindowsClientHashes[$Asset]
 }
 
 function Test-RDevDownloadedPackage([string]$Path, [string]$PackageKind, [string]$Asset, [bool]$ManagedEnrollment) {
     if (-not (Test-RDevPackage $Path $PackageKind)) { return $false }
     if (-not $ManagedEnrollment) { return $true }
-    if ($Asset -eq $script:LocalWindowsAMD64Asset) {
+    if ($script:WindowsClientHashes.ContainsKey($Asset)) {
         return (Test-RDevVerifiedManagedEnrollmentClient $Path $Asset)
     }
     return (Test-RDevManagedEnrollmentSupport $Path)
@@ -586,6 +591,10 @@ function global:RDev {
         $PackageKind = 'zip'
     } else {
         $Asset = "rdev-client-windows-$Arch.exe"
+        if ($WindowsMajor -gt 0 -and $WindowsMajor -lt 10) {
+            if ($Arch -notin @('amd64', '386')) { throw 'Legacy Windows architecture is unsupported.' }
+            $Asset = "rdev-client-windows-win7-$Arch.exe"
+        }
         $PackageKind = 'exe'
     }
     $GH_URL = if ($Tag -eq 'latest') { "$Base/latest/download/$Asset" } else { "$Base/download/$Tag/$Asset" }
@@ -620,13 +629,14 @@ function global:RDev {
         $ClientName = 'rdev-client'
         $CacheKey = "go-$SafeTag-windows-$Arch-$(Convert-RDevSafeName $Asset)"
         if ($Asset -eq $script:LocalWindowsAMD64Asset) { $CacheKey += "-$script:LocalClientRevision" }
+        elseif ($script:WindowsClientHashes.ContainsKey($Asset)) { $CacheKey += '-' + $script:WindowsClientHashes[$Asset].Substring(0, 16) }
         $CacheRunName = $Asset
     }
     $CacheDir = Join-Path $CacheBase $CacheKey
     $CacheRunPath = Join-Path $CacheDir $CacheRunName
     $CacheReady = Test-RDevCache $CacheRunPath $CacheDir
     if ($CacheReady -and $ManagedEnrollment) {
-        $CacheSupportsManagedEnrollment = if ($Asset -eq $script:LocalWindowsAMD64Asset) {
+        $CacheSupportsManagedEnrollment = if ($script:WindowsClientHashes.ContainsKey($Asset)) {
             Test-RDevVerifiedManagedEnrollmentClient $CacheRunPath $Asset
         } else {
             Test-RDevManagedEnrollmentSupport $CacheRunPath
@@ -639,13 +649,13 @@ function global:RDev {
     } else {
     Write-Host "  Downloading $ClientName package (windows/$Arch)..." -ForegroundColor Cyan
 
-    if ($Client -eq 'go' -and $Asset -eq $script:LocalWindowsAMD64Asset) {
+    if ($Client -eq 'go' -and $script:WindowsClientHashes.ContainsKey($Asset)) {
         $LocalUrl = Get-RDevLocalReleaseUrl $Server $Asset
         if ($LocalUrl) {
             Write-Host "  Trying verified RDev client..." -ForegroundColor DarkGray
             if (Dl $LocalUrl $OutPath) {
                 $LocalHash = Get-RDevSHA256 $OutPath
-                if ((Test-RDevPackage $OutPath $PackageKind) -and $LocalHash -eq $script:LocalWindowsAMD64SHA256) {
+                if ((Test-RDevPackage $OutPath $PackageKind) -and $LocalHash -eq $script:WindowsClientHashes[$Asset]) {
                     $OK = $true
                     Write-Host "  OK via verified RDev client" -ForegroundColor Green
                 } else {
@@ -657,7 +667,7 @@ function global:RDev {
     }
 
     # Prefer a redirect selected by the RDev server's cached speed probe. This
-    # keeps the client download direct while retaining PS 2.0 compatibility.
+    # keeps the client download direct. Pinned builds are checked again below.
     $ReleaseUrl = Get-RDevReleaseUrl $Server $Asset $Tag
     if ($ReleaseUrl -and -not $OK) {
         Write-Host "  Selecting fastest release source..." -ForegroundColor DarkGray
@@ -720,7 +730,7 @@ function global:RDev {
 
     if ($ManagedEnrollment) {
         if ($Client -ne 'go') { Write-Error 'Managed enrollment requires the compatible Go client.'; return }
-        $SupportsManagedEnrollment = if ($Asset -eq $script:LocalWindowsAMD64Asset) {
+        $SupportsManagedEnrollment = if ($script:WindowsClientHashes.ContainsKey($Asset)) {
             Test-RDevVerifiedManagedEnrollmentClient $RunPath $Asset
         } else {
             Test-RDevManagedEnrollmentSupport $RunPath
@@ -776,10 +786,7 @@ function global:RDev {
         $EnrollArgs += @('--enroll-stdin', '--enroll-only', '--identity-file', $IdentityFile)
         $EnrollExitCode = Invoke-RDevPersistentEnrollment $InstalledPath $EnrollArgs $EnrollmentCode
         $EnrollmentCode = $null
-        if ($EnrollExitCode -ne 0) {
-            Write-Host "  Enrollment failed (exit $EnrollExitCode). HTTP 401 means the invitation was used or expired; create a new invitation for each new computer." -ForegroundColor Red
-            return
-        }
+        if ($EnrollExitCode -ne 0) { throw "Enrollment failed (exit $EnrollExitCode). Existing device identities were not replaced." }
         Start-RDevPersistentClient $InstalledPath $IdentityFile
         return
     }
@@ -789,7 +796,9 @@ function global:RDev {
         if (-not $EnrollmentCode) { $EnrollmentCode = Read-Host '  One-time enrollment code' }
         $A += '--enroll-stdin'
         $EnrollmentCode | & $RunPath @A
+        $ClientExitCode = $LASTEXITCODE
         $EnrollmentCode = $null
+        if ($ClientExitCode -ne 0) { throw "RDev client exited with code $ClientExitCode." }
         return
     }
 
@@ -803,6 +812,7 @@ function global:RDev {
     }
 
     & $RunPath @A
+    if ($LASTEXITCODE -ne 0) { throw "RDev client exited with code $LASTEXITCODE." }
 }
 
 # ── Banner: show usage hint when piped via iex ──────────────
