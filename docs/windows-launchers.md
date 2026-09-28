@@ -1,5 +1,9 @@
 # Windows 启动与兼容边界
 
+2026-09-28 已部署 `v0.2.121-feidu.23`，实现提交 `d4d0c44e48d67fdabc6898787e975b90320a3e92`。服务端 SHA-256 `31c42df3344814f3cfbbde14fb7d918906ecf3fd289e4dbd9a1dc8e1909df4c0`。回退保留原镜像 `rdev-new-local:0.2.121-feidu.21-992cfaa`、原 compose 与备份 `/opt/rdev-new/backups/windows-d4d0c44-20260928T084724Z`，备份含设备注册表、SSH host key、控制凭据与 Caddy。上线前后已有设备记录逐项相等，host key 未变。
+
+公网三个启动入口与 `/join` 已逐字节匹配源码；两个 Win7 客户端从公网下载并核对完整 SHA-256。真实 `run.cmd` 经 CMD、空 PATH、HTTPS 下载入口和客户端完成临时注册上线；测试设备已撤销，已消费邀请不可再用。此前两次 QA 因测试器调用 CMD 时引号转义错误失败，邀请均已撤销；不是产品脚本通过前隐藏的成功记录。公网工具更新同时包含 `db8f8c5` 中文导入修复，其 SHA-256 `7a1d2c08fadecbf1abf988a50349b7959ad40df04eb659c3758c29f3e7d7c83c`，并用该公开工具和现有 DPAPI 授权对 `DESKTOP-5E5QU52-2` 执行真实 SSH `hostname` 成功。
+
 网页“新增设备”和 `/join` 明确区分 CMD 与 PowerShell。复制的是各自终端可直接执行的一条命令，使用 Windows 系统目录定位 PowerShell，首个 HTTPS 请求前启用 TLS 1.2。注册码只进入当前进程，不进入下载 URL 或脚本文件；编码命令不是加密，不应将含邀请码的命令发到公开日志。
 
 也可下载 `https://r.feidu.fit/run.cmd`，运行后粘贴邀请码。默认保持在线；显式 `-Enroll` 为本次运行，`-Persist` 为保持在线。PowerShell 中执行下载后的文件用 `& '.\run.cmd'`，CMD 中用 `run.cmd`。本地配套 `run-cmd.ps1` 存在时直接执行，否则通过 HTTPS 下载临时入口，结束后清理。只在子进程设置 RemoteSigned，不修改系统执行策略、不绕过组策略。

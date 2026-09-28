@@ -1,5 +1,7 @@
 # 中文设备配置导入
 
+更新（2026-09-28）：本修复已随 `v0.2.121-feidu.23` 部署，公开工具 SHA-256 已回读一致。准确制品、备份和公网测试见 [Windows 启动发布记录](windows-launchers.md)。下方“尚未部署”是 9 月 26 日的历史状态。
+
 `--import-stdin` 读取原始字节，不再依赖 Python 的控制台解码。默认严格 UTF-8，UTF-16/UTF-32 仅在 BOM 明确时接受；最大 65536 字节。错误编码、非法设备 ID 和指定 `--device` 不匹配时，不覆盖原状态，不回显凭据。
 
 Windows 优先 `--import-clipboard`。PowerShell 管道发送 Unicode 前设置 `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`；不能将编码错误误判为设备离线，也不能按相似 ID 自动纠正。SSH 仍使用准确注册 `id`，不改成 `requestedId` 或 `instanceId`。
