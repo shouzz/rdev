@@ -1,7 +1,7 @@
 @echo off
 setlocal DisableDelayedExpansion
-rem Win7 path: use the self-contained Go client and BITS. No PowerShell,
-rem .NET 4.8, WMF, JSON parser, or machine policy change is required.
+rem Win7 path: use the self-contained Go client. certutil is the fallback
+rem downloader because some Windows 7 images do not include BITS.
 ver | find "6.1." >nul
 if not errorlevel 1 goto :win7
 set "RDEV_PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -32,14 +32,21 @@ if /i "%PROCESSOR_ARCHITEW6432%"=="AMD64" set "RDEV_ASSET=rdev-client-windows-wi
 set "RDEV_CLIENT=%RDEV_HOME%\rdev-client.exe"
 if not exist "%RDEV_CLIENT%" (
   where bitsadmin >nul 2>&1
+  if not errorlevel 1 (
+    bitsadmin /reset >nul 2>&1
+    bitsadmin /transfer RDevClient /download /priority FOREGROUND "https://r.feidu.fit/local-release?asset=%RDEV_ASSET%" "%RDEV_CLIENT%" >nul
+  )
+)
+if not exist "%RDEV_CLIENT%" (
+  where certutil >nul 2>&1
   if errorlevel 1 (
-    echo RDev: Windows 7 BITS is unavailable. 1>&2
+    echo RDev: Windows 7 download tools are unavailable. 1>&2
     exit /b 2
   )
-  bitsadmin /reset >nul 2>&1
-  bitsadmin /transfer RDevClient /download /priority FOREGROUND "https://r.feidu.fit/local-release?asset=%RDEV_ASSET%" "%RDEV_CLIENT%" >nul
+  del /q "%RDEV_CLIENT%" >nul 2>&1
+  certutil -urlcache -split -f "https://r.feidu.fit/local-release?asset=%RDEV_ASSET%" "%RDEV_CLIENT%" >nul
   if errorlevel 1 (
-    echo RDev: client download failed. Check Windows 7 SP1 updates and network access. 1>&2
+    echo RDev: client download failed. Check Windows 7 SP1 network access. 1>&2
     exit /b 1
   )
 )
