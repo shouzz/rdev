@@ -41,7 +41,7 @@ Sub Window_OnLoad
   client = home & "\rdev-client.exe"
   identity = home & "\identity.bin"
   If Not fso.FileExists(identity) Then
-    cmd = "cmd.exe /d /s /c echo " & code & "|\"" & client & "\" --server https://r.feidu.fit --enroll-stdin --enroll-only --identity-file \"" & identity & "\""
+    cmd = "cmd.exe /d /s /c echo " & code & "|""" & client & """ --server https://r.feidu.fit --enroll-stdin --enroll-only --identity-file """ & identity & """"
     rc = shell.Run(cmd, 0, True)
     If rc <> 0 Then
       MsgBox "RDev: 注册失败，错误码 " & rc, 16, "RDev"
@@ -51,7 +51,7 @@ Sub Window_OnLoad
   End If
   startup = env("APPDATA") & "\Microsoft\Windows\Start Menu\Programs\Startup\RDev.cmd"
   Set file = fso.CreateTextFile(startup, True)
-  file.WriteLine "@start \"\" /min \"" & client & "\" --identity-file \"" & identity & "\""
+  file.WriteLine "@start """" /min """ & client & """ --identity-file """ & identity & """"
   file.Close
-  shell.Run "\"" & client & "\" --identity-file \"" & identity & "\"", 0, False
+  shell.Run """" & client & """ --identity-file """ & identity & """", 0, False
   MsgBox "RDev 已连接，登录后会自动重连。", 64, "RDev"
