@@ -686,18 +686,8 @@ read_enrollment_code() {
         RDEV_ENROLLMENT_CODE=""
         return 0
     fi
-    [ -r /dev/tty ] || { echo "Error: enrollment requires an interactive terminal" >&2; return 1; }
-    printf '%s' "  One-time enrollment code: " >/dev/tty
-    old_stty="$(stty -g </dev/tty 2>/dev/null || true)"
-    if [ -n "$old_stty" ]; then
-        stty -echo </dev/tty 2>/dev/null || true
-    fi
-    IFS= read -r ENROLLMENT_CODE </dev/tty
-    if [ -n "$old_stty" ]; then
-        stty "$old_stty" </dev/tty 2>/dev/null || true
-    fi
-    printf '\n' >/dev/tty
-    [ -n "$ENROLLMENT_CODE" ] || { echo "Error: enrollment code is empty" >&2; return 1; }
+    echo "Error: startup configuration is missing. Copy the complete device connection command from the console." >&2
+    return 1
 }
 
 run_as_root() {

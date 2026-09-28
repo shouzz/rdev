@@ -778,7 +778,7 @@ function global:RDev {
             return
         }
         Copy-Item -LiteralPath $RunPath -Destination $InstalledPath -Force -ErrorAction Stop
-        if (-not $EnrollmentCode) { $EnrollmentCode = Read-Host '  One-time enrollment code' }
+        if (-not $EnrollmentCode) { throw 'RDev: startup configuration is missing. Copy the complete device connection command from the console.' }
         $EnrollArgs = @('-s', $ClientServer)
         if ($Id) { $EnrollArgs += @('-i', $Id) }
         # Fresh installations always receive a distinct server-assigned ID on
@@ -793,7 +793,7 @@ function global:RDev {
 
     if ($Enroll) {
         if ($Client -ne 'go') { Write-Error 'Enrollment requires the compatible Go client.'; return }
-        if (-not $EnrollmentCode) { $EnrollmentCode = Read-Host '  One-time enrollment code' }
+        if (-not $EnrollmentCode) { throw 'RDev: startup configuration is missing. Copy the complete device connection command from the console.' }
         $A += '--enroll-stdin'
         $EnrollmentCode | & $RunPath @A
         $ClientExitCode = $LASTEXITCODE

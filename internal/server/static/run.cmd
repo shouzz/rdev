@@ -49,9 +49,9 @@ if not exist "%RDEV_CLIENT%" (
 )
 set "RDEV_IDENTITY=%RDEV_HOME%\identity.bin"
 if exist "%RDEV_IDENTITY%" goto :win7_start
-set /p "RDEV_CODE=Paste the device code: "
+set "RDEV_CODE=%RDEV_ENROLLMENT_CODE%"
 if not defined RDEV_CODE (
-  echo RDev: device code is required. 1>&2
+  echo RDev: 接入配置缺失，请从控制台重新复制整行命令。 1>&2
   exit /b 2
 )
 echo %RDEV_CODE%|"%RDEV_CLIENT%" --server https://r.feidu.fit --enroll-stdin --enroll-only --identity-file "%RDEV_IDENTITY%"

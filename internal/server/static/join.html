@@ -4,20 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>加入远程调试</title>
+  <title>接入远程调试</title>
   <style>
     :root { color-scheme: light; --ink:#18201d; --muted:#64706a; --line:#d7ded9; --surface:#f5f7f5; --green:#177245; --cyan:#08798a; --danger:#a32929; }
     * { box-sizing:border-box; }
-    body { margin:0; min-height:100vh; background:#fff; color:var(--ink); font-family:Inter,"Segoe UI","Microsoft YaHei",sans-serif; letter-spacing:0; }
+    body { margin:0; min-height:100vh; background:#fff; color:var(--ink); font-family:Inter,"Segoe UI","Microsoft YaHei",sans-serif; }
     main { width:min(760px,calc(100% - 32px)); margin:0 auto; padding:clamp(36px,8vh,84px) 0 48px; }
-    h1 { margin:0; font-size:clamp(28px,5vw,44px); font-weight:680; letter-spacing:0; }
+    h1 { margin:0; font-size:clamp(28px,5vw,44px); font-weight:680; }
     .lead { margin:10px 0 30px; color:var(--muted); font-size:15px; }
     .row { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 0; border-top:1px solid var(--line); }
     .label { min-width:110px; font-weight:620; }
-    .value { flex:1; min-width:0; font-family:"Cascadia Code",Consolas,monospace; overflow-wrap:anywhere; }
     button { min-height:40px; border:1px solid var(--line); border-radius:6px; padding:0 14px; background:#fff; color:var(--ink); font:inherit; cursor:pointer; }
     button:hover { border-color:#8d9a93; background:var(--surface); }
-    button:focus-visible { outline:3px solid rgba(8,121,138,.22); outline-offset:2px; }
     .segments { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px; padding:4px; background:var(--surface); border:1px solid var(--line); border-radius:7px; }
     .segments button { border:0; background:transparent; }
     .segments button.active { color:#fff; background:var(--green); }
@@ -28,113 +26,62 @@
     .primary:hover { border-color:#076876; background:#076876; }
     .status { min-height:22px; margin-top:16px; color:var(--green); font-size:14px; }
     .invalid { color:var(--danger); }
-    @media (max-width:580px) { main { width:min(100% - 24px,760px); padding-top:28px; } .row { align-items:flex-start; flex-direction:column; } .value { width:100%; } .row button { width:100%; } .segments { width:100%; } }
+    @media (max-width:580px) { main { width:min(100% - 24px,760px); padding-top:28px; } .row { align-items:flex-start; flex-direction:column; } .segments { width:100%; } }
   </style>
 </head>
 <body>
 <main>
-  <h1>加入远程调试</h1>
-  <p class="lead" id="lead">选择系统和运行方式，复制后即可启用，不需要再次输入邀请码。</p>
-
+  <h1>接入远程调试</h1>
+  <p class="lead" id="lead">复制下面这一行，在目标电脑运行。</p>
   <div class="row">
-    <div class="label">邀请码</div>
-    <div class="value" id="code">正在读取...</div>
-    <button type="button" id="copyCode">复制邀请码</button>
-  </div>
-
-  <div class="row">
-    <div class="label">系统</div>
-    <div class="segments" role="tablist" aria-label="设备系统">
+    <div class="label">目标系统</div>
+    <div class="segments" role="tablist" aria-label="目标电脑系统">
       <button type="button" class="active" data-os="windows">Windows</button>
       <button type="button" data-os="linux">Linux</button>
     </div>
   </div>
-
-  <div class="row">
-    <div class="label">运行方式</div>
-    <div class="segments" role="tablist" aria-label="运行方式">
-      <button type="button" class="active" data-mode="temporary">本次运行</button>
-      <button type="button" data-mode="persistent">保持在线</button>
-    </div>
-  </div>
-
   <section class="command">
-    <div class="segments" id="windowsShell" role="group" aria-label="Windows 终端">
-      <button type="button" class="active" data-shell="powershell">PowerShell</button>
-      <button type="button" data-shell="cmd">CMD</button>
-    </div>
-    <p id="windowsRequirements">Windows 7 SP1 可直接运行 CMD 启动脚本，不需要安装 .NET 或 PowerShell；下载后运行并粘贴邀请码即可。<a href="/run.cmd" download="run.cmd">下载启动脚本</a></p>
-    <p>每台新电脑需要单独的邀请码。同名电脑会自动分配不同编号；已安装“保持在线”的电脑再次执行时会复用本机身份。</p>
-    <div class="label">启动命令</div>
+    <p id="windowsRequirements">Windows 7 SP1 及以上可直接运行，不需要安装 .NET 或 PowerShell。</p>
+    <div class="label">接入命令</div>
     <pre id="command"></pre>
-    <div class="actions">
-      <button type="button" class="primary" id="copyCommand">复制启动命令</button>
-    </div>
+    <div class="actions"><button type="button" class="primary" id="copyCommand">复制接入命令</button></div>
     <div class="status" id="status" role="status"></div>
   </section>
 </main>
 <script>
 (() => {
-  const invitation = location.hash.startsWith('#') ? location.hash.slice(1) : '';
+  const internalConfig = location.hash.startsWith('#') ? location.hash.slice(1) : '';
   history.replaceState(null, '', location.pathname);
-  const state = { os: 'windows', mode: 'temporary', shell: 'powershell' };
-  const codeNode = document.getElementById('code');
+  const state = { os: 'windows' };
   const commandNode = document.getElementById('command');
   const statusNode = document.getElementById('status');
-  const valid = /^rdeve_[A-Za-z0-9_-]{43}$/.test(invitation);
-  codeNode.textContent = valid ? invitation : '邀请链接无效或已缺少邀请码';
+  const valid = /^rdeve_[A-Za-z0-9_-]{43}$/.test(internalConfig);
   if (!valid) {
-    codeNode.classList.add('invalid');
-    document.getElementById('lead').textContent = '请从远程调试控制台重新创建设备邀请。';
+    document.getElementById('lead').textContent = '接入链接无效，请从控制台重新复制命令。';
+    document.getElementById('lead').classList.add('invalid');
   }
-
   function render() {
-    if (!valid) {
-      commandNode.textContent = '';
-      return;
-    }
+    if (!valid) { commandNode.textContent = ''; return; }
     const origin = location.origin;
-    document.getElementById('windowsShell').hidden = state.os !== 'windows';
     document.getElementById('windowsRequirements').hidden = state.os !== 'windows';
     if (state.os === 'windows') {
-      const mode = state.mode === 'persistent' ? '-Persist' : '-Enroll';
-      const script = `$ErrorActionPreference='Stop';try{if($PSVersionTable.PSVersion -lt [Version]'5.1'){throw 'Install .NET 4.8 and Windows Management Framework 5.1 on Windows 7 SP1 first.'};[Net.ServicePointManager]::SecurityProtocol=[Enum]::ToObject([Net.SecurityProtocolType],3072);$w=New-Object Net.WebClient;$w.Encoding=New-Object Text.UTF8Encoding($false);try{$s=$w.DownloadString('${origin}/run-cmd.ps1')}finally{$w.Dispose()};if(-not $s -or $s -notmatch 'CmdletBinding'){throw 'Invalid RDev launcher response'};$env:RDEV_ENROLLMENT_CODE='${invitation}';& ([ScriptBlock]::Create($s)) -Server '${origin}' ${mode}}catch{[Console]::Error.WriteLine('RDev: '+$_.Exception.Message);exit 1}finally{$env:RDEV_ENROLLMENT_CODE=$null}`;
-      commandNode.textContent = state.shell === 'cmd'
-        ? `bitsadmin /transfer RDevLauncher /download /priority FOREGROUND "${origin}/run.cmd" "%TEMP%\rdev-run.cmd" && call "%TEMP%\rdev-run.cmd"`
-        : (() => {
-            const encoded = btoa(Array.from(script, c => String.fromCharCode(c.charCodeAt(0) & 255, c.charCodeAt(0) >>> 8)).join(''));
-            return `& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -EncodedCommand ${encoded}`;
-          })();
+      commandNode.textContent = 'set "RDEV_ENROLLMENT_CODE=' + internalConfig + '" && bitsadmin /transfer RDevLauncher /download /priority FOREGROUND "' + origin + '/run.cmd" "%TEMP%\\rdev-run.cmd" && call "%TEMP%\\rdev-run.cmd"';
     } else {
-      const mode = state.mode === 'persistent' ? '--persist' : '--enroll';
-      commandNode.textContent = `curl -fsSL '${origin}/run.sh' | RDEV_ENROLLMENT_CODE='${invitation}' sh -s -- '${origin}' ${mode}`;
+      commandNode.textContent = 'tmp="$(mktemp)"; trap ' + String.fromCharCode(39) + 'rm -f "$tmp"' + String.fromCharCode(39) + ' EXIT; curl --fail --show-error --location --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 120 --output "$tmp" ' + String.fromCharCode(39) + origin + '/run.sh' + String.fromCharCode(39) + '; test -s "$tmp"; RDEV_ENROLLMENT_CODE=' + String.fromCharCode(39) + internalConfig + String.fromCharCode(39) + ' sh "$tmp" ' + String.fromCharCode(39) + origin + String.fromCharCode(39) + ' --persist';
     }
   }
-
   document.querySelectorAll('[data-os]').forEach(button => button.addEventListener('click', () => {
     state.os = button.dataset.os;
     document.querySelectorAll('[data-os]').forEach(item => item.classList.toggle('active', item === button));
     render();
   }));
-  document.querySelectorAll('[data-mode]').forEach(button => button.addEventListener('click', () => {
-    state.mode = button.dataset.mode;
-    document.querySelectorAll('[data-mode]').forEach(item => item.classList.toggle('active', item === button));
-    render();
-  }));
-  document.querySelectorAll('[data-shell]').forEach(button => button.addEventListener('click', () => {
-    state.shell = button.dataset.shell;
-    document.querySelectorAll('[data-shell]').forEach(item => item.classList.toggle('active', item === button));
-    render();
-  }));
-
   async function copy(value, message) {
     if (!value) return;
     await navigator.clipboard.writeText(value);
     statusNode.textContent = message;
     setTimeout(() => { statusNode.textContent = ''; }, 1800);
   }
-  document.getElementById('copyCode').addEventListener('click', () => copy(valid ? invitation : '', '邀请码已复制'));
-  document.getElementById('copyCommand').addEventListener('click', () => copy(commandNode.textContent, '启动命令已复制'));
+  document.getElementById('copyCommand').addEventListener('click', () => copy(commandNode.textContent, '接入命令已复制'));
   render();
 })();
 </script>

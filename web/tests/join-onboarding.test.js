@@ -6,24 +6,15 @@ import { JSDOM } from "jsdom";
 const root = resolve(import.meta.dirname, "../..");
 
 describe("RDev browser onboarding", () => {
-  test("join page emits non-interactive commands for both platforms and modes", async () => {
+  test("join page emits one non-interactive persistent command per platform", async () => {
     const source = await readFile(
       resolve(root, "internal/server/static/join.html"),
       "utf8",
     );
 
-    expect(source).toContain(
-      "[Environment]::SetEnvironmentVariable('RDEV_ENROLLMENT_CODE'",
-    );
-    expect(source).toContain("RDEV_ENROLLMENT_CODE='");
-    expect(source).toContain(
-      "const mode = state.mode === 'persistent' ? '-Persist' : '-Enroll'",
-    );
-    expect(source).toContain(
-      "const mode = state.mode === 'persistent' ? '--persist' : '--enroll'",
-    );
-    expect(source).toContain("RDev '${origin}' ${mode}");
-    expect(source).toContain("'${origin}' ${mode}");
+    expect(source).toContain("RDEV_ENROLLMENT_CODE=");
+    expect(source).toContain("--persist");
+    expect(source).not.toContain("邀请码");
     expect(source).not.toContain("Read-Host");
   });
 
