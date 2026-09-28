@@ -63,7 +63,7 @@
       <button type="button" class="active" data-shell="powershell">PowerShell</button>
       <button type="button" data-shell="cmd">CMD</button>
     </div>
-    <p id="windowsRequirements">Windows 7 SP1 需要 .NET 4.8 和 PowerShell 5.1。<a href="/run.cmd" download="run.cmd">下载启动脚本</a> 后也可运行并粘贴邀请码，无需修改 PATH。</p>
+    <p id="windowsRequirements">Windows 7 SP1 可直接运行 CMD 启动脚本，不需要安装 .NET 或 PowerShell；下载后运行并粘贴邀请码即可。<a href="/run.cmd" download="run.cmd">下载启动脚本</a></p>
     <p>每台新电脑需要单独的邀请码。同名电脑会自动分配不同编号；已安装“保持在线”的电脑再次执行时会复用本机身份。</p>
     <div class="label">启动命令</div>
     <pre id="command"></pre>
@@ -99,10 +99,12 @@
     if (state.os === 'windows') {
       const mode = state.mode === 'persistent' ? '-Persist' : '-Enroll';
       const script = `$ErrorActionPreference='Stop';try{if($PSVersionTable.PSVersion -lt [Version]'5.1'){throw 'Install .NET 4.8 and Windows Management Framework 5.1 on Windows 7 SP1 first.'};[Net.ServicePointManager]::SecurityProtocol=[Enum]::ToObject([Net.SecurityProtocolType],3072);$w=New-Object Net.WebClient;$w.Encoding=New-Object Text.UTF8Encoding($false);try{$s=$w.DownloadString('${origin}/run-cmd.ps1')}finally{$w.Dispose()};if(-not $s -or $s -notmatch 'CmdletBinding'){throw 'Invalid RDev launcher response'};$env:RDEV_ENROLLMENT_CODE='${invitation}';& ([ScriptBlock]::Create($s)) -Server '${origin}' ${mode}}catch{[Console]::Error.WriteLine('RDev: '+$_.Exception.Message);exit 1}finally{$env:RDEV_ENROLLMENT_CODE=$null}`;
-      const encoded = btoa(Array.from(script, c => String.fromCharCode(c.charCodeAt(0) & 255, c.charCodeAt(0) >>> 8)).join(''));
       commandNode.textContent = state.shell === 'cmd'
-        ? `"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoLogo -NoProfile -EncodedCommand ${encoded}`
-        : `& "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoLogo -NoProfile -EncodedCommand ${encoded}`;
+        ? `bitsadmin /transfer RDevLauncher /download /priority FOREGROUND "${origin}/run.cmd" "%TEMP%\rdev-run.cmd" && call "%TEMP%\rdev-run.cmd"`
+        : (() => {
+            const encoded = btoa(Array.from(script, c => String.fromCharCode(c.charCodeAt(0) & 255, c.charCodeAt(0) >>> 8)).join(''));
+            return `& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -EncodedCommand ${encoded}`;
+          })();
     } else {
       const mode = state.mode === 'persistent' ? '--persist' : '--enroll';
       commandNode.textContent = `curl -fsSL '${origin}/run.sh' | RDEV_ENROLLMENT_CODE='${invitation}' sh -s -- '${origin}' ${mode}`;

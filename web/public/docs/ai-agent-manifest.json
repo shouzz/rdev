@@ -4,8 +4,8 @@
   "windows_launchers": {
     "cmd": "/run.cmd",
     "powershell": "/run-cmd.ps1",
-    "minimum_powershell": "5.1",
-    "legacy_windows_prerequisites": "Windows 7 SP1, .NET 4.8, WMF 5.1, TLS 1.2",
+    "minimum_powershell": "not_required_for_windows7_cmd",
+    "legacy_windows_prerequisites": "Windows 7 SP1 with BITS and current root certificates; CMD path uses the self-contained Go client",
     "legacy_windows_runtime_acceptance": "pending_real_windows7",
     "credential_transport": "process_environment_or_interactive_prompt"
   },

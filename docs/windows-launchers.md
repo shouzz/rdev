@@ -12,7 +12,7 @@
 
 ## Windows 7
 
-最低条件是 Windows 7 SP1 + .NET Framework 4.8 + Windows Management Framework 5.1 + 正常 TLS 1.2/根证书。未满足条件先提示，不尝试降级到 TLS 1.0/1.1，不关闭证书校验。
+Windows 7 SP1 的 CMD 入口优先使用系统 BITS 下载自包含 Go 客户端，不要求安装 .NET Framework 或 Windows Management Framework；系统仍需能访问 HTTPS 并具有正常根证书。PowerShell 入口继续按现有脚本要求运行。
 
 旧系统选择以下独立客户端，下载后核对 SHA-256：
 
