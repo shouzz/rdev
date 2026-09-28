@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,6 +28,12 @@ func TestWindowsLaunchersAreServedWithoutStaleCaching(t *testing.T) {
 			}
 			if path == "/run.cmd" && w.Header().Get("Content-Disposition") != `attachment; filename="run.cmd"` {
 				t.Fatal("CMD launcher must download as a file")
+			}
+			if path == "/run.cmd" && method == http.MethodGet {
+				body := w.Body.String()
+				if !strings.Contains(body, `certutil.exe" -urlcache -split -f`) || strings.Contains(body, "Windows 7 BITS is unavailable") {
+					t.Fatal("Win7 launcher must include the certutil fallback")
+				}
 			}
 		}
 	}
@@ -391,5 +399,19 @@ func TestReverseForwardOpenFailAndRegistry(t *testing.T) {
 	s.removeReverseForward("listen-1")
 	if got := s.getReverseForward("listen-1"); got != nil {
 		t.Fatalf("reverse forward should be removed, got %#v", got)
+	}
+}
+
+// The fallback is useful on stock Win7 only if the trusted page pins the exact
+// bytes that the server serves. Prevent a launcher edit from stranding users.
+func TestJoinPinsServedWindowsBootstrap(t *testing.T) {
+	s := &Server{}
+	script := httptest.NewRecorder()
+	s.StaticHandler().ServeHTTP(script, httptest.NewRequest(http.MethodGet, "/run.cmd", nil))
+	page := httptest.NewRecorder()
+	s.StaticPageHandler("join.html").ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/join", nil))
+	digest := fmt.Sprintf("%x", sha256.Sum256(script.Body.Bytes()))
+	if script.Code != 200 || page.Code != 200 || !strings.Contains(page.Body.String(), digest) {
+		t.Fatal("join page does not pin the served Windows bootstrap")
 	}
 }

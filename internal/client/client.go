@@ -786,6 +786,7 @@ func (c *Client) connectWebSocket(serverURL string) error {
 	}
 	socket, _, err := gws.NewClient(handler, &gws.ClientOption{
 		Addr:               wsURL,
+		TlsConfig:          wincompat.TLSConfig(),
 		HandshakeTimeout:   10 * time.Second,
 		ReadMaxPayloadSize: 16 * 1024 * 1024,
 		NewDialer:          websocketDialerFor(wsURL),

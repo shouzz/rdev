@@ -43,8 +43,8 @@ $script:LocalWindowsAMD64Asset = 'rdev-client-windows-amd64.exe'
 $script:LocalWindowsAMD64SHA256 = '9a72a3dfa04696a2b2b67f13a51daa533c8dc4757dd2d92b962576d298185abd'
 $script:WindowsClientHashes = @{
     'rdev-client-windows-amd64.exe' = $script:LocalWindowsAMD64SHA256
-    'rdev-client-windows-win7-amd64.exe' = '7e25b7a9e429b4e6aa013f272c51c12566c8c5a7cb804db7917a18135b86e239'
-    'rdev-client-windows-win7-386.exe' = 'ad2ff87eb913763bf676981eb613a164c5fac93a1a64f0b2157c7d92d37402e4'
+    'rdev-client-windows-win7-rtm-amd64.exe' = '081247e2610c9798520691a1bb8dab2bbd7b2e0689ab2f711508af67fb7dab88'
+    'rdev-client-windows-win7-rtm-386.exe' = 'a5643e183ecb9d5104fa9e718391dc8099998421b883331c78cb9acf4bb8a353'
 }
 
 function Convert-RDevMirrorUrl([string]$Mirror, [string]$Url) {
@@ -593,7 +593,7 @@ function global:RDev {
         $Asset = "rdev-client-windows-$Arch.exe"
         if ($WindowsMajor -gt 0 -and $WindowsMajor -lt 10) {
             if ($Arch -notin @('amd64', '386')) { throw 'Legacy Windows architecture is unsupported.' }
-            $Asset = "rdev-client-windows-win7-$Arch.exe"
+            $Asset = "rdev-client-windows-win7-rtm-$Arch.exe"
         }
         $PackageKind = 'exe'
     }

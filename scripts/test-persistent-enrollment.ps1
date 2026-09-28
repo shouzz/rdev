@@ -74,7 +74,7 @@ try {
         $Arch=$LegacyArch
         $env:PROCESSOR_ARCHITECTURE=if($Arch -eq '386'){'x86'}else{'AMD64'}
         $env:PROCESSOR_ARCHITEW6432=$null
-        $Asset='rdev-client-windows-win7-'+$Arch+'.exe'
+        $Asset='rdev-client-windows-win7-rtm-'+$Arch+'.exe'
         $Suffix=$script:WindowsClientHashes[$Asset].Substring(0,16)
     }
     Assert-QA ((Get-RDevSHA256 $ClientBinary) -eq $script:WindowsClientHashes[$Asset]) 'Candidate hash does not match launcher pin'

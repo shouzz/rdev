@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lxzan/gws"
+	"rdev/internal/wincompat"
 )
 
 func websocketDialerFor(rawURL string) func() (gws.Dialer, error) {
@@ -54,7 +55,12 @@ func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
 	}
 	if d.proxyURL.Scheme == "https" {
 		serverName := d.proxyURL.Hostname()
-		tlsConn := tls.Client(conn, &tls.Config{ServerName: serverName})
+		config := wincompat.TLSConfig()
+		if config == nil {
+			config = &tls.Config{}
+		}
+		config.ServerName = serverName
+		tlsConn := tls.Client(conn, config)
 		if err := tlsConn.Handshake(); err != nil {
 			conn.Close()
 			return nil, err

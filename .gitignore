@@ -45,3 +45,6 @@ authorized_keys
 /artifacts/
 __pycache__/
 *.py[cod]
+
+# Public root certificate bundled for legacy Windows TLS.
+!internal/wincompat/isrgrootx1.pem
