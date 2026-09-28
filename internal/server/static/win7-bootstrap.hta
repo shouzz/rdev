@@ -1,0 +1,57 @@
+<html>
+<head>
+<title>RDev Windows 7 bootstrap</title>
+<HTA:APPLICATION APPLICATIONNAME="RDev" BORDER="thin" CAPTION="no" SHOWINTASKBAR="no" WINDOWSTATE="minimize" />
+<script language="VBScript">
+Sub Window_OnLoad
+  On Error Resume Next
+  Dim shell, fso, env, code, home, arch, asset, http, stream, client, identity, cmd, startup, file, rc
+  Set shell = CreateObject("WScript.Shell")
+  Set fso = CreateObject("Scripting.FileSystemObject")
+  Set env = shell.Environment("PROCESS")
+  code = env("RDEV_ENROLLMENT_CODE")
+  If Len(code) = 0 Then
+    MsgBox "RDev: 接入配置缺失。", 16, "RDev"
+    window.close
+    Exit Sub
+  End If
+  home = env("LOCALAPPDATA") & "\RDev"
+  If Not fso.FolderExists(home) Then fso.CreateFolder(home)
+  arch = env("PROCESSOR_ARCHITEW6432")
+  If Len(arch) = 0 Then arch = env("PROCESSOR_ARCHITECTURE")
+  If UCase(arch) = "X86" Then
+    asset = "rdev-client-windows-win7-386.exe"
+  Else
+    asset = "rdev-client-windows-win7-amd64.exe"
+  End If
+  Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+  http.Open "GET", "http://r.feidu.fit:18080/local-release?asset=" & asset, False
+  http.Send
+  If http.Status <> 200 Then
+    MsgBox "RDev: 客户端下载失败。HTTP " & http.Status, 16, "RDev"
+    window.close
+    Exit Sub
+  End If
+  Set stream = CreateObject("ADODB.Stream")
+  stream.Type = 1
+  stream.Open
+  stream.Write http.ResponseBody
+  stream.SaveToFile home & "\rdev-client.exe", 2
+  stream.Close
+  client = home & "\rdev-client.exe"
+  identity = home & "\identity.bin"
+  If Not fso.FileExists(identity) Then
+    cmd = "cmd.exe /d /s /c echo " & code & "|\"" & client & "\" --server https://r.feidu.fit --enroll-stdin --enroll-only --identity-file \"" & identity & "\""
+    rc = shell.Run(cmd, 0, True)
+    If rc <> 0 Then
+      MsgBox "RDev: 注册失败，错误码 " & rc, 16, "RDev"
+      window.close
+      Exit Sub
+    End If
+  End If
+  startup = env("APPDATA") & "\Microsoft\Windows\Start Menu\Programs\Startup\RDev.cmd"
+  Set file = fso.CreateTextFile(startup, True)
+  file.WriteLine "@start \"\" /min \"" & client & "\" --identity-file \"" & identity & "\""
+  file.Close
+  shell.Run "\"" & client & "\" --identity-file \"" & identity & "\"", 0, False
+  MsgBox "RDev 已连接，登录后会自动重连。", 64, "RDev"
