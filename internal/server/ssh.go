@@ -582,44 +582,7 @@ func (s *SSHServer) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn, n
 	fwd.CloseSSH = func() { ch.Close() }
 	go gossh.DiscardRequests(reqs)
 
-	var once sync.Once
-	cleanup := func() { once.Do(func() { close(fwd.Done) }) }
-
-	// SSH channel -> client device (binary frame)
-	go func() {
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := ch.Read(buf)
-			if n > 0 {
-				client.SendBinary(protocol.BinTCPData, forwardID, buf[:n])
-			}
-			if err != nil {
-				client.Send(&protocol.Message{Type: protocol.MsgTCPClose, ForwardID: forwardID})
-				cleanup()
-				return
-			}
-		}
-	}()
-
-	// Client device -> SSH channel (data from remote target)
-	go func() {
-		for data := range fwd.WriteCh {
-			if _, err := ch.Write(data); err != nil {
-				cleanup()
-				return
-			}
-		}
-		ch.Close()
-		cleanup()
-	}()
-
-	// When close signal received, close the write channel
-	go func() {
-		<-fwd.CloseCh
-		fwd.CloseOutput()
-	}()
-
-	<-fwd.Done
+	bridgeForward(client, fwd, ch)
 }
 
 // localForwardChannelData matches RFC4254 Section 7.2

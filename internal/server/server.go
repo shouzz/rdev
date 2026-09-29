@@ -1315,7 +1315,7 @@ func (s *Server) handleClientBinary(client *ClientConn, raw []byte) {
 	case protocol.BinTCPData:
 		fwd := s.getForward(id)
 		if fwd != nil && len(data) > 0 {
-			sendBytes(fwd.WriteCh, data, "tcp forward")
+			fwd.enqueue(data)
 		}
 	case protocol.BinDesktopFrame:
 		s.handleDesktopFrame(id, data)
@@ -1536,41 +1536,7 @@ func (s *Server) openReverseForwardChannel(rev *ReverseForward, client *ClientCo
 		client.mu.Unlock()
 	}()
 
-	var once sync.Once
-	cleanup := func() { once.Do(func() { close(proxy.Done) }) }
-
-	go func() {
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := ch.Read(buf)
-			if n > 0 {
-				client.SendBinary(protocol.BinTCPData, msg.ForwardID, buf[:n])
-			}
-			if err != nil {
-				client.Send(&protocol.Message{Type: protocol.MsgTCPClose, ForwardID: msg.ForwardID})
-				cleanup()
-				return
-			}
-		}
-	}()
-
-	go func() {
-		for data := range proxy.WriteCh {
-			if _, err := ch.Write(data); err != nil {
-				cleanup()
-				return
-			}
-		}
-		ch.Close()
-		cleanup()
-	}()
-
-	go func() {
-		<-proxy.CloseCh
-		proxy.CloseOutput()
-	}()
-
-	<-proxy.Done
+	bridgeForward(client, proxy, ch)
 }
 
 func splitHostPort(addr string) (string, int) {
