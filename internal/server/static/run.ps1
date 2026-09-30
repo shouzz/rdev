@@ -413,10 +413,15 @@ function Start-RDevPersistentClient([string]$InstalledPath, [string]$IdentityFil
         }
     }
     if ($Running.Count -eq 0) {
-        $Process = Start-Process -FilePath $InstalledPath -ArgumentList @('--identity-file', ('"' + $IdentityFile + '"')) -WindowStyle Hidden -PassThru -ErrorAction Stop
-        if ($Process.WaitForExit(1000)) {
-            throw "The installed client exited with code $($Process.ExitCode). Its saved identity was preserved; check that identity before enrolling again."
-        }
+        # Use an independent ShellExecute process so a pasted cmd.exe wrapper
+        # never waits on the client's inherited console handles.
+        $Info = New-Object Diagnostics.ProcessStartInfo
+        $Info.FileName = $InstalledPath
+        $Info.Arguments = '--identity-file ' + [char]34 + $IdentityFile + [char]34
+        $Info.UseShellExecute = $true
+        $Info.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+        $Process = [Diagnostics.Process]::Start($Info)
+        if (-not $Process) { throw 'Unable to start the RDev client.' }
     }
     $StartupPath = Join-Path (Get-RDevStartupDirectory) 'RDev.cmd'
     $StartupCommand = '@start "" /min "' + $InstalledPath + '" --identity-file "' + $IdentityFile + '"' + "`r`n"
