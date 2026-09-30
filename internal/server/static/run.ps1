@@ -765,10 +765,16 @@ function global:RDev {
     if ($Persist) {
         if ($Client -ne 'go') { Write-Error 'Persistent enrollment requires the compatible Go client.'; return }
         $InstallDir = Join-Path $env:LOCALAPPDATA 'RDev'
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        # A previous elevated install may leave LOCALAPPDATA\RDev readable but
+        # unwritable for the current user. Keep it intact and use the user's
+        # roaming profile for this enrollment instead of failing with Access Denied.
+        $probe = Join-Path $InstallDir ('.write-test-' + [Guid]::NewGuid().ToString('N'))
+        try { [IO.File]::WriteAllText($probe, 'ok'); Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
+        catch { $InstallDir = Join-Path $env:APPDATA 'RDev'; New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null }
         $InstalledPath = Join-Path $InstallDir 'rdev-client.exe'
         if (-not $IdentityFile) { $IdentityFile = Join-Path $InstallDir 'identity.bin' }
         $IdentityFile = [IO.Path]::GetFullPath($IdentityFile)
-        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
         if (Test-Path -LiteralPath $IdentityFile -PathType Leaf) {
             $EnrollmentCode = $null
             if (-not (Test-Path -LiteralPath $InstalledPath -PathType Leaf)) {

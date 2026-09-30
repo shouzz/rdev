@@ -65,7 +65,7 @@
     const origin = location.origin;
     document.getElementById('windowsRequirements').hidden = state.os !== 'windows';
     if (state.os === 'windows') {
-      const hashPattern = 'c9f9d19de355cf86b1858d31fe678d038158c3c7932a409981bf1c132a669c44'.match(/../g).join('.*');
+      const hashPattern = '51119757467c0bc68ec6d9641e6dd21a92f1fc901a7663e5bc1cd5dc0fe4b04a'.match(/../g).join('.*');
       const download = 'certutil -urlcache -split -f ' + origin + '/run.cmd rdev-run.cmd';
       const bootstrap = origin === 'https://r.feidu.fit' ? '(' + download + ' >nul 2>&1 || certutil -urlcache -split -f http://r.feidu.fit:18080/run.cmd rdev-run.cmd)' : download;
       commandNode.textContent = 'cmd.exe /d /s /c "cd /d %TEMP% && set RDEV_ENROLLMENT_CODE=' + internalConfig + '&& ' + bootstrap + ' && (certutil -hashfile rdev-run.cmd SHA256 | findstr /i /r /x ' + hashPattern + ' >nul) && call rdev-run.cmd -Server ' + origin + ' -Enroll -Persist"';

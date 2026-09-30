@@ -74,10 +74,20 @@ if /i not "%RDEV_SERVER:~0,8%"=="https://" (
 )
 set "RDEV_HOME=%LOCALAPPDATA%\RDev"
 if not exist "%RDEV_HOME%" mkdir "%RDEV_HOME%" >nul 2>&1
-if not exist "%RDEV_HOME%" (
-  echo RDev: unable to create the client directory. 1>&2
+rem Some managed PCs leave an old RDev directory readable but not writable.
+rem Probe the directory before downloading; keep the old files and use the
+rem current user's roaming profile when the legacy location is locked down.
+> "%RDEV_HOME%\.write-test-%RANDOM%" echo ok
+if errorlevel 1 (
+  set "RDEV_HOME=%APPDATA%\RDev"
+  if not exist "%RDEV_HOME%" mkdir "%RDEV_HOME%" >nul 2>&1
+  > "%RDEV_HOME%\.write-test-%RANDOM%" echo ok
+)
+if errorlevel 1 (
+  echo RDev: unable to create a writable client directory. 1>&2
   exit /b 1
 )
+del /q "%RDEV_HOME%\.write-test-*" >nul 2>&1
 set "RDEV_SYSTEM=%SystemRoot%\System32"
 if defined PROCESSOR_ARCHITEW6432 if exist "%SystemRoot%\Sysnative\certutil.exe" set "RDEV_SYSTEM=%SystemRoot%\Sysnative"
 if not exist "%RDEV_SYSTEM%\certutil.exe" (
