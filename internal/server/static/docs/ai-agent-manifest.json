@@ -1,5 +1,5 @@
 {
-  "schema": "rdev.ai-agent-manifest.v6",
+  "schema": "rdev.ai-agent-manifest.v7",
   "default_authentication": "permanent_device_token",
   "windows_launchers": {
     "cmd": "/run.cmd",
@@ -33,7 +33,7 @@
       "FEIDU_DRIVE_TOKEN": "token"
     },
     "tool": "/skills/rdev-agent/scripts/rdev-agent.py",
-    "tool_sha256": "7a1d2c08fadecbf1abf988a50349b7959ad40df04eb659c3758c29f3e7d7c83c",
+    "tool_sha256": "9cf8c9dfc36b5296adaa8f35a9d4e979340a457ddf6afcf692b259b55bde364a",
     "stdin_encoding": "utf-8; utf-16/utf-32 require BOM",
     "skill": "/skills/rdev-agent/SKILL.md",
     "input": "access_json_or_handoff_with_one_json_code_block"
@@ -90,5 +90,56 @@
   "documentation": {
     "human": "/docs/ai-agent-artifact-bridge.md",
     "repository": "docs/ai-agent-artifact-bridge.md"
+  },
+  "ssh_websocket": {
+    "url": "wss://r.feidu.fit/ssh-ws",
+    "query_fields": [
+      "device"
+    ],
+    "subprotocols": [
+      "rdev-browser-v1",
+      "rdev-access-ticket.<credential>"
+    ],
+    "selected_subprotocol": "rdev-browser-v1",
+    "authentication": [
+      "permanent_token_with_ssh_capability",
+      "delegated_device_access_ticket"
+    ],
+    "ssh_authentication": "none_bound_to_authenticated_exact_device",
+    "transports": [
+      "auto",
+      "raw",
+      "wss"
+    ],
+    "auto_selection": "raw SSH banner probe before execution; WSS on failure; never replay commands",
+    "python_dependency": "websocket-client>=1.8,<2",
+    "proxy": "HTTPS_PROXY/https_proxy CONNECT; TLS verification; no redirects",
+    "supported": [
+      "shell",
+      "pty",
+      "exec",
+      "stderr",
+      "exit_status",
+      "ssh_channel_eof",
+      "sftp",
+      "scp_sftp_mode_OpenSSH_9+"
+    ],
+    "unsupported": [
+      "local_forward",
+      "remote_forward",
+      "dynamic_forward",
+      "agent_forward",
+      "x11_forward",
+      "legacy_scp_O"
+    ],
+    "limits": {
+      "message_bytes": 65536,
+      "connections_per_device": 8,
+      "connections_total": 128,
+      "handshake_seconds": 15,
+      "idle_seconds": 90,
+      "write_seconds": 15
+    },
+    "close": "WebSocket close is full transport close; SSH channel EOF remains independent"
   }
 }

@@ -15,7 +15,9 @@ import os
 import pathlib
 import posixpath
 import re
+import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -742,11 +744,114 @@ def run_open_ssh(args, program: str, extra: list[str]) -> int:
     common += ["-o", "PasswordAuthentication=yes", "-o", "PubkeyAuthentication=no", "-o", "NumberOfPasswordPrompts=1", "-o", "StrictHostKeyChecking=accept-new"]
     common += ["-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
     try:
+        transport = choose_ssh_transport(state_data, getattr(args, "transport", "auto"))
+        if transport == "wss":
+            if getattr(args, "local_forward", []) or getattr(args, "remote_forward", []) or getattr(args, "no_command", False):
+                raise AgentError("port forwarding is unavailable over WSS; use --transport raw")
+            require_websocket()
+            endpoint = urllib.parse.urlsplit(state_data["rdev_base"])
+            if endpoint.scheme != "https":
+                raise AgentError("WSS requires an HTTPS rdev_base")
+            environment["RDEV_WS_URL"] = urllib.parse.urlunsplit((
+                "wss", endpoint.netloc, "/ssh-ws",
+                urllib.parse.urlencode({"device": state_data["device_id"]}), ""))
+            proxy = [sys.executable, str(pathlib.Path(__file__).resolve()), "_ssh-ws-stdio"]
+            proxy_command = subprocess.list2cmdline(proxy) if os.name == "nt" else shlex.join(proxy)
+            # OpenSSH expands percent tokens even inside quoted ProxyCommand paths.
+            proxy_command = proxy_command.replace("%", "%%")
+            common += ["-o", "ProxyCommand=" + proxy_command,
+                       "-o", "PreferredAuthentications=none",
+                       "-o", "ClearAllForwardings=yes", "-o", "ForwardAgent=no",
+                       "-o", "ForwardX11=no"]
+        else:
+            # Ignore user-configured proxies for an explicitly selected raw path.
+            common += ["-o", "ProxyCommand=none"]
         if permanent(state_data):
             return run_fixed_subprocess([executable, *common, *extra], environment)
         return run_maintained_subprocess(args.state, [executable, *common, *extra], environment)
     finally:
         temporary.cleanup()
+
+
+def choose_ssh_transport(state_data: dict, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    host = state_data.get("ssh_host") or urllib.parse.urlsplit(state_data["rdev_base"]).hostname
+    # Probe only: no authentication or command execution, hence no replay risk.
+    try:
+        with socket.create_connection((host, int(state_data["ssh_port"])), timeout=3) as probe:
+            probe.settimeout(3)
+            if probe.recv(255).startswith(b"SSH-2.0-"):
+                return "raw"
+    except OSError:
+        pass
+    return "wss"
+
+
+def require_websocket():
+    try:
+        import websocket
+    except ImportError:
+        raise AgentError("WSS requires websocket-client: python -m pip install 'websocket-client>=1.8,<2'") from None
+    return websocket
+
+
+def command_ws_stdio() -> int:
+    """Private OpenSSH ProxyCommand. stdout contains SSH bytes exclusively."""
+    websocket = require_websocket()
+    endpoint = os.environ.get("RDEV_WS_URL", "")
+    secret = os.environ.pop("RDEV_AGENT_SECRET", "")
+    if urllib.parse.urlsplit(endpoint).scheme != "wss" or not secret:
+        raise AgentError("WSS proxy runtime configuration is missing")
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+        msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+    connection = None
+    failed = threading.Event()
+    try:
+        websocket.enableTrace(False)
+        connection = websocket.create_connection(
+            endpoint, subprotocols=["rdev-browser-v1", "rdev-access-ticket." + secret],
+            timeout=15, redirect_limit=0, enable_multithread=True, suppress_origin=True)
+        secret = ""
+        if connection.getsubprotocol() != "rdev-browser-v1":
+            raise AgentError("WSS proxy protocol was not negotiated")
+        connection.settimeout(90)
+
+        def send_stdin():
+            try:
+                while True:
+                    block = os.read(sys.stdin.fileno(), 32768)
+                    if not block:
+                        break
+                    connection.send_binary(block)
+            except Exception:
+                failed.set()
+            finally:
+                # SSH channel EOF travels inside SSH packets. Transport EOF is a
+                # full disconnect, never a request to truncate pending SSH output.
+                connection.shutdown()
+
+        threading.Thread(target=send_stdin, daemon=True, name="rdev-wss-input").start()
+        while True:
+            opcode, block = connection.recv_data()
+            if opcode == websocket.ABNF.OPCODE_CLOSE:
+                break
+            if opcode != websocket.ABNF.OPCODE_BINARY or len(block) > 65536:
+                raise AgentError("invalid WSS SSH frame")
+            view = memoryview(block)
+            while view:
+                count = os.write(sys.stdout.fileno(), view)
+                view = view[count:]
+        return 1 if failed.is_set() else 0
+    except Exception:
+        # Library exceptions can contain response headers. Never echo them.
+        print("rdev-agent: WSS SSH connection ended or was rejected", file=sys.stderr)
+        return 1
+    finally:
+        if connection is not None:
+            connection.shutdown()
 
 
 def run_fixed_subprocess(command: list[str], environment: dict[str, str]) -> int:
@@ -786,6 +891,8 @@ def command_ssh(args) -> int:
         forwarding = ["-o", "ExitOnForwardFailure=yes", *forwarding]
     if args.no_command:
         forwarding.append("-N")
+    if getattr(args, "tty", False):
+        forwarding.append("-tt")
     return run_open_ssh(args, "ssh", [*forwarding, target, *command])
 
 
@@ -1039,17 +1146,22 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--observed-bytes-per-second", type=int, default=0)
     commands.add_parser("revoke")
     ssh = commands.add_parser("ssh")
+    ssh.add_argument("--transport", choices=("auto", "raw", "wss"), default="auto")
+    ssh.add_argument("-t", "--tty", action="store_true", help="request an interactive PTY")
     ssh.add_argument("-L", "--local-forward", action="append", default=[])
     ssh.add_argument("-R", "--remote-forward", action="append", default=[])
     ssh.add_argument("-N", "--no-command", action="store_true")
     ssh.add_argument("remote_command", nargs=argparse.REMAINDER)
     scp_to = commands.add_parser("scp-to")
+    scp_to.add_argument("--transport", choices=("auto", "raw", "wss"), default="auto")
     scp_to.add_argument("local_path")
     scp_to.add_argument("remote_path")
     scp_from = commands.add_parser("scp-from")
+    scp_from.add_argument("--transport", choices=("auto", "raw", "wss"), default="auto")
     scp_from.add_argument("remote_path")
     scp_from.add_argument("local_path")
     sftp = commands.add_parser("sftp")
+    sftp.add_argument("--transport", choices=("auto", "raw", "wss"), default="auto")
     sftp.add_argument("--batch-file", default="", help="SFTP batch file; '-' reads commands from stdin")
     drive = commands.add_parser("drive")
     drive.add_argument("drive_args", nargs=argparse.REMAINDER)
@@ -1082,6 +1194,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    if (sys.argv[1:] if argv is None else argv) == ["_ssh-ws-stdio"]:
+        try:
+            return command_ws_stdio()
+        except AgentError as error:
+            print(f"rdev-agent: {error}", file=sys.stderr)
+            return 2
     parser = build_parser()
     args = parser.parse_args(argv)
     if (args.import_clipboard or args.import_stdin) and args.command:

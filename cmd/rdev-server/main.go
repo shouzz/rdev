@@ -310,6 +310,7 @@ Examples:
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", srv.HandleWS)
 	mux.HandleFunc("/terminal", splitPageAndWebSocket(srv.StaticPageHandler("terminal.html"), srv.HandleTerminalWS))
+	mux.HandleFunc("/ssh-ws", sshServer.HandleWebSocket)
 	mux.HandleFunc("/desktop", srv.HandleDesktopWS)
 	mux.HandleFunc("/gpu-desktop-tunnel", srv.HandleGPUDesktopTunnel)
 	mux.HandleFunc("/gpu-desktop/", srv.HandleGPUDesktopProxy)

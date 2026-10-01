@@ -16,7 +16,7 @@ describe("AI Agent artifact bridge", () => {
       ),
     );
 
-    expect(repository.schema).toBe("rdev.ai-agent-manifest.v6");
+    expect(repository.schema).toBe("rdev.ai-agent-manifest.v7");
     expect(repository.default_authentication).toBe("permanent_device_token");
     expect(repository.permanent_access.schema).toBe("rdev-device-access.v1");
     expect(repository.permanent_access.fields).toEqual([

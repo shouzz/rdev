@@ -19,6 +19,8 @@ python rdev-agent.py --device DEVICE-ID drive resume-upload UPLOAD-SESSION-ID ./
 网盘对象使用列表返回的 `content_id`。`operation_id` 为上传任务 UUID；恢复使用原上传会话。
 工具自动加载设备 Token 并提供给 SSH/SFTP 和网盘 API（`FEIDU_DRIVE_TOKEN`）。
 
+受 HTTPS 代理限制时，以上 SSH/SFTP/SCP 命令在 raw TCP 预探测失败后自动使用认证 WSS；也可在子命令后加 `--transport wss`。安装 `websocket-client>=1.8,<2`，使用 OpenSSH 9+ 的 SFTP 模式 SCP。WSS 不支持端口转发；传输参数和限制见 [skill](../skills/rdev-agent/SKILL.md)。每次人工传输核对源端和目标端的大小及 SHA-256；控制请求成功不能替代文件校验。
+
 ## 大文件直传与恢复
 
 设备与网盘直接传输，无需经过 AI 本机。网页超过 100 MiB 时自动使用中转。

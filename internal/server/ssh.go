@@ -32,6 +32,9 @@ type SSHServer struct {
 	fwdHandler          *ForwardedTCPHandler // for -R port forwarding
 	ticketConnectionsMu sync.Mutex
 	ticketConnections   map[string]map[string]io.Closer
+	wsMu                sync.Mutex
+	wsConnections       map[string]int
+	wsTotal             int
 }
 
 type sshContextKey struct{}
