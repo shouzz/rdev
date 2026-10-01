@@ -135,13 +135,13 @@ describe("AI Agent artifact bridge", () => {
   });
 
   test("launchers prefer the verified managed clients", async () => {
-    const expectedRevision = "feidu-20260905-7be947e";
+    const expectedRevision = "v0.2.121-feidu.33-049a608";
     const expectedWindowsHash =
-      "9a72a3dfa04696a2b2b67f13a51daa533c8dc4757dd2d92b962576d298185abd";
+      "c61725cdcda09839df1e4f0e95738239b226ca46b5b9594b272db15e12a8a7aa";
     const expectedLinuxAMD64Hash =
-      "f096771469099050590688ca663b947b5130951d00658f325b997744de2bc212";
+      "6601ca0ee369d3ce34d5ffbc1c09050d55dc44531a33e64e7765cd4ac2eff550";
     const expectedLinuxARM64Hash =
-      "8041966da8428b4c32d92e62576b7009d09507c999070dfa1af5f35f58fb490b";
+      "03ecc21099868ab13ed0c7929fb94da63745f7a72b4404bc5b979a896f2e9535";
     const powershell = await readFile(
       resolve(root, "internal/server/static/run.ps1"),
       "utf8",
