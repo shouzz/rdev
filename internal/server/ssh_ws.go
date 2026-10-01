@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gliderlabs/ssh"
@@ -21,7 +22,32 @@ const (
 	sshWSHandshake  = 15 * time.Second
 	sshWSIdle       = 90 * time.Second
 	sshWSWrite      = 15 * time.Second
+	sshWSLifetime   = 24 * time.Hour
 )
+
+// Two pipes give each stream direction an independent EOF and deadline.
+type sshWSDuplex struct {
+	reader net.Conn
+	writer net.Conn
+}
+
+func sshWSPipe() (*sshWSDuplex, *sshWSDuplex) {
+	aRead, bWrite := net.Pipe()
+	bRead, aWrite := net.Pipe()
+	return &sshWSDuplex{aRead, aWrite}, &sshWSDuplex{bRead, bWrite}
+}
+func (c *sshWSDuplex) Read(p []byte) (int, error)         { return c.reader.Read(p) }
+func (c *sshWSDuplex) Write(p []byte) (int, error)        { return c.writer.Write(p) }
+func (c *sshWSDuplex) CloseWrite() error                  { return c.writer.Close() }
+func (c *sshWSDuplex) Close() error                       { _ = c.reader.Close(); return c.writer.Close() }
+func (c *sshWSDuplex) LocalAddr() net.Addr                { return c.reader.LocalAddr() }
+func (c *sshWSDuplex) RemoteAddr() net.Addr               { return c.reader.RemoteAddr() }
+func (c *sshWSDuplex) SetReadDeadline(t time.Time) error  { return c.reader.SetReadDeadline(t) }
+func (c *sshWSDuplex) SetWriteDeadline(t time.Time) error { return c.writer.SetWriteDeadline(t) }
+func (c *sshWSDuplex) SetDeadline(t time.Time) error {
+	_ = c.SetReadDeadline(t)
+	return c.SetWriteDeadline(t)
+}
 
 // Authentication is performed before upgrade, independently of control-plane
 // access and browser terminal permissions. Never forward a credential to SSH.
@@ -107,7 +133,7 @@ func (s *SSHServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.releaseWebSocket(auth.DeviceID)
 
-	bridge, backend := net.Pipe()
+	bridge, backend := sshWSPipe()
 	defer bridge.Close()
 	defer backend.Close()
 	handler := &sshWSBridge{pipe: bridge, idle: sshWSIdle, write: sshWSWrite}
@@ -135,6 +161,8 @@ func (s *SSHServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 func (s *SSHServer) watchWebSocketAuthorization(auth deviceAuthorization, socket *gws.Conn, done <-chan struct{}) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	deadline := time.NewTimer(sshWSLifetime)
+	defer deadline.Stop()
 	for {
 		client, ok := s.srv.GetClient(auth.DeviceID)
 		if !ok || !s.srv.deviceAuthorizationValid(auth, client) {
@@ -144,6 +172,10 @@ func (s *SSHServer) watchWebSocketAuthorization(auth deviceAuthorization, socket
 		}
 		select {
 		case <-done:
+			return
+		case <-deadline.C:
+			_ = socket.SetWriteDeadline(time.Now().Add(sshWSWrite))
+			_ = socket.WriteClose(1008, []byte("connection lifetime ended"))
 			return
 		case <-ticker.C:
 		}
@@ -180,22 +212,41 @@ func (s *SSHServer) serveWebSocketSSH(conn net.Conn, auth deviceAuthorization) {
 
 type sshWSBridge struct {
 	gws.BuiltinEventHandler
-	pipe  net.Conn
-	idle  time.Duration
-	write time.Duration
+	pipe    net.Conn
+	idle    time.Duration
+	write   time.Duration
+	eof     bool
+	writeMu sync.Mutex
 }
 
 func (h *sshWSBridge) OnClose(_ *gws.Conn, _ error) { _ = h.pipe.Close() }
 
+func (h *sshWSBridge) OnPing(socket *gws.Conn, payload []byte) {
+	_ = socket.SetReadDeadline(time.Now().Add(h.idle))
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	_ = socket.SetWriteDeadline(time.Now().Add(h.write))
+	_ = socket.WritePong(payload)
+}
+
 func (h *sshWSBridge) OnMessage(socket *gws.Conn, message *gws.Message) {
 	defer message.Close()
-	if message.Opcode != gws.OpcodeBinary {
+	if message.Opcode != gws.OpcodeBinary || h.eof {
 		_ = socket.SetWriteDeadline(time.Now().Add(h.write))
 		_ = socket.WriteClose(1003, []byte("binary SSH data required"))
 		_ = h.pipe.Close()
 		return
 	}
 	_ = socket.SetReadDeadline(time.Now().Add(h.idle))
+	if len(message.Bytes()) == 0 {
+		h.eof = true
+		if half, ok := h.pipe.(interface{ CloseWrite() error }); ok {
+			_ = half.CloseWrite()
+		} else {
+			_ = h.pipe.Close()
+		}
+		return
+	}
 	_ = h.pipe.SetWriteDeadline(time.Now().Add(h.write))
 	if _, err := h.pipe.Write(message.Bytes()); err != nil {
 		_ = socket.NetConn().Close()
@@ -208,8 +259,11 @@ func (h *sshWSBridge) pump(socket *gws.Conn) {
 	for {
 		n, err := h.pipe.Read(buffer)
 		if n > 0 {
+			h.writeMu.Lock()
 			_ = socket.SetWriteDeadline(time.Now().Add(h.write))
-			if socket.WriteMessage(gws.OpcodeBinary, buffer[:n]) != nil {
+			writeErr := socket.WriteMessage(gws.OpcodeBinary, buffer[:n])
+			h.writeMu.Unlock()
+			if writeErr != nil {
 				_ = socket.NetConn().Close()
 				return
 			}

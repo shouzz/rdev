@@ -316,7 +316,7 @@ class RDevAgentTest(unittest.TestCase):
         state = {"rdev_ticket": Handler.ticket, "ssh_port": 18112}
         temporary = mock.Mock()
         environment = {"SSH_ASKPASS_REQUIRE": "force"}
-        args = mock.Mock(state=self.state, transport="raw")
+        args = mock.Mock(state=self.state)
         with (
             mock.patch.object(rdev_agent, "maintained_state", return_value=(state, {})),
             mock.patch.object(rdev_agent.shutil, "which", return_value="scp.exe"),
@@ -498,7 +498,7 @@ class PermanentAccessTest(unittest.TestCase):
         process = mock.Mock()
         process.wait.return_value = 255
         with mock.patch.object(rdev_agent.subprocess, "Popen", return_value=process) as popen, mock.patch.object(rdev_agent.shutil, "which", return_value="ssh"), mock.patch.object(rdev_agent, "run_maintained_subprocess", side_effect=AssertionError("lease path")):
-            code, _, errors = self.run_main(["ssh", "--transport", "raw", "--", "hostname"])
+            code, _, errors = self.run_main(["ssh", "--", "hostname"])
         self.assertEqual((code, errors), (255, ""))
         self.assertEqual(popen.call_count, 1)
         self.assertEqual(process.wait.call_args, mock.call())  # no short command deadline
@@ -515,7 +515,7 @@ class PermanentAccessTest(unittest.TestCase):
     def test_sftp_batch_and_drive_use_saved_service_and_credential(self):
         data = self.save_access()
         with mock.patch.object(rdev_agent, "run_fixed_subprocess", return_value=0) as run, mock.patch.object(rdev_agent.shutil, "which", return_value="sftp"):
-            self.assertEqual(self.run_main(["sftp", "--transport", "raw", "--batch-file", "-"])[0], 0)
+            self.assertEqual(self.run_main(["sftp", "--batch-file", "-"])[0], 0)
             command, environment = run.call_args.args
             self.assertEqual(command[:3], ["sftp", "-P", "18112"])
             self.assertIn("BatchMode=no", command)
