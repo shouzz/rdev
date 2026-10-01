@@ -147,7 +147,7 @@ func (s *Server) handleMaintenanceToken(w http.ResponseWriter, r *http.Request) 
 	}
 	if err = s.installMaintenanceToken(deviceID, grant); err != nil {
 		switch {
-		case errors.Is(err, os.ErrNotExist):
+		case err == os.ErrNotExist:
 			http.NotFound(w, r)
 		case errors.Is(err, errMaintenanceConflict), errors.Is(err, errManagedDeviceRevoked):
 			http.Error(w, "maintenance token conflicts with stored device state", http.StatusConflict)

@@ -756,7 +756,11 @@ def run_open_ssh(args, program: str, extra: list[str]) -> int:
                 "wss", endpoint.netloc, "/ssh-ws",
                 urllib.parse.urlencode({"device": state_data["device_id"]}), ""))
             proxy = [sys.executable, str(pathlib.Path(__file__).resolve()), "_ssh-ws-stdio"]
-            proxy_command = subprocess.list2cmdline(proxy) if os.name == "nt" else shlex.join(proxy)
+            # Git for Windows OpenSSH uses sh; Windows OpenSSH uses Win32 quoting.
+            git_shell = os.name == "nt" and pathlib.Path(executable).with_name("sh.exe").is_file()
+            if git_shell:
+                proxy = [value.replace("\\", "/") for value in proxy]
+            proxy_command = subprocess.list2cmdline(proxy) if os.name == "nt" and not git_shell else shlex.join(proxy)
             # OpenSSH expands percent tokens even inside quoted ProxyCommand paths.
             proxy_command = proxy_command.replace("%", "%%")
             common += ["-o", "ProxyCommand=" + proxy_command,
@@ -809,6 +813,7 @@ def command_ws_stdio() -> int:
         msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
     connection = None
     failed = threading.Event()
+    input_ended = threading.Event()
     try:
         websocket.enableTrace(False)
         connection = websocket.create_connection(
@@ -831,6 +836,7 @@ def command_ws_stdio() -> int:
             finally:
                 # SSH channel EOF travels inside SSH packets. Transport EOF is a
                 # full disconnect, never a request to truncate pending SSH output.
+                input_ended.set()
                 connection.shutdown()
 
         threading.Thread(target=send_stdin, daemon=True, name="rdev-wss-input").start()
@@ -846,6 +852,8 @@ def command_ws_stdio() -> int:
                 view = view[count:]
         return 1 if failed.is_set() else 0
     except Exception:
+        if input_ended.is_set() and not failed.is_set():
+            return 0
         # Library exceptions can contain response headers. Never echo them.
         print("rdev-agent: WSS SSH connection ended or was rejected", file=sys.stderr)
         return 1
