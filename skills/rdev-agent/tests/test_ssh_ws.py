@@ -1,6 +1,8 @@
 import argparse
 import contextlib
 import io
+import hashlib
+import json
 import pathlib
 import socket
 import unittest
@@ -10,6 +12,17 @@ from test_rdev_agent import rdev_agent as agent
 
 
 class SSHWebSocketTest(unittest.TestCase):
+    def test_distributed_script_hash_and_copies(self):
+        root = pathlib.Path(__file__).resolve().parents[3]
+        relative = pathlib.Path("skills/rdev-agent/scripts/rdev-agent.py")
+        content = (root / relative).read_bytes()
+        manifest_path = pathlib.Path("docs/ai-agent-manifest.json")
+        manifest = json.loads((root / manifest_path).read_text("utf8"))
+        self.assertEqual(manifest["permanent_access"]["tool_sha256"], hashlib.sha256(content).hexdigest())
+        for base in ("web/public", "internal/server/static"):
+            self.assertEqual((root / base / relative).read_bytes(), content)
+            self.assertEqual((root / base / manifest_path).read_bytes(), (root / manifest_path).read_bytes())
+
     def state(self):
         return {"schema": agent.ACCESS_SCHEMA, "device_id": "device-精确",
                 "rdev_base": "https://example.test", "ssh_host": "example.test",
@@ -45,6 +58,7 @@ class SSHWebSocketTest(unittest.TestCase):
             self.assertNotIn(self.state()["token"], " ".join(argv))
             self.assertIn("PreferredAuthentications=none", argv)
             self.assertIn("ClearAllForwardings=yes", argv)
+            self.assertIn("ControlPath=none", argv)
             self.assertTrue(environment["RDEV_WS_URL"].startswith("wss://example.test/ssh-ws?device="))
             self.assertNotIn(self.state()["token"], environment["RDEV_WS_URL"])
         temporary.cleanup.assert_called_once()

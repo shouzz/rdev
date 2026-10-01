@@ -765,6 +765,7 @@ def run_open_ssh(args, program: str, extra: list[str]) -> int:
             proxy_command = proxy_command.replace("%", "%%")
             common += ["-o", "ProxyCommand=" + proxy_command,
                        "-o", "PreferredAuthentications=none",
+                       "-o", "ControlMaster=no", "-o", "ControlPath=none",
                        "-o", "ClearAllForwardings=yes", "-o", "ForwardAgent=no",
                        "-o", "ForwardX11=no"]
         else:
