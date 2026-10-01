@@ -38,9 +38,9 @@ if ($env:RDEV_MIRRORS) {
 }
 $script:Repo = 'icepie/rdev'
 $script:DefaultControlBase = 'https://r.feidu.fit'
-$script:LocalClientRevision = 'v0.2.121-feidu.34-27fd605'
+$script:LocalClientRevision = 'v0.2.121-feidu.34-29a6849'
 $script:LocalWindowsAMD64Asset = 'rdev-client-windows-amd64.exe'
-$script:LocalWindowsAMD64SHA256 = '0a7ce52f6a34ce5f33470a5bd31cb8f37659550a3106d515ce46d19c38c66893'
+$script:LocalWindowsAMD64SHA256 = '8592b7cb6356476c3f1015f892ab206101762581c721e3a5990ea80afdf08074'
 $script:WindowsClientHashes = @{
     'rdev-client-windows-amd64.exe' = $script:LocalWindowsAMD64SHA256
     'rdev-client-windows-win7-rtm-amd64.exe' = '081247e2610c9798520691a1bb8dab2bbd7b2e0689ab2f711508af67fb7dab88'
