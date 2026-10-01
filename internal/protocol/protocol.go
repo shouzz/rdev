@@ -11,6 +11,8 @@ import (
 type MessageType string
 
 const (
+	MsgDeviceAction       MessageType = "device_action"
+	MsgDeviceActionResult MessageType = "device_action_result"
 	// Control (text frames)
 	MsgRegister      MessageType = "register"       // C->S: register with ID + password
 	MsgRegisterError MessageType = "register_error" // S->C: registration rejected
@@ -120,12 +122,16 @@ const (
 
 // Message is the WebSocket protocol message (for text/JSON frames)
 type Message struct {
-	Type          MessageType `json:"type"`
-	ClientID      string      `json:"clientId,omitempty"`
-	SessionID     string      `json:"sessionId,omitempty"`
-	ClientVersion string      `json:"clientVersion,omitempty"`
-	Platform      string      `json:"platform,omitempty"`
-	Architecture  string      `json:"architecture,omitempty"`
+	DeviceManagementV1 bool        `json:"deviceManagementV1,omitempty"`
+	Action             string      `json:"action,omitempty"`
+	ActionState        string      `json:"actionState,omitempty"`
+	DeleteIdentity     bool        `json:"deleteIdentity,omitempty"`
+	Type               MessageType `json:"type"`
+	ClientID           string      `json:"clientId,omitempty"`
+	SessionID          string      `json:"sessionId,omitempty"`
+	ClientVersion      string      `json:"clientVersion,omitempty"`
+	Platform           string      `json:"platform,omitempty"`
+	Architecture       string      `json:"architecture,omitempty"`
 
 	// Client registration identity. InstanceID is a stable per-process token used
 	// to distinguish duplicate IDs from reconnects of the same running client.

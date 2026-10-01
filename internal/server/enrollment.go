@@ -33,6 +33,7 @@ const (
 	managedDeviceRegistryV2   = "rdev-device-registry.v2"
 	managedDeviceRegistryV3   = "rdev-device-registry.v3"
 	managedDeviceRegistryV4   = "rdev-device-registry.v4"
+	managedDeviceRegistryV6   = "rdev-device-registry.v6"
 	managedDeviceRegistryV5   = "rdev-device-registry.v5"
 )
 
@@ -52,6 +53,7 @@ type enrollmentInvite struct {
 }
 
 type managedDevice struct {
+	DisplayName       string
 	ID                string
 	OwnerSubject      string
 	SecretHash        string
@@ -69,6 +71,7 @@ type managedDeviceRegistry struct {
 }
 
 type managedDeviceRegistryRecord struct {
+	DisplayName       string                 `json:"display_name,omitempty"`
 	ID                string                 `json:"id"`
 	OwnerSubject      string                 `json:"owner_subject"`
 	SecretHash        string                 `json:"secret_hash"`
@@ -267,6 +270,14 @@ func (s *Server) HandleManagedDeviceLifecycleAPI(w http.ResponseWriter, r *http.
 	if !s.requireEnrollmentControl(w, r) {
 		return
 	}
+	if strings.HasSuffix(r.URL.EscapedPath(), "/name") {
+		s.handleDeviceName(w, r)
+		return
+	}
+	if strings.HasSuffix(r.URL.EscapedPath(), "/actions") {
+		s.handleDeviceActions(w, r)
+		return
+	}
 	if strings.HasSuffix(r.URL.EscapedPath(), "/maintenance-token") {
 		s.handleMaintenanceToken(w, r)
 		return
@@ -399,6 +410,7 @@ func (s *Server) HandleEnrollmentRedeemAPI(w http.ResponseWriter, r *http.Reques
 		CreatedAt: storedAt, UpdatedAt: storedAt,
 	}
 	if replacing {
+		updatedDevice.DisplayName = originalDevice.DisplayName
 		updatedDevice.CreatedAt = originalDevice.CreatedAt
 		updatedDevice.MaintenanceToken = originalDevice.MaintenanceToken
 		updatedDevice.CredentialVersion, err = nextManagedDeviceCredentialVersion(originalDevice.CredentialVersion)
@@ -832,10 +844,13 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 	if err = decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return errors.New("decode managed device registry: trailing data")
 	}
-	if registry.Schema != managedDeviceRegistryV2 && registry.Schema != managedDeviceRegistryV3 && registry.Schema != managedDeviceRegistryV4 && registry.Schema != managedDeviceRegistryV5 {
+	if registry.Schema != managedDeviceRegistryV2 && registry.Schema != managedDeviceRegistryV3 && registry.Schema != managedDeviceRegistryV4 && registry.Schema != managedDeviceRegistryV5 && registry.Schema != managedDeviceRegistryV6 {
 		return errors.New("managed device registry schema is invalid")
 	}
 	for _, record := range registry.Devices {
+		if !validDisplayName(record.DisplayName) {
+			return errors.New("invalid device display name")
+		}
 		if err = validateManagedDeviceID(record.ID); err != nil {
 			return fmt.Errorf("managed device registry id: %w", err)
 		}
@@ -871,7 +886,7 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 			return errors.New("managed device registry contains duplicate ids")
 		}
 		if record.MaintenanceToken != nil {
-			if (registry.Schema != managedDeviceRegistryV4 && registry.Schema != managedDeviceRegistryV5) || normalizeMaintenanceGrant(record.MaintenanceToken) != nil {
+			if (registry.Schema != managedDeviceRegistryV4 && registry.Schema != managedDeviceRegistryV5 && registry.Schema != managedDeviceRegistryV6) || normalizeMaintenanceGrant(record.MaintenanceToken) != nil {
 				return errors.New("managed device maintenance grant is invalid")
 			}
 			for _, other := range s.managedDevices {
@@ -881,7 +896,7 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 			}
 		}
 		s.managedDevices[record.ID] = managedDevice{
-			ID: record.ID, OwnerSubject: record.OwnerSubject, SecretHash: record.SecretHash,
+			DisplayName: record.DisplayName, ID: record.ID, OwnerSubject: record.OwnerSubject, SecretHash: record.SecretHash,
 			CredentialVersion: credentialVersion, CreatedAt: createdAt, UpdatedAt: updatedAt, RevokedAt: revokedAt,
 			MaintenanceToken: record.MaintenanceToken,
 		}
@@ -908,7 +923,7 @@ func (s *Server) loadManagedDeviceRegistryLocked() error {
 		if parseErr != nil {
 			return errors.New("enrollment registry created_at is invalid")
 		}
-		expiresAt, parseErr := parseRegistryTime(record.ExpiresAt, registry.Schema != managedDeviceRegistryV5)
+		expiresAt, parseErr := parseRegistryTime(record.ExpiresAt, registry.Schema != managedDeviceRegistryV5 && registry.Schema != managedDeviceRegistryV6)
 		if parseErr != nil || (!expiresAt.IsZero() && !expiresAt.After(createdAt)) || (expiresAt.IsZero() && record.ExpiresAt != "") {
 			return errors.New("enrollment registry expires_at is invalid")
 		}
@@ -964,7 +979,7 @@ func (s *Server) persistManagedDeviceRegistryLocked() error {
 	for _, id := range ids {
 		device := s.managedDevices[id]
 		record := managedDeviceRegistryRecord{
-			ID: id, OwnerSubject: device.OwnerSubject, SecretHash: device.SecretHash,
+			DisplayName: device.DisplayName, ID: id, OwnerSubject: device.OwnerSubject, SecretHash: device.SecretHash,
 			CredentialVersion: device.CredentialVersion,
 			MaintenanceToken:  device.MaintenanceToken,
 			CreatedAt:         device.CreatedAt.UTC().Format(time.RFC3339), UpdatedAt: device.UpdatedAt.UTC().Format(time.RFC3339),
@@ -1002,6 +1017,12 @@ func (s *Server) persistManagedDeviceRegistryLocked() error {
 			record.RevokedAt = invite.RevokedAt.UTC().Format(time.RFC3339)
 		}
 		registry.Enrollments = append(registry.Enrollments, record)
+	}
+	for _, d := range registry.Devices {
+		if d.DisplayName != "" {
+			registry.Schema = managedDeviceRegistryV6
+			break
+		}
 	}
 	data, err := json.MarshalIndent(registry, "", "  ")
 	if err != nil {

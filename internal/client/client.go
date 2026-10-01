@@ -217,6 +217,7 @@ type managedUpload struct {
 
 // Client is the rdev client that connects to the server
 type Client struct {
+	management      clientManagement
 	serverURL       string
 	clientID        string
 	requestedID     string
@@ -1053,6 +1054,8 @@ func (c *Client) handleMessage(msg *protocol.Message) {
 		go c.handleManagedDownloadStart(msg)
 	case protocol.MsgFileTransferCancel:
 		c.handleManagedTransferCancel(msg.TaskID)
+	case protocol.MsgDeviceAction:
+		c.handleDeviceAction(msg)
 	case protocol.MsgCloudTransferStart:
 		c.handleCloudTransferStart(msg)
 	case protocol.MsgDesktopStart:
@@ -1077,6 +1080,7 @@ func (c *Client) registrationMessage() *protocol.Message {
 		Type: protocol.MsgRegister, ClientID: c.requestedID, InstanceID: c.instanceID,
 		ClientVersion: c.version, Platform: runtime.GOOS, Architecture: runtime.GOARCH,
 		Password: c.password, DeviceSecret: c.deviceSecret,
+		DeviceManagementV1:  c.management.handler != nil,
 		DesktopCapabilities: desktopCapabilities(), LogSupported: true, CloudTransferV1: true, PeripheralV1: true,
 	}
 }

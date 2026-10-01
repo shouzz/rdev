@@ -70,31 +70,32 @@ var (
 
 // ClientConn represents a connected client device
 type ClientConn struct {
-	ID              string
-	RequestedID     string
-	InstanceID      string
-	Version         string
-	Platform        string
-	Architecture    string
-	TransportName   string
-	RemoteIP        string
-	Conn            *gws.Conn
-	Transport       DeviceTransport
-	ConnectedAt     time.Time
-	Password        string
-	Managed         bool
-	OwnerSubject    string
-	Sessions        map[string]*ProxySession
-	Forwards        map[string]*ProxyForward
-	Desktop         *protocol.DesktopCapabilities
-	LogSupported    bool
-	CloudTransferV1 bool
-	PeripheralV1    bool
-	Network         *deviceNetworkInfo
-	writeMu         sync.Mutex
-	mu              sync.Mutex
-	telemetryMu     sync.Mutex
-	telemetry       deviceTelemetry
+	ID                 string
+	RequestedID        string
+	InstanceID         string
+	Version            string
+	Platform           string
+	Architecture       string
+	TransportName      string
+	RemoteIP           string
+	Conn               *gws.Conn
+	Transport          DeviceTransport
+	ConnectedAt        time.Time
+	Password           string
+	Managed            bool
+	OwnerSubject       string
+	Sessions           map[string]*ProxySession
+	Forwards           map[string]*ProxyForward
+	Desktop            *protocol.DesktopCapabilities
+	LogSupported       bool
+	CloudTransferV1    bool
+	DeviceManagementV1 bool
+	PeripheralV1       bool
+	Network            *deviceNetworkInfo
+	writeMu            sync.Mutex
+	mu                 sync.Mutex
+	telemetryMu        sync.Mutex
+	telemetry          deviceTelemetry
 }
 
 type DeviceTransport interface {
@@ -541,6 +542,7 @@ func (f *ReverseForward) Result() (uint32, string) {
 
 // Server manages WebSocket clients and SSH proxy
 type Server struct {
+	management               deviceManagement
 	clients                  map[string]*ClientConn
 	mu                       sync.RWMutex
 	sessions                 map[string]*ProxySession
@@ -807,26 +809,27 @@ func (h *wsHandler) handleRegister(socket *gws.Conn, msg *protocol.Message) {
 	remoteIPValue, _ := socket.Session().Load("remoteIP")
 	remoteIP, _ := remoteIPValue.(string)
 	client := &ClientConn{
-		ID:              clientID,
-		RequestedID:     clientID,
-		InstanceID:      instanceID,
-		Version:         msg.ClientVersion,
-		Platform:        platform,
-		Architecture:    architecture,
-		TransportName:   "wss",
-		RemoteIP:        remoteIP,
-		Conn:            socket,
-		Transport:       &wsDeviceTransport{conn: socket},
-		ConnectedAt:     time.Now(),
-		Password:        msg.Password,
-		Managed:         managed,
-		OwnerSubject:    h.srv.managedDeviceOwner(clientID),
-		Desktop:         cloneDesktopCapabilities(msg.DesktopCapabilities),
-		LogSupported:    msg.LogSupported,
-		CloudTransferV1: msg.CloudTransferV1,
-		PeripheralV1:    msg.PeripheralV1,
-		Sessions:        make(map[string]*ProxySession),
-		Forwards:        make(map[string]*ProxyForward),
+		ID:                 clientID,
+		RequestedID:        clientID,
+		InstanceID:         instanceID,
+		Version:            msg.ClientVersion,
+		Platform:           platform,
+		Architecture:       architecture,
+		TransportName:      "wss",
+		RemoteIP:           remoteIP,
+		Conn:               socket,
+		Transport:          &wsDeviceTransport{conn: socket},
+		ConnectedAt:        time.Now(),
+		Password:           msg.Password,
+		Managed:            managed,
+		OwnerSubject:       h.srv.managedDeviceOwner(clientID),
+		Desktop:            cloneDesktopCapabilities(msg.DesktopCapabilities),
+		LogSupported:       msg.LogSupported,
+		CloudTransferV1:    msg.CloudTransferV1,
+		DeviceManagementV1: msg.DeviceManagementV1,
+		PeripheralV1:       msg.PeripheralV1,
+		Sessions:           make(map[string]*ProxySession),
+		Forwards:           make(map[string]*ProxyForward),
 	}
 	client.initializeDeviceTelemetry(time.Now())
 	h.srv.prepareClientNetwork(client)
@@ -1231,25 +1234,26 @@ func (s *Server) registerStreamClient(transport DeviceTransport, msg *protocol.M
 	instanceID := strings.TrimSpace(msg.InstanceID)
 	platform, architecture := validateRegistrationRuntime(msg.Platform, msg.Architecture)
 	client := &ClientConn{
-		ID:              clientID,
-		RequestedID:     clientID,
-		InstanceID:      instanceID,
-		Version:         msg.ClientVersion,
-		Platform:        platform,
-		Architecture:    architecture,
-		TransportName:   label,
-		RemoteIP:        remoteIPFromAddress(transport.RemoteAddr()),
-		Transport:       transport,
-		ConnectedAt:     time.Now(),
-		Password:        msg.Password,
-		Managed:         managed,
-		OwnerSubject:    s.managedDeviceOwner(clientID),
-		Desktop:         cloneDesktopCapabilities(msg.DesktopCapabilities),
-		LogSupported:    msg.LogSupported,
-		CloudTransferV1: msg.CloudTransferV1,
-		PeripheralV1:    msg.PeripheralV1,
-		Sessions:        make(map[string]*ProxySession),
-		Forwards:        make(map[string]*ProxyForward),
+		ID:                 clientID,
+		RequestedID:        clientID,
+		InstanceID:         instanceID,
+		Version:            msg.ClientVersion,
+		Platform:           platform,
+		Architecture:       architecture,
+		TransportName:      label,
+		RemoteIP:           remoteIPFromAddress(transport.RemoteAddr()),
+		Transport:          transport,
+		ConnectedAt:        time.Now(),
+		Password:           msg.Password,
+		Managed:            managed,
+		OwnerSubject:       s.managedDeviceOwner(clientID),
+		Desktop:            cloneDesktopCapabilities(msg.DesktopCapabilities),
+		LogSupported:       msg.LogSupported,
+		CloudTransferV1:    msg.CloudTransferV1,
+		DeviceManagementV1: msg.DeviceManagementV1,
+		PeripheralV1:       msg.PeripheralV1,
+		Sessions:           make(map[string]*ProxySession),
+		Forwards:           make(map[string]*ProxyForward),
 	}
 	client.initializeDeviceTelemetry(time.Now())
 	s.prepareClientNetwork(client)
@@ -1400,6 +1404,8 @@ func (s *Server) handleClientMessage(client *ClientConn, msg *protocol.Message) 
 		s.handleDesktopMessage(msg)
 	case protocol.MsgLogBatch:
 		s.handleClientLogBatch(client, msg)
+	case protocol.MsgDeviceActionResult:
+		s.handleDeviceActionResult(client, msg)
 	case protocol.MsgCloudTransferResult:
 		s.handleCloudTransferResult(client, msg)
 	case protocol.MsgPeripheralListResult, protocol.MsgSerialOpenResult, protocol.MsgSerialCloseResult, protocol.MsgSerialWriteResult, protocol.MsgSerialError:
@@ -1943,25 +1949,32 @@ func (s *Server) HandleTerminalAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	clients := make([]*ClientConn, 0, len(s.clients))
+	for _, c := range s.clients {
+		clients = append(clients, c)
+	}
+	s.mu.RUnlock()
 
 	type deviceInfo struct {
-		ID              string                        `json:"id"`
-		RequestedID     string                        `json:"requestedId,omitempty"`
-		ConnectedAt     string                        `json:"connectedAt"`
-		Version         string                        `json:"version,omitempty"`
-		HasPassword     bool                          `json:"hasPassword"`
-		Desktop         *protocol.DesktopCapabilities `json:"desktop,omitempty"`
-		GPUDesktop      bool                          `json:"gpuDesktop,omitempty"`
-		LogSupported    bool                          `json:"logSupported,omitempty"`
-		CloudTransferV1 bool                          `json:"cloudTransferV1,omitempty"`
-		PeripheralV1    bool                          `json:"peripheralV1,omitempty"`
-		OwnerSubject    string                        `json:"ownerSubject,omitempty"`
+		DisplayName        string                        `json:"displayName,omitempty"`
+		DeviceManagementV1 bool                          `json:"deviceManagementV1,omitempty"`
+		ID                 string                        `json:"id"`
+		RequestedID        string                        `json:"requestedId,omitempty"`
+		ConnectedAt        string                        `json:"connectedAt"`
+		Version            string                        `json:"version,omitempty"`
+		HasPassword        bool                          `json:"hasPassword"`
+		Desktop            *protocol.DesktopCapabilities `json:"desktop,omitempty"`
+		GPUDesktop         bool                          `json:"gpuDesktop,omitempty"`
+		LogSupported       bool                          `json:"logSupported,omitempty"`
+		CloudTransferV1    bool                          `json:"cloudTransferV1,omitempty"`
+		PeripheralV1       bool                          `json:"peripheralV1,omitempty"`
+		OwnerSubject       string                        `json:"ownerSubject,omitempty"`
 	}
 
-	devices := make([]deviceInfo, 0, len(s.clients))
-	for _, c := range s.clients {
+	devices := make([]deviceInfo, 0, len(clients))
+	for _, c := range clients {
 		devices = append(devices, deviceInfo{
+			DisplayName: s.displayName(c.ID), DeviceManagementV1: c.DeviceManagementV1,
 			ID:              c.ID,
 			RequestedID:     c.RequestedID,
 			ConnectedAt:     c.ConnectedAt.Format(time.RFC3339),

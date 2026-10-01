@@ -3,6 +3,8 @@ package updater
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/minio/selfupdate"
@@ -51,8 +54,25 @@ type releaseInfo struct {
 }
 
 type releaseAsset struct {
-	Name string `json:"name"`
-	URL  string `json:"browser_download_url"`
+	Name   string `json:"name"`
+	URL    string `json:"browser_download_url"`
+	Digest string `json:"digest"`
+}
+
+var updateMu sync.Mutex
+var updatePending bool
+
+// Restart uses the same restart path as automatic updates.
+func Restart() error { return restartSelf() }
+
+// WaitForIdle is used after cancelling the automatic updater before stopping.
+func WaitForIdle() error {
+	updateMu.Lock()
+	defer updateMu.Unlock()
+	if updatePending {
+		return errors.New("an applied update is awaiting restart")
+	}
+	return nil
 }
 
 func Start(ctx context.Context, cfg Config) {
@@ -140,9 +160,23 @@ func (l *updateFailureLogger) recovered(logger *log.Logger) {
 }
 
 func CheckAndApply(ctx context.Context, cfg Config) (bool, error) {
+	return checkAndApply(ctx, cfg, func(data []byte) error {
+		return selfupdate.Apply(bytes.NewReader(data), selfupdate.Options{})
+	})
+}
+
+func checkAndApply(ctx context.Context, cfg Config, apply func([]byte) error) (bool, error) {
+	updateMu.Lock()
+	defer updateMu.Unlock()
+	if updatePending {
+		return false, errors.New("an applied update is awaiting restart")
+	}
+	if err := platformUpdateAllowed(); err != nil {
+		return false, err
+	}
 	current := normalizeVersion(cfg.Version)
 	if current == "" || current == "dev" {
-		return false, nil
+		return false, errors.New("development build has no upgrade version")
 	}
 	release, err := latestRelease(ctx)
 	if err != nil {
@@ -154,9 +188,11 @@ func CheckAndApply(ctx context.Context, cfg Config) (bool, error) {
 	}
 	assetName := releaseAssetName(cfg.App)
 	assetURL := ""
+	assetDigest := ""
 	for _, asset := range release.Assets {
 		if asset.Name == assetName {
 			assetURL = asset.URL
+			assetDigest = asset.Digest
 			break
 		}
 	}
@@ -167,18 +203,49 @@ func CheckAndApply(ctx context.Context, cfg Config) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := selfupdate.Apply(bytes.NewReader(data), selfupdate.Options{}); err != nil {
+	if err := verifyAssetDigest(data, assetDigest); err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := apply(data); err != nil {
 		if rollbackErr := selfupdate.RollbackError(err); rollbackErr != nil {
 			return false, fmt.Errorf("apply update failed: %w; rollback failed: %v", err, rollbackErr)
 		}
 		return false, err
 	}
+	updatePending = true
 	return true, nil
+}
+
+func verifyAssetDigest(data []byte, digest string) error {
+	want, err := hex.DecodeString(strings.TrimPrefix(digest, "sha256:"))
+	got := sha256.Sum256(data)
+	if !strings.HasPrefix(digest, "sha256:") || err != nil || len(want) != sha256.Size || !bytes.Equal(want, got[:]) {
+		return errors.New("release asset SHA-256 is missing or mismatched")
+	}
+	return nil
 }
 
 func latestRelease(ctx context.Context) (*releaseInfo, error) {
 	url := "https://api.github.com/repos/" + repo + "/releases/latest"
-	data, err := downloadJSONWithProxies(ctx, url)
+	// Obtain the release digest from GitHub over verified TLS. Download mirrors
+	// may supply asset bytes, but must not be able to replace their own digest.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "rdev-auto-updater")
+	response, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, errors.New("trusted release metadata request failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, errors.New("trusted release metadata unavailable")
+	}
+	data, err := readDownloadBody(io.LimitReader(response.Body, 4<<20))
 	if err != nil {
 		return nil, err
 	}

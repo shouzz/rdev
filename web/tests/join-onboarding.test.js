@@ -129,7 +129,7 @@ describe("RDev browser onboarding", () => {
       "utf8",
     );
     const hashGate = powershell.indexOf(
-      "$LocalHash -eq $script:LocalWindowsAMD64SHA256",
+      "$LocalHash -eq $script:WindowsClientHashes[$Asset]",
     );
     const rejectedLocalCleanup = powershell.indexOf(
       "if (-not $OK) { Remove-Item $OutPath -Force -EA SilentlyContinue }",
@@ -204,11 +204,11 @@ describe("RDev browser onboarding", () => {
       "function Test-RDevVerifiedManagedEnrollmentClient",
     );
     const assetGate = powershell.indexOf(
-      "$Asset -ne $script:LocalWindowsAMD64Asset",
+      "-not $script:WindowsClientHashes.ContainsKey($Asset)",
       verifier,
     );
     const hashGate = powershell.indexOf(
-      "(Get-RDevSHA256 $Path) -eq $script:LocalWindowsAMD64SHA256",
+      "(Get-RDevSHA256 $Path) -eq $script:WindowsClientHashes[$Asset]",
       assetGate,
     );
     const finalGate = powershell.lastIndexOf(
@@ -264,9 +264,11 @@ describe("RDev browser onboarding", () => {
 
     const command = dom.window.document.getElementById("command").textContent;
     expect(command).toContain(
-      `[Environment]::SetEnvironmentVariable('RDEV_ENROLLMENT_CODE','${invitation}','Process')`,
+      `set RDEV_ENROLLMENT_CODE=${invitation}&&`,
     );
-    expect(command).toContain("RDev 'https://rdev.example' -Enroll");
+    expect(command).toContain("cmd.exe /d /s /c");
+    expect(command).toContain("certutil -hashfile rdev-run.cmd SHA256");
+    expect(command).toContain("call rdev-run.cmd -Server https://rdev.example -Enroll -Persist");
     expect(command).not.toContain("Read-Host");
     dom.window.document.querySelector('[data-os="linux"]').click();
     expect(dom.window.document.getElementById("command").textContent).toContain(

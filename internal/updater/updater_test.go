@@ -3,7 +3,10 @@ package updater
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +15,66 @@ import (
 	"testing"
 	"time"
 )
+
+type updateTestTransport func(*http.Request) (*http.Response, error)
+
+func (f updateTestTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestCheckAndApplyIntegrityAndPendingRestart(t *testing.T) {
+	original := http.DefaultTransport
+	defer func() { http.DefaultTransport = original; updatePending = false }()
+	t.Setenv("RDEV_UPDATE_PROXY", "")
+	binary := []byte("fixture release bytes")
+	digest := fmt.Sprintf("sha256:%x", sha256.Sum256(binary))
+	tamper := true
+	http.DefaultTransport = updateTestTransport(func(r *http.Request) (*http.Response, error) {
+		var body string
+		if r.URL.Host == "api.github.com" {
+			body = fmt.Sprintf(`{"tag_name":"v2.0.0","assets":[{"name":%q,"browser_download_url":"https://github.com/icepie/rdev/releases/download/v2.0.0/client","digest":%q}]}`, releaseAssetName("client"), digest)
+		} else {
+			body = string(binary)
+			if tamper {
+				body = "corrupt release bytes"
+			}
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	applies := 0
+	apply := func(data []byte) error {
+		applies++
+		if !bytes.Equal(data, binary) {
+			t.Fatal("corrupt bytes reached executable replacement")
+		}
+		return nil
+	}
+	cfg := Config{App: "client", Version: "1.0.0"}
+	if updated, err := checkAndApply(context.Background(), cfg, apply); updated || err == nil || applies != 0 {
+		t.Fatal("corrupt release was not rejected before apply")
+	}
+	tamper = false
+	if updated, err := checkAndApply(context.Background(), cfg, apply); !updated || err != nil || applies != 1 {
+		t.Fatalf("verified release was not applied: updated=%v err=%v applies=%d", updated, err, applies)
+	}
+	if updated, err := checkAndApply(context.Background(), cfg, apply); updated || err == nil || applies != 1 {
+		t.Fatal("second update applied while awaiting restart")
+	}
+}
+
+func TestReleaseAssetDigestRequired(t *testing.T) {
+	data := []byte("release binary fixture")
+	digest := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+	if err := verifyAssetDigest(data, digest); err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []string{"", "sha256:00", strings.TrimPrefix(digest, "sha256:"), strings.Replace(digest, "sha256:", "sha512:", 1)} {
+		if verifyAssetDigest(data, invalid) == nil {
+			t.Fatal("invalid or missing digest accepted")
+		}
+	}
+	if verifyAssetDigest([]byte("tampered"), digest) == nil {
+		t.Fatal("tampered release binary accepted")
+	}
+}
 
 func TestNewerVersion(t *testing.T) {
 	tests := []struct {

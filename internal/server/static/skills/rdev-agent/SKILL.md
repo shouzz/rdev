@@ -25,6 +25,17 @@ python rdev-agent.py --device DEVICE-ID drive list --limit 100
 只有一台已保存设备时可省略 `--device`。`status` 查看本地接入信息。
 大文件直传和断点恢复见[文件传输](https://r.feidu.fit/docs/ai-agent-artifact-bridge.md)；命令参数见 `--help`。
 
+## 设备显示名与 RDev 维护
+
+使用经过认证的后端控制 API，不通过 SSH 拼接升级或停止脚本。详见[设备管理](https://r.feidu.fit/docs/device-management.md)。
+
+- 改名：`PATCH /api/control/devices/{精确ID}/name`，JSON 包含实际操作者 `subject` 与 `displayName`。空名称清除覆盖；名称持久化，不改变设备 ID、身份文件或 Token。
+- 维护：`POST /api/control/devices/{精确ID}/actions`，JSON 包含 `subject`、当前 `instanceId`、随机 32 位小写十六进制 `requestId` 和 `action`（`upgrade` / `stop` / `uninstall`）。设备须声明 `deviceManagementV1`。
+- 查询：同一路径 `GET`，通过 `subject`、`requestId` 查询结果。202 仅为已下发；升级后核对重新连接版本，停止后核对离线。不自动重放失败、未知或服务重启后丢失记录的操作。
+- 卸载需显式 `confirm:true` 和客户端本地 `--allow-remote-uninstall`。仅支持标准 Linux systemd 安装；其他系统拒绝。默认保留身份，只有明确要求 `deleteIdentity:true` 才删除配置的身份文件。
+
+控制凭据只放 `X-RDev-Control-Token` HTTPS 请求头，由可信后端保管，不输出、不放 URL、不放浏览器。设备 SSH Token 和浏览器票据不具备此权限。禁止按显示名猜 ID；不得把停止变成撤销身份或禁用下次开机启动。Win7 不使用普通在线升级通道，只接受专用 go-win7 构建和固定哈希。
+
 ## HTTPS 代理环境
 
 `ssh`、`scp-to`、`scp-from`、`sftp` 默认 `--transport auto`：执行前探测 raw SSH banner，TCP 不通时使用 `wss://r.feidu.fit/ssh-ws?device=<精确ID>`。可显式选择 `--transport wss` 或 `--transport raw`；命令已经开始后不切换传输、不重放。
@@ -45,3 +56,13 @@ Windows 设备的 SFTP 批处理绝对路径写成 `/C:/Users/.../file.bin`；`C
 WSS 明确禁止 `-L` / `-R` / `-D` / `-N`、Agent/X11 转发；服务端拒绝 direct-tcpip 和 tcpip-forward，即使绕过 CLI 也不能建立监听。需要端口转发时显式使用 `ssh --transport raw`。空二进制消息表示传输写 EOF 并继续读反向数据；WebSocket close 关闭整个传输；单个 SSH channel 的半关闭仍按 SSH 协议处理，不能用 WebSocket close 表示 stdin EOF。
 
 凭据只放 `rdev-access-ticket.<credential>` 子协议请求头；协商结果只返回 `rdev-browser-v1`。代理子进程从运行时环境取凭据，SSH 层使用已绑定身份的 none 认证，不把 Token 发给设备。禁止调试输出请求头。服务端限制：64 KiB 消息、每设备 8 / 总计 128 连接、SSH 握手 15 秒、空闲 90 秒、阻塞写 15 秒、连接最长 24 小时；OpenSSH 每 15 秒 keepalive。撤销、到期或设备实例更换在至多约 1 秒内关闭桥。
+
+## Managed device controls
+
+Managed devices keep a stable device ID while allowing a separate display name. The authenticated control API uses exact IDs:
+
+- PATCH `/api/control/devices/{DEVICE-ID}/name` with `{"subject":"OWNER","displayName":"NAME"}`; GET reads it.
+- POST `/api/control/devices/{DEVICE-ID}/actions` with `{"subject":"OWNER","instanceId":"INSTANCE","requestId":"32 lowercase hex chars","action":"upgrade|stop"}`.
+- Uninstall is explicit: use `action:"uninstall"`, `confirm:true`, and only when the client was started with `--allow-remote-uninstall`. `deleteIdentity:true` is required only when the protected identity should also be removed.
+
+Action requests are bound to the exact device ID and process instance, are idempotent by request ID, and never replay after a server restart. Upgrade verifies the release SHA-256 before applying it. Stop is one-shot; the client reports its state and exits intentionally. Standard Linux systemd installations support uninstall; other platforms return an explicit unsupported result. Never place a permanent device token in logs or display names.

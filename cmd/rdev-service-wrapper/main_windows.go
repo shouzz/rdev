@@ -151,6 +151,11 @@ func (s *wrapperService) Execute(args []string, requests <-chan svc.ChangeReques
 				log.Printf("unsupported service request: %v", request.Cmd)
 			}
 		case err := <-s.done:
+			if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 75 {
+				// RDev's authenticated one-shot stop is intentional, not a crash.
+				changes <- svc.Status{State: svc.Stopped}
+				return false, 0
+			}
 			if err != nil {
 				log.Printf("child exited: %v", err)
 			} else {

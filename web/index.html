@@ -563,7 +563,7 @@
                 if (!c.length) { tb.innerHTML = '<tr><td colspan="9" class="empty"><div class="empty-icon" data-icon="radio"></div><span data-i18n="index.waitingDevices">等待设备连接...</span></td></tr>'; return; }
                 tb.innerHTML = c.map(d => `<tr>
                     <td><span class="dot online"></span>${t('common.online')}</td>
-                    <td style="font-weight:600">${esc(d.id)}</td>
+                    <td style="font-weight:600">${esc(d.displayName || d.id)}${d.displayName ? `<br><small>${esc(d.id)}</small>` : ''}</td>
                     <td style="color:var(--muted)">${esc(d.version || '-')}</td>
                     <td style="color:var(--muted)">${ago(d.connectedAt)}</td>
                     <td>${d.sessions}</td><td>${d.forwards}</td>

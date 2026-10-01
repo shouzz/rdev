@@ -20,6 +20,8 @@ const (
 )
 
 type deviceInfo struct {
+	DisplayName                      string                        `json:"displayName,omitempty"`
+	DeviceManagementV1               bool                          `json:"deviceManagementV1,omitempty"`
 	ID                               string                        `json:"id"`
 	RequestedID                      string                        `json:"requestedId,omitempty"`
 	InstanceID                       string                        `json:"instanceId,omitempty"`
@@ -76,6 +78,7 @@ func (s *Server) deviceInfo(client *ClientConn) deviceInfo {
 	client.mu.Unlock()
 	telemetry := client.deviceTelemetrySnapshot()
 	return deviceInfo{
+		DisplayName: s.displayName(client.ID), DeviceManagementV1: client.DeviceManagementV1,
 		ID:                               client.ID,
 		RequestedID:                      client.RequestedID,
 		InstanceID:                       client.InstanceID,

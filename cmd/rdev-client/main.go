@@ -24,18 +24,19 @@ var version = "dev"
 
 func main() {
 	var (
-		serverURL       string
-		clientID        string
-		password        string
-		identityFile    string
-		enrollStdin     bool
-		enrollOnly      bool
-		replaceExisting bool
-		shell           string
-		autoUpdate      = true
-		updateInterval  = time.Minute
-		reconnectMin    = time.Second
-		reconnectMax    = 30 * time.Second
+		serverURL            string
+		clientID             string
+		password             string
+		identityFile         string
+		enrollStdin          bool
+		enrollOnly           bool
+		replaceExisting      bool
+		allowRemoteUninstall bool
+		shell                string
+		autoUpdate           = true
+		updateInterval       = time.Minute
+		reconnectMin         = time.Second
+		reconnectMax         = 30 * time.Second
 	)
 
 	for i := 1; i < len(os.Args); i++ {
@@ -73,6 +74,8 @@ func main() {
 			}
 		case "--no-auto-update":
 			autoUpdate = false
+		case "--allow-remote-uninstall":
+			allowRemoteUninstall = true
 		case "--auto-update":
 			if i+1 < len(os.Args) {
 				autoUpdate = parseBoolDefault(os.Args[i+1], true)
@@ -115,6 +118,7 @@ Options:
 	  --replace-existing Replace a same-owner managed device with the requested ID
   --shell, -S     Shell to use (default: $SHELL or /bin/sh or cmd.exe)
   --no-auto-update Disable built-in GitHub release auto-update
+  --allow-remote-uninstall Allow explicit control-API uninstall (standard Linux systemd installation only)
   --auto-update    Enable/disable auto-update explicitly (true/false)
   --update-interval Auto-update polling interval (default 1m)
   --reconnect-min Minimum reconnect delay (default 1s)
@@ -303,7 +307,11 @@ Environment variables:
 		fmt.Println()
 	}
 
-	updater.Start(context.Background(), updater.Config{App: "client", Version: version, Enabled: autoUpdate, Interval: updateInterval})
+	updateContext, cancelUpdates := context.WithCancel(context.Background())
+	defer cancelUpdates()
+	updateConfig := updater.Config{App: "client", Version: version, Enabled: autoUpdate, Interval: updateInterval}
+	c.SetDeviceActionHandler(deviceActionHandler(updateConfig, identityFile, allowRemoteUninstall, cancelUpdates))
+	updater.Start(updateContext, updateConfig)
 
 	if err := c.Run(); err != nil {
 		log.Fatalf("client error: %v", err)

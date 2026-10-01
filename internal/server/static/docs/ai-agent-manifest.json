@@ -113,5 +113,25 @@
       "lifetime_seconds": 86400
     },
     "forwarding": "WSS rejects TCP, Agent, X11 forwarding; select raw for -L/-R/-N"
+  },
+  "device_management": {
+    "authentication": "backend_control_token_header",
+    "header": "X-RDev-Control-Token",
+    "guide": "/docs/device-management.md",
+    "name": "PATCH /api/control/devices/{exactDeviceId}/name",
+    "read_name": "GET /api/control/devices/{exactDeviceId}/name?subject={subject}",
+    "dispatch": "POST /api/control/devices/{exactDeviceId}/actions",
+    "result": "GET /api/control/devices/{exactDeviceId}/actions?subject={subject}&requestId={requestId}",
+    "client_capability": "deviceManagementV1",
+    "actions": [
+      "upgrade",
+      "stop",
+      "uninstall"
+    ],
+    "identity": "exact_managed_device_id_and_current_instance",
+    "display_name_persistence": "managed_device_registry_v6",
+    "result_retention": "in_memory_24_hours_max_1024_no_replay",
+    "uninstall": "explicit_confirmation_and_local_opt_in_standard_linux_systemd_only",
+    "delete_identity_default": false
   }
 }
