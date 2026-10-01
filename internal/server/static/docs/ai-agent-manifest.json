@@ -33,7 +33,7 @@
       "FEIDU_DRIVE_TOKEN": "token"
     },
     "tool": "/skills/rdev-agent/scripts/rdev-agent.py",
-    "tool_sha256": "c4c00c993e858dd6e50b14935a13f095741c7a26d15e39eb6537ac36c6c395c0",
+    "tool_sha256": "af5360c661651494faf8c7a380b50216a1ffd6f33d18d54b9efa8e766676760d",
     "stdin_encoding": "utf-8; utf-16/utf-32 require BOM",
     "skill": "/skills/rdev-agent/SKILL.md",
     "input": "access_json_or_handoff_with_one_json_code_block"
@@ -92,54 +92,26 @@
     "repository": "docs/ai-agent-artifact-bridge.md"
   },
   "ssh_websocket": {
-    "url": "wss://r.feidu.fit/ssh-ws",
-    "query_fields": [
-      "device"
-    ],
+    "endpoint": "/ssh-ws?device=EXACT-ID",
     "subprotocols": [
       "rdev-browser-v1",
       "rdev-access-ticket.<credential>"
     ],
-    "selected_subprotocol": "rdev-browser-v1",
-    "authentication": [
-      "permanent_token_with_ssh_capability",
-      "delegated_device_access_ticket"
-    ],
-    "ssh_authentication": "none_bound_to_authenticated_exact_device",
-    "transports": [
-      "auto",
-      "raw",
-      "wss"
-    ],
-    "auto_selection": "raw SSH banner probe before execution; WSS on failure; never replay commands",
-    "python_dependency": "websocket-client>=1.8,<2",
-    "proxy": "HTTPS_PROXY/https_proxy CONNECT; TLS verification; no redirects",
-    "supported": [
-      "shell",
-      "pty",
-      "exec",
-      "stderr",
-      "exit_status",
-      "ssh_channel_eof",
-      "sftp",
-      "scp_sftp_mode_OpenSSH_9+"
-    ],
-    "unsupported": [
-      "local_forward",
-      "remote_forward",
-      "dynamic_forward",
-      "agent_forward",
-      "x11_forward",
-      "legacy_scp_O"
-    ],
+    "authentication": "ssh-capable permanent token or delegated non-browser device ticket",
+    "inner_ssh_user": "exact outer device ID",
+    "transport_selection": "auto (default): raw SSH banner probe, WSS fallback before execution; explicit raw or wss; no command replay",
+    "python_dependency": "websockets>=15,<17",
+    "proxy": "system HTTPS proxy; verified TLS; no redirects",
+    "max_binary_message_bytes": 65536,
+    "empty_binary_message": "write EOF; keep reading opposite direction",
     "limits": {
-      "message_bytes": 65536,
-      "connections_per_device": 8,
-      "connections_total": 128,
+      "per_device": 8,
+      "global": 128,
       "handshake_seconds": 15,
       "idle_seconds": 90,
-      "write_seconds": 15
+      "write_seconds": 15,
+      "lifetime_seconds": 86400
     },
-    "close": "WebSocket close is full transport close; SSH channel EOF remains independent"
+    "forwarding": "WSS rejects TCP, Agent, X11 forwarding; select raw for -L/-R/-N"
   }
 }

@@ -316,7 +316,7 @@ class RDevAgentTest(unittest.TestCase):
         state = {"rdev_ticket": Handler.ticket, "ssh_port": 18112}
         temporary = mock.Mock()
         environment = {"SSH_ASKPASS_REQUIRE": "force"}
-        args = mock.Mock(state=self.state, transport="raw")
+        args = mock.Mock(state=self.state)
         with (
             mock.patch.object(rdev_agent, "maintained_state", return_value=(state, {})),
             mock.patch.object(rdev_agent.shutil, "which", return_value="scp.exe"),

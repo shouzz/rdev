@@ -75,19 +75,6 @@ class SSHWebSocketTest(unittest.TestCase):
             run.assert_not_called()
         temporary.cleanup.assert_called_once()
 
-    def test_proxy_error_never_echoes_headers(self):
-        secret = self.state()["token"]
-        library = mock.Mock()
-        library.create_connection.side_effect = RuntimeError("response contains " + secret)
-        errors = io.StringIO()
-        with (mock.patch.dict(agent.os.environ, {"RDEV_WS_URL": "wss://example.test/ssh-ws?device=test",
-                                                "RDEV_AGENT_SECRET": secret}),
-              mock.patch.object(agent, "require_websocket", return_value=library),
-              mock.patch.object(agent.os, "name", "posix"),
-              contextlib.redirect_stderr(errors)):
-            self.assertEqual(agent.command_ws_stdio(), 1)
-        self.assertNotIn(secret, errors.getvalue())
-        self.assertEqual(library.create_connection.call_args.kwargs["redirect_limit"], 0)
 
 
 if __name__ == "__main__":

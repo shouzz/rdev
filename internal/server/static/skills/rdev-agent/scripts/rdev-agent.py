@@ -10,6 +10,7 @@ import datetime as dt
 import getpass
 import hashlib
 import json
+import logging
 import ntpath
 import os
 import pathlib
@@ -795,15 +796,18 @@ def choose_ssh_transport(state_data: dict, requested: str) -> str:
 
 def require_websocket():
     try:
-        import websocket
+        from websockets.sync.client import connect
+        import websockets
+        if int(websockets.__version__.split(".")[0]) < 15:
+            raise ImportError
     except ImportError:
-        raise AgentError("WSS requires websocket-client: python -m pip install 'websocket-client>=1.8,<2'") from None
-    return websocket
+        raise AgentError("WSS requires websockets: python -m pip install 'websockets>=15,<17'") from None
+    return connect
 
 
 def command_ws_stdio() -> int:
     """Private OpenSSH ProxyCommand. stdout contains SSH bytes exclusively."""
-    websocket = require_websocket()
+    connect = require_websocket()
     endpoint = os.environ.get("RDEV_WS_URL", "")
     secret = os.environ.pop("RDEV_AGENT_SECRET", "")
     if urllib.parse.urlsplit(endpoint).scheme != "wss" or not secret:
@@ -814,38 +818,35 @@ def command_ws_stdio() -> int:
         msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
     connection = None
     failed = threading.Event()
-    input_ended = threading.Event()
     try:
-        websocket.enableTrace(False)
-        connection = websocket.create_connection(
+        # Dedicated silent logger: debug handshake logs would expose the
+        # credential subprotocol. sync.connect does not follow redirects.
+        logger = logging.Logger("rdev-wss-private")
+        logger.addHandler(logging.NullHandler())
+        logger.propagate = False
+        connection = connect(
             endpoint, subprotocols=["rdev-browser-v1", "rdev-access-ticket." + secret],
-            timeout=15, redirect_limit=0, enable_multithread=True, suppress_origin=True)
+            open_timeout=15, close_timeout=5, ping_interval=15, ping_timeout=30,
+            max_size=65536, max_queue=4, compression=None, logger=logger)
         secret = ""
-        if connection.getsubprotocol() != "rdev-browser-v1":
+        if connection.subprotocol != "rdev-browser-v1":
             raise AgentError("WSS proxy protocol was not negotiated")
-        connection.settimeout(90)
 
         def send_stdin():
             try:
                 while True:
                     block = os.read(sys.stdin.fileno(), 32768)
                     if not block:
-                        break
-                    connection.send_binary(block)
+                        connection.send(b"")  # write EOF; continue draining stdout
+                        return
+                    connection.send(block)
             except Exception:
                 failed.set()
-            finally:
-                # SSH channel EOF travels inside SSH packets. Transport EOF is a
-                # full disconnect, never a request to truncate pending SSH output.
-                input_ended.set()
-                connection.shutdown()
+                connection.close()
 
         threading.Thread(target=send_stdin, daemon=True, name="rdev-wss-input").start()
-        while True:
-            opcode, block = connection.recv_data()
-            if opcode == websocket.ABNF.OPCODE_CLOSE:
-                break
-            if opcode != websocket.ABNF.OPCODE_BINARY or len(block) > 65536:
+        for block in connection:
+            if not isinstance(block, bytes) or len(block) > 65536:
                 raise AgentError("invalid WSS SSH frame")
             view = memoryview(block)
             while view:
@@ -853,14 +854,12 @@ def command_ws_stdio() -> int:
                 view = view[count:]
         return 1 if failed.is_set() else 0
     except Exception:
-        if input_ended.is_set() and not failed.is_set():
-            return 0
         # Library exceptions can contain response headers. Never echo them.
         print("rdev-agent: WSS SSH connection ended or was rejected", file=sys.stderr)
         return 1
     finally:
         if connection is not None:
-            connection.shutdown()
+            connection.close()
 
 
 def run_fixed_subprocess(command: list[str], environment: dict[str, str]) -> int:

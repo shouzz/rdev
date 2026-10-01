@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -308,5 +309,22 @@ func TestSSHWSLimitsAndClose(t *testing.T) {
 				t.Fatal("connection leaked")
 			}
 		})
+	}
+}
+
+func TestSSHWSDuplexHalfCloseDrainsReverseData(t *testing.T) {
+	a, b := sshWSPipe()
+	defer a.Close()
+	defer b.Close()
+	_ = a.SetDeadline(time.Now().Add(time.Second))
+	_ = b.SetDeadline(time.Now().Add(time.Second))
+	_ = a.CloseWrite()
+	if _, err := b.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("want EOF: %v", err)
+	}
+	go func() { _, _ = b.Write([]byte("tail")); _ = b.CloseWrite() }()
+	output, err := io.ReadAll(a)
+	if err != nil || string(output) != "tail" {
+		t.Fatalf("tail lost: %q %v", output, err)
 	}
 }
