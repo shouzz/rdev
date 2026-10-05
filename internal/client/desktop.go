@@ -25,12 +25,15 @@ func desktopSourcesByBackendFrom(sources []protocol.DesktopSource, backend strin
 }
 
 func desktopCapabilities() *protocol.DesktopCapabilities {
+	videoCodecs, encoderBackends := desktopVideoCodecs()
 	caps := &protocol.DesktopCapabilities{
-		Platform:  runtime.GOOS,
-		Supported: false,
-		ViewOnly:  false,
-		Input:     false,
-		Clipboard: false,
+		Platform:        runtime.GOOS,
+		Supported:       false,
+		ViewOnly:        false,
+		Input:           false,
+		Clipboard:       false,
+		VideoCodecs:     videoCodecs,
+		EncoderBackends: encoderBackends,
 	}
 
 	switch runtime.GOOS {

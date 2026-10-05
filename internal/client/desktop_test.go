@@ -1,11 +1,14 @@
 package client
 
 import (
+	"bytes"
 	"encoding/base64"
 	"image"
+	"image/jpeg"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"rdev/internal/protocol"
 )
@@ -117,5 +120,173 @@ func TestValidateDesktopClipboardItemsRejectsInvalidPayloads(t *testing.T) {
 				t.Fatalf("error = %v, want containing %q", err, test.want)
 			}
 		})
+	}
+}
+
+type testDesktopEncoder struct {
+	format  string
+	encoded int
+}
+
+func (e *testDesktopEncoder) Format() string              { return e.format }
+func (e *testDesktopEncoder) CodecInfo() desktopCodecInfo { return desktopCodecInfo{} }
+func (e *testDesktopEncoder) Close()                      {}
+func (e *testDesktopEncoder) Encode(_ *image.RGBA, out *bytes.Buffer) error {
+	e.encoded++
+	out.WriteByte(byte(e.encoded))
+	return nil
+}
+
+func TestDesktopFrameSenderMJPEGSkipsUnchangedFramesAndResendsCachedPayload(t *testing.T) {
+	encoder := &testDesktopEncoder{format: desktopFormatMJPEG}
+	sender := newDesktopFrameSender(encoder)
+	frame := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	now := time.Unix(100, 0)
+
+	payload, send, err := sender.tick(frame, now)
+	if err != nil || !send || !bytes.Equal(payload, []byte{1}) {
+		t.Fatalf("first tick = (%v, %t, %v), want encoded frame", payload, send, err)
+	}
+	if payload, send, err = sender.tick(frame, now.Add(time.Second)); err != nil || send || payload != nil {
+		t.Fatalf("unchanged tick = (%v, %t, %v), want skipped", payload, send, err)
+	}
+	payload, send, err = sender.tick(frame, now.Add(desktopIdleResendInterval))
+	if err != nil || !send || !bytes.Equal(payload, []byte{1}) || encoder.encoded != 1 {
+		t.Fatalf("idle resend = (%v, %t, %v), encodes=%d; want cached frame", payload, send, err, encoder.encoded)
+	}
+}
+
+func TestDesktopFrameSenderH264EncodesEveryFrame(t *testing.T) {
+	encoder := &testDesktopEncoder{format: desktopFormatH264}
+	sender := newDesktopFrameSender(encoder)
+	frame := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	now := time.Unix(100, 0)
+	for i := 1; i <= 2; i++ {
+		payload, send, err := sender.tick(frame, now.Add(time.Duration(i)*time.Second))
+		if err != nil || !send || !bytes.Equal(payload, []byte{byte(i)}) {
+			t.Fatalf("tick %d = (%v, %t, %v), want newly encoded frame", i, payload, send, err)
+		}
+	}
+	if encoder.encoded != 2 {
+		t.Fatalf("H264 encoded %d frames, want 2", encoder.encoded)
+	}
+}
+
+func TestNormalizeH264FrameSizeRoundsDownWithoutExceedingLimit(t *testing.T) {
+	for _, test := range []struct {
+		width, height int
+		wantW, wantH  int
+	}{
+		{1600, 1000, 1600, 1000},
+		{1601, 1001, 1600, 1000},
+		{1, 1, 1, 1},
+	} {
+		gotW, gotH := normalizeH264FrameSize(test.width, test.height)
+		if gotW != test.wantW || gotH != test.wantH {
+			t.Fatalf("normalizeH264FrameSize(%d, %d) = %d, %d; want %d, %d", test.width, test.height, gotW, gotH, test.wantW, test.wantH)
+		}
+	}
+}
+
+func TestDesktopEncoderFallsBackToMJPEGWhenH264IsUnavailable(t *testing.T) {
+	encoder := newDesktopEncoder(desktopFormatH264, 321, 241, 60, 8)
+	defer encoder.Close()
+	if got := encoder.Format(); got != desktopFormatMJPEG {
+		t.Fatalf("encoder format = %q, want %q for an unavailable/invalid H264 request", got, desktopFormatMJPEG)
+	}
+}
+
+func TestMJPEGFallbackProducesDecodableJPEG(t *testing.T) {
+	encoder := newDesktopEncoder(desktopFormatH264, 321, 241, 60, 8)
+	defer encoder.Close()
+	frame := image.NewRGBA(image.Rect(0, 0, 8, 6))
+	var payload bytes.Buffer
+	if err := encoder.Encode(frame, &payload); err != nil {
+		t.Fatalf("JPEG fallback encode error = %v", err)
+	}
+	decoded, err := jpeg.Decode(bytes.NewReader(payload.Bytes()))
+	if err != nil {
+		t.Fatalf("JPEG fallback payload is not decodable: %v", err)
+	}
+	if got := decoded.Bounds().Size(); got != frame.Bounds().Size() {
+		t.Fatalf("decoded JPEG size = %v, want %v", got, frame.Bounds().Size())
+	}
+}
+
+func TestNormalizeDesktopFormatRejectsLegacyOrUnknownValues(t *testing.T) {
+	for _, value := range []string{"", "jpeg", "h264-baseline", "vp9"} {
+		if got := normalizeDesktopFormat(value); got != "" {
+			t.Fatalf("normalizeDesktopFormat(%q) = %q, want empty", value, got)
+		}
+	}
+}
+
+func TestAnnexBToAVCCHandlesMixedStartCodesAndKeyframes(t *testing.T) {
+	annexB := []byte{
+		0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x1F, 0,
+		0, 0, 1, 0x68, 0xCE, 0x06, 0xE2,
+		0, 0, 0, 1, 0x65, 0x88, 0x84, 0,
+	}
+	keyframe, avcc, err := annexBToAVCC(annexB)
+	if err != nil {
+		t.Fatalf("annexBToAVCC() error = %v", err)
+	}
+	if !keyframe {
+		t.Fatal("annexBToAVCC() did not identify the IDR NAL as a keyframe")
+	}
+	want := []byte{
+		0, 0, 0, 4, 0x67, 0x42, 0xC0, 0x1F,
+		0, 0, 0, 4, 0x68, 0xCE, 0x06, 0xE2,
+		0, 0, 0, 3, 0x65, 0x88, 0x84,
+	}
+	if !bytes.Equal(avcc, want) {
+		t.Fatalf("AVCC = %x, want %x", avcc, want)
+	}
+}
+
+func TestAnnexBToAVCCRejectsDataWithoutStartCode(t *testing.T) {
+	if _, _, err := annexBToAVCC([]byte{0x65, 0x88, 0x84}); err == nil {
+		t.Fatal("annexBToAVCC() accepted data without an Annex B start code")
+	}
+}
+
+func TestResizeDesktopFrameToSizeReusesMatchingDestination(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	destination := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	first, err := resizeDesktopFrameToSize(destination, source, 2, 2)
+	if err != nil || first != destination {
+		t.Fatalf("first resize = (%p, %v), want provided buffer %p", first, err, destination)
+	}
+	second, err := resizeDesktopFrameToSize(first, source, 2, 2)
+	if err != nil || second != destination {
+		t.Fatalf("second resize = (%p, %v), want reused buffer %p", second, err, destination)
+	}
+}
+
+// TestResizeDesktopFrameToSizeKeepsEvenH264Geometry guards the encoder
+// contract: after normalizeH264FrameSize rounds a requested size down to even
+// values, frames must still be produced at exactly that size. Re-deriving a
+// proportional size from the normalized target used to shrink the frame
+// (1600x905 -> encoder 1600x904 -> frame 1598x904), which the x264 encoder
+// rejects with "frame size does not match encoder".
+func TestResizeDesktopFrameToSizeKeepsEvenH264Geometry(t *testing.T) {
+	for _, test := range []struct {
+		sourceW, sourceH int
+		maxW, maxH       int
+	}{
+		{1600, 905, 1600, 905},
+		{1600, 904, 1600, 903},
+		{1921, 1081, 1920, 1080},
+		{905, 1600, 905, 1600},
+	} {
+		size := scaledDimension(test.sourceW, test.sourceH, test.maxW, test.maxH)
+		size.X, size.Y = normalizeH264FrameSize(size.X, size.Y)
+		frame, err := resizeDesktopFrameToSize(nil, image.NewRGBA(image.Rect(0, 0, test.sourceW, test.sourceH)), size.X, size.Y)
+		if err != nil {
+			t.Fatalf("source %dx%d -> %dx%d: %v", test.sourceW, test.sourceH, size.X, size.Y, err)
+		}
+		if frame.Bounds().Dx() != size.X || frame.Bounds().Dy() != size.Y {
+			t.Fatalf("source %dx%d -> %dx%d produced frame %v", test.sourceW, test.sourceH, size.X, size.Y, frame.Bounds().Size())
+		}
 	}
 }

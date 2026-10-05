@@ -309,7 +309,7 @@ Environment variables:
 
 	updateContext, cancelUpdates := context.WithCancel(context.Background())
 	defer cancelUpdates()
-	updateConfig := updater.Config{App: "client", Version: version, Enabled: autoUpdate, Interval: updateInterval}
+	updateConfig := updater.Config{App: updaterAppName(), Version: version, Enabled: autoUpdate, Interval: updateInterval}
 	c.SetDeviceActionHandler(deviceActionHandler(updateConfig, identityFile, allowRemoteUninstall, cancelUpdates))
 	updater.Start(updateContext, updateConfig)
 
